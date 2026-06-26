@@ -1,0 +1,46 @@
+market:
+  benchmark: "000300.SH"
+  min_listed_days: 120
+  min_amount_ma20: 100000000
+  exclude_st: true
+
+risk_filter:
+  max_debt_ratio: 0.80
+  min_roe: 0
+  st_filter_mode: "history"
+
+backtest:
+  init_cash: 100000
+  max_position_per_stock: 0.10
+  commission: 0.0003
+  stamp_tax: 0.0005
+  slippage: 0.001
+  rebalance: "monthly"
+  execution: "next_open"
+  holding_months: [3, 6, 12]
+
+storage:
+  parquet_backend: "minio"
+  minio_endpoint: "stock-minio:9000"
+  minio_bucket_raw: "stock-raw"
+  minio_bucket_processed: "stock-processed"
+  minio_bucket_backtest: "stock-backtest"
+
+service:
+  metadata_db: "postgresql"
+  api_backend: "springboot"
+
+llm:
+  enable: false
+  mode: "explain_only"
+  allow_price_prediction: false
+  allow_decision_making: false
+
+path_safety:
+  strict_date_format: true
+
+postgres:
+  host: "stock-postgres"
+  port: 5432
+  database: "stock_selector"
+  user: "stock_app"

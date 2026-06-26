@@ -1,0 +1,85 @@
+services:
+  stock-postgres:
+    image: postgres:16-alpine
+    container_name: stock-postgres
+    environment:
+      POSTGRES_DB: ${STOCK_POSTGRES_DB:-stock_selector}
+      POSTGRES_USER: ${STOCK_POSTGRES_USER:-stock_app}
+      POSTGRES_PASSWORD: ${STOCK_POSTGRES_PASSWORD:-stock_postgres_dev_password}
+    ports:
+      - "15432:5432"
+    volumes:
+      - stock_pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  stock-minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: stock-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${STOCK_MINIO_ROOT_USER:-stock_minio}
+      MINIO_ROOT_PASSWORD: ${STOCK_MINIO_ROOT_PASSWORD:-stock_minio_dev_password}
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    volumes:
+      - stock_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  stock-python:
+    build:
+      context: .
+      dockerfile: docker/python/Dockerfile
+    container_name: stock-python
+    command: ["sh", "-c", "while true; do sleep 3600; done"]
+    environment:
+      STOCK_CONFIG_DIR: /app/config
+      STOCK_SCHEMA_SQL_PATH: /app/docker/postgres/init/001_schema.sql
+      STOCK_POSTGRES_HOST: stock-postgres
+      STOCK_POSTGRES_PORT: "5432"
+      STOCK_POSTGRES_DB: ${STOCK_POSTGRES_DB:-stock_selector}
+      STOCK_POSTGRES_USER: ${STOCK_POSTGRES_USER:-stock_app}
+      STOCK_POSTGRES_PASSWORD: ${STOCK_POSTGRES_PASSWORD:-stock_postgres_dev_password}
+      STOCK_MINIO_ENDPOINT: stock-minio:9000
+      STOCK_MINIO_ACCESS_KEY: ${STOCK_MINIO_ACCESS_KEY:-stock_minio}
+      STOCK_MINIO_SECRET_KEY: ${STOCK_MINIO_SECRET_KEY:-stock_minio_dev_password}
+      STOCK_MINIO_SECURE: "false"
+    depends_on:
+      stock-postgres:
+        condition: service_healthy
+      stock-minio:
+        condition: service_healthy
+
+  stock-api:
+    image: maven:3.9-eclipse-temurin-17
+    container_name: stock-api
+    working_dir: /workspace/spring-api
+    command: ["mvn", "-q", "spring-boot:run"]
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://stock-postgres:5432/${STOCK_POSTGRES_DB:-stock_selector}
+      SPRING_DATASOURCE_USERNAME: ${SPRING_DATASOURCE_USERNAME:-stock_app}
+      SPRING_DATASOURCE_PASSWORD: ${SPRING_DATASOURCE_PASSWORD:-stock_postgres_dev_password}
+    ports:
+      - "18080:8080"
+    volumes:
+      - ./spring-api:/workspace/spring-api
+    tmpfs:
+      - /workspace/spring-api/target
+    depends_on:
+      stock-postgres:
+        condition: service_healthy
+
+volumes:
+  stock_pgdata:
+    name: stock_pgdata
+  stock_minio_data:
+    name: stock_minio_data

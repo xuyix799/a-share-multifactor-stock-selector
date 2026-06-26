@@ -1,0 +1,5 @@
+quality_score: 0.30
+growth_score: 0.25
+valuation_score: 0.20
+industry_score: 0.15
+trend_score: 0.10

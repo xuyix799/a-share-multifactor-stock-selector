@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+data/
+logs/
+*.parquet
+*.duckdb
+*.db
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+target/
+**/target/
+*.egg-info/
+.venv/
+venv/
