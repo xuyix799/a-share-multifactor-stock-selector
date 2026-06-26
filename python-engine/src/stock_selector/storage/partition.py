@@ -20,6 +20,7 @@ DERIVED_DATASETS = (
     "risk_filter",
     "eligible_universe",
     "factor_input_table",
+    "factor_daily",
 )
 
 PROVIDER_DATASETS = RAW_DATASETS

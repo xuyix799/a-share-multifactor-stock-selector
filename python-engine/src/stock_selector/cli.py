@@ -15,6 +15,8 @@ from stock_selector.data.data_validator import DataValidationError, validate_dat
 from stock_selector.data.mock_data import generate_mock_dataset
 from stock_selector.data.update_pipeline import update_provider_data
 from stock_selector.data.update_log import create_update_log_repository
+from stock_selector.factors.factor_pipeline import build_factor_daily_for_date
+from stock_selector.factors.factor_validator import validate_factor_daily
 from stock_selector.providers.provider_factory import list_providers
 from stock_selector.providers.schema_contract import inspect_schema
 from stock_selector.providers.schema_mapper import SchemaMappingError, normalize_date, normalize_stock_code
@@ -361,6 +363,35 @@ def _cmd_build_universe_inputs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_factors(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+
+    _ensure_db_schema()
+    result = build_factor_daily_for_date(trade_date, force=args.force, read_dataset_fn=_read_dataset, write_dataset_fn=_write_dataset)
+    print(json.dumps({"trade_date": trade_date, "force": args.force, "result": result}, ensure_ascii=False, default=str))
+    return 0
+
+
+def _cmd_validate_factors(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="stock-factor-validate-") as tmp:
+        path = _materialize_dataset("factor_daily", trade_date, Path(tmp))
+        df = pd.read_parquet(path)
+        validate_factor_daily(df, trade_date)
+
+    print(json.dumps({"trade_date": trade_date, "dataset": "factor_daily", "status": "valid"}, ensure_ascii=False))
+    return 0
+
+
 def _cmd_show_update_log(args: argparse.Namespace) -> int:
     try:
         trade_date = validate_trade_date(args.trade_date)
@@ -555,6 +586,15 @@ def build_parser() -> argparse.ArgumentParser:
     build_universe.add_argument("--trade-date", required=True)
     build_universe.add_argument("--force", action="store_true")
     build_universe.set_defaults(func=_cmd_build_universe_inputs)
+
+    build_factors = subparsers.add_parser("build-factors")
+    build_factors.add_argument("--trade-date", required=True)
+    build_factors.add_argument("--force", action="store_true")
+    build_factors.set_defaults(func=_cmd_build_factors)
+
+    validate_factors = subparsers.add_parser("validate-factors")
+    validate_factors.add_argument("--trade-date", required=True)
+    validate_factors.set_defaults(func=_cmd_validate_factors)
 
     show_log = subparsers.add_parser("show-update-log")
     show_log.add_argument("--trade-date", required=True)

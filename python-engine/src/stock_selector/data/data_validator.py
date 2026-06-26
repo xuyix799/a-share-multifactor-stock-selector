@@ -40,6 +40,7 @@ def validate_dataset_frame(dataset: str, df: pd.DataFrame, trade_date: str) -> N
         "risk_filter": _validate_risk_filter,
         "eligible_universe": _validate_eligible_universe,
         "factor_input_table": _validate_factor_input_table,
+        "factor_daily": _validate_factor_daily,
     }
     validators[dataset](df, trade_date)
 
@@ -358,3 +359,54 @@ def _validate_factor_input_table(df: pd.DataFrame, trade_date: str) -> None:
         raise DataValidationError("adj_close must be positive")
     if (df["amount"] < 0).any():
         raise DataValidationError("amount must be non-negative")
+
+
+def _validate_factor_daily(df: pd.DataFrame, trade_date: str) -> None:
+    _require_columns(
+        df,
+        [
+            "stock_code",
+            "trade_date",
+            "industry",
+            "market_type",
+            "quality_roe",
+            "quality_gross_margin",
+            "quality_debt_ratio",
+            "quality_cashflow_profit_ratio",
+            "growth_revenue_yoy",
+            "growth_net_profit_yoy",
+            "valuation_pe_ttm",
+            "valuation_pb",
+            "valuation_ps_ttm",
+            "valuation_pe_percentile_3y",
+            "valuation_pb_percentile_3y",
+            "trend_ret_20d",
+            "trend_ret_60d",
+            "trend_ret_120d",
+            "trend_ma20",
+            "trend_ma60",
+            "trend_ma120",
+            "trend_price_ma60_ratio",
+            "industry_ret_60d",
+            "industry_ret_120d",
+            "industry_strength_60d",
+            "industry_strength_120d",
+            "liquidity_amount",
+            "liquidity_turnover_rate",
+            "quality_score",
+            "growth_score",
+            "valuation_score",
+            "trend_score",
+            "industry_score",
+        ],
+    )
+    _validate_trade_date_column(df, trade_date)
+    _validate_stock_codes(df)
+    _validate_unique(df, ["stock_code", "trade_date"])
+    if "total_score" in df.columns:
+        raise DataValidationError("factor_daily must not include total_score")
+    for column in ["quality_score", "growth_score", "valuation_score", "trend_score", "industry_score"]:
+        if df[column].isna().any() or (df[column] < 0).any() or (df[column] > 100).any():
+            raise DataValidationError(f"{column} must be between 0 and 100")
+    if (df["liquidity_amount"] < 0).any():
+        raise DataValidationError("liquidity_amount must be non-negative")

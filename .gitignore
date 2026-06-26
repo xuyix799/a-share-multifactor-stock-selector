@@ -6,6 +6,7 @@
 *.parquet
 *.duckdb
 *.db
+A股多因子选股系统第一版方案.md
 __pycache__/
 *.pyc
 .pytest_cache/

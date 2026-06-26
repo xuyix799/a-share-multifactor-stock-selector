@@ -112,3 +112,45 @@ def test_schema_contract_includes_goal5_universe_datasets():
         "operating_cashflow",
     ]
 
+
+def test_schema_contract_includes_goal6_factor_daily_dataset():
+    factor_daily = get_schema_contract("factor_daily")
+
+    assert factor_daily.columns == [
+        "stock_code",
+        "trade_date",
+        "industry",
+        "market_type",
+        "quality_roe",
+        "quality_gross_margin",
+        "quality_debt_ratio",
+        "quality_cashflow_profit_ratio",
+        "growth_revenue_yoy",
+        "growth_net_profit_yoy",
+        "valuation_pe_ttm",
+        "valuation_pb",
+        "valuation_ps_ttm",
+        "valuation_pe_percentile_3y",
+        "valuation_pb_percentile_3y",
+        "trend_ret_20d",
+        "trend_ret_60d",
+        "trend_ret_120d",
+        "trend_ma20",
+        "trend_ma60",
+        "trend_ma120",
+        "trend_price_ma60_ratio",
+        "industry_ret_60d",
+        "industry_ret_120d",
+        "industry_strength_60d",
+        "industry_strength_120d",
+        "liquidity_amount",
+        "liquidity_turnover_rate",
+        "quality_score",
+        "growth_score",
+        "valuation_score",
+        "trend_score",
+        "industry_score",
+    ]
+    assert "total_score" not in factor_daily.columns
+    assert "quality_score" in factor_daily.numeric_columns
+

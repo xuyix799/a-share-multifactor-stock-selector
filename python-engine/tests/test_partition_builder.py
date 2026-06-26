@@ -13,6 +13,10 @@ def test_validate_dataset_accepts_goal5_universe_datasets():
     assert validate_dataset("factor_input_table") == "factor_input_table"
 
 
+def test_validate_dataset_accepts_goal6_factor_daily_dataset():
+    assert validate_dataset("factor_daily") == "factor_daily"
+
+
 def test_validate_dataset_rejects_unknown_or_unsafe_dataset():
     with pytest.raises(DatasetValidationError):
         validate_dataset("../daily_price")
