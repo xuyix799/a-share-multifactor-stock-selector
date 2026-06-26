@@ -1,5 +1,5 @@
 from stock_selector.data.update_pipeline import update_provider_data
-from stock_selector.storage.partition import SUPPORTED_DATASETS
+from stock_selector.storage.partition import PROVIDER_DATASETS
 
 
 class FakeUpdateLogRepository:
@@ -38,9 +38,9 @@ def test_update_provider_data_writes_all_mapped_datasets_and_marks_done():
         write_dataset_fn=write_dataset,
     )
 
-    assert [item["status"] for item in result] == ["done"] * len(SUPPORTED_DATASETS)
-    assert [item[0] for item in writes] == list(SUPPORTED_DATASETS)
-    assert len(repo.done_marks) == len(SUPPORTED_DATASETS)
+    assert [item["status"] for item in result] == ["done"] * len(PROVIDER_DATASETS)
+    assert [item[0] for item in writes] == list(PROVIDER_DATASETS)
+    assert len(repo.done_marks) == len(PROVIDER_DATASETS)
     assert repo.failed_marks == []
 
 
@@ -56,7 +56,7 @@ def test_update_provider_data_skips_done_steps_by_default_and_force_reruns():
     skipped = update_provider_data("2026-06-19", "mock", update_log_repo=repo, write_dataset_fn=write_dataset)
     forced = update_provider_data("2026-06-19", "mock", force=True, update_log_repo=repo, write_dataset_fn=write_dataset)
 
-    assert [item["status"] for item in skipped] == ["skipped"] * len(SUPPORTED_DATASETS)
-    assert [item["status"] for item in forced] == ["done"] * len(SUPPORTED_DATASETS)
-    assert len(writes) == len(SUPPORTED_DATASETS) * 2
+    assert [item["status"] for item in skipped] == ["skipped"] * len(PROVIDER_DATASETS)
+    assert [item["status"] for item in forced] == ["done"] * len(PROVIDER_DATASETS)
+    assert len(writes) == len(PROVIDER_DATASETS) * 2
 

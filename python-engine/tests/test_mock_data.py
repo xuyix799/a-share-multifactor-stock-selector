@@ -1,9 +1,9 @@
 from stock_selector.data.mock_data import generate_mock_dataset
-from stock_selector.storage.partition import SUPPORTED_DATASETS
+from stock_selector.storage.partition import PROVIDER_DATASETS
 
 
 def test_generate_mock_dataset_supports_all_goal2_datasets():
-    for dataset in SUPPORTED_DATASETS:
+    for dataset in PROVIDER_DATASETS:
         df = generate_mock_dataset(dataset, "2026-06-19")
         assert not df.empty, dataset
 

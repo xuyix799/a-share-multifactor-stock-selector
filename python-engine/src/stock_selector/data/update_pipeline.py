@@ -11,7 +11,7 @@ from stock_selector.providers.provider_factory import create_provider
 from stock_selector.providers.schema_mapper import map_provider_frame
 from stock_selector.storage.atomic_writer import AtomicObjectWriter, write_parquet_local_atomic
 from stock_selector.storage.minio_client import create_minio_client, ensure_buckets
-from stock_selector.storage.partition import SUPPORTED_DATASETS, build_partition
+from stock_selector.storage.partition import PROVIDER_DATASETS, build_partition
 from stock_selector.utils.date_validator import validate_trade_date
 
 
@@ -33,7 +33,7 @@ def update_provider_data(
     writer = write_dataset_fn or _default_write_dataset
 
     results = []
-    for dataset in SUPPORTED_DATASETS:
+    for dataset in PROVIDER_DATASETS:
         step_name = f"provider_data:{dataset}"
         if not repo.should_run_step(trade_date, step_name, force=force):
             results.append({"dataset": dataset, "step_name": step_name, "status": "skipped"})

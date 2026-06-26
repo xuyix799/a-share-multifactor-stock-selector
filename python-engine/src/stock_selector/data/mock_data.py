@@ -2,7 +2,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from stock_selector.storage.partition import SUPPORTED_DATASETS, validate_dataset
+from stock_selector.storage.partition import PROVIDER_DATASETS, DatasetValidationError, validate_dataset
 from stock_selector.utils.date_validator import validate_trade_date
 
 
@@ -32,12 +32,14 @@ def generate_mock_dataset(dataset: str, trade_date: str) -> pd.DataFrame:
         "st_history": _st_history,
         "benchmark_price": _benchmark_price,
     }
+    if dataset not in generators:
+        raise DatasetValidationError(f"mock data is only available for provider dataset: {dataset}")
     return generators[dataset](trade_date)
 
 
 def generate_all_mock_datasets(trade_date: str) -> dict[str, pd.DataFrame]:
     trade_date = validate_trade_date(trade_date)
-    return {dataset: generate_mock_dataset(dataset, trade_date) for dataset in SUPPORTED_DATASETS}
+    return {dataset: generate_mock_dataset(dataset, trade_date) for dataset in PROVIDER_DATASETS}
 
 
 def _stock_basic(trade_date: str) -> pd.DataFrame:

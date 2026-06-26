@@ -8,6 +8,8 @@ from pathlib import Path
 import pandas as pd
 from minio.error import S3Error
 
+from stock_selector.cleaning.clean_pipeline import build_adjusted_price_for_date, build_clean_snapshot_for_date
+from stock_selector.cleaning.snapshot_validator import validate_clean_daily_snapshot
 from stock_selector.config.config_loader import load_settings
 from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame, validate_stock_code
 from stock_selector.data.mock_data import generate_mock_dataset
@@ -20,7 +22,7 @@ from stock_selector.storage.atomic_writer import AtomicObjectWriter
 from stock_selector.storage.atomic_writer import write_parquet_local_atomic
 from stock_selector.storage.duckdb_query import query_dataset_file, query_stock_price_files
 from stock_selector.storage.minio_client import create_minio_client, ensure_buckets, get_required_buckets
-from stock_selector.storage.partition import SUPPORTED_DATASETS, DatasetValidationError, build_partition, validate_dataset
+from stock_selector.storage.partition import PROVIDER_DATASETS, DatasetValidationError, build_partition, validate_dataset
 from stock_selector.storage.postgres_client import create_postgres_client
 from stock_selector.utils.date_validator import DateValidationError, validate_date_range, validate_trade_date
 from stock_selector.utils.logger import get_logger
@@ -131,7 +133,7 @@ def _cmd_storage_smoke(args: argparse.Namespace) -> int:
 def _cmd_generate_mock_data(args: argparse.Namespace) -> int:
     try:
         trade_date = validate_trade_date(args.trade_date)
-        datasets = _resolve_datasets(args.dataset)
+        datasets = _resolve_datasets(args.dataset, all_datasets=PROVIDER_DATASETS)
     except (DateValidationError, DatasetValidationError) as exc:
         print(f"invalid input: {exc}", file=sys.stderr)
         return 2
@@ -149,7 +151,7 @@ def _cmd_generate_mock_data(args: argparse.Namespace) -> int:
 def _cmd_validate_data(args: argparse.Namespace) -> int:
     try:
         trade_date = validate_trade_date(args.trade_date)
-        datasets = _resolve_datasets(args.dataset)
+        datasets = _resolve_datasets(args.dataset, all_datasets=PROVIDER_DATASETS)
     except (DateValidationError, DatasetValidationError) as exc:
         print(f"invalid input: {exc}", file=sys.stderr)
         return 2
@@ -174,7 +176,7 @@ def _cmd_update_mock_data(args: argparse.Namespace) -> int:
     _ensure_db_schema()
     repo = create_update_log_repository()
     results = []
-    for dataset in SUPPORTED_DATASETS:
+    for dataset in PROVIDER_DATASETS:
         step_name = f"mock_data:{dataset}"
         if not repo.should_run_step(trade_date, step_name, force=args.force):
             results.append({"dataset": dataset, "status": "skipped"})
@@ -222,7 +224,7 @@ def _cmd_update_provider_data(args: argparse.Namespace) -> int:
 def _cmd_validate_provider_data(args: argparse.Namespace) -> int:
     try:
         trade_date = validate_trade_date(args.trade_date)
-        datasets = _resolve_datasets(args.dataset)
+        datasets = _resolve_datasets(args.dataset, all_datasets=PROVIDER_DATASETS)
     except (DateValidationError, DatasetValidationError) as exc:
         print(f"invalid input: {exc}", file=sys.stderr)
         return 2
@@ -303,6 +305,48 @@ def _cmd_query_stock_price(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_adjusted_price(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+
+    _ensure_db_schema()
+    result = build_adjusted_price_for_date(trade_date, force=args.force, read_dataset_fn=_read_dataset, write_dataset_fn=_write_dataset)
+    print(json.dumps({"trade_date": trade_date, "force": args.force, "result": result}, ensure_ascii=False, default=str))
+    return 0
+
+
+def _cmd_build_clean_snapshot(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+
+    _ensure_db_schema()
+    result = build_clean_snapshot_for_date(trade_date, force=args.force, read_dataset_fn=_read_dataset, write_dataset_fn=_write_dataset)
+    print(json.dumps({"trade_date": trade_date, "force": args.force, "result": result}, ensure_ascii=False, default=str))
+    return 0
+
+
+def _cmd_validate_clean_snapshot(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="stock-clean-validate-") as tmp:
+        path = _materialize_dataset("clean_daily_snapshot", trade_date, Path(tmp))
+        df = pd.read_parquet(path)
+        validate_clean_daily_snapshot(df, trade_date)
+
+    print(json.dumps({"trade_date": trade_date, "dataset": "clean_daily_snapshot", "status": "valid"}, ensure_ascii=False))
+    return 0
+
+
 def _cmd_show_update_log(args: argparse.Namespace) -> int:
     try:
         trade_date = validate_trade_date(args.trade_date)
@@ -317,9 +361,9 @@ def _cmd_show_update_log(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_datasets(dataset: str) -> list[str]:
+def _resolve_datasets(dataset: str, all_datasets=PROVIDER_DATASETS) -> list[str]:
     if dataset == "all":
-        return list(SUPPORTED_DATASETS)
+        return list(all_datasets)
     return [validate_dataset(dataset)]
 
 
@@ -359,6 +403,12 @@ def _write_dataset(dataset: str, trade_date: str, df: pd.DataFrame) -> str:
         df.to_parquet(local_file, index=False)
         result = AtomicObjectWriter(minio_client, tmp_dir=Path(tmp)).write_file_atomic(bucket, partition.object_key, local_file)
     return result.final_key
+
+
+def _read_dataset(dataset: str, trade_date: str) -> pd.DataFrame:
+    with tempfile.TemporaryDirectory(prefix="stock-read-") as tmp:
+        path = _materialize_dataset(dataset, trade_date, Path(tmp))
+        return pd.read_parquet(path)
 
 
 def _materialize_dataset(dataset: str, trade_date: str, tmp_root: Path) -> Path:
@@ -472,6 +522,20 @@ def build_parser() -> argparse.ArgumentParser:
     query_stock.add_argument("--start-date", required=True)
     query_stock.add_argument("--end-date", required=True)
     query_stock.set_defaults(func=_cmd_query_stock_price)
+
+    build_adjusted = subparsers.add_parser("build-adjusted-price")
+    build_adjusted.add_argument("--trade-date", required=True)
+    build_adjusted.add_argument("--force", action="store_true")
+    build_adjusted.set_defaults(func=_cmd_build_adjusted_price)
+
+    build_snapshot = subparsers.add_parser("build-clean-snapshot")
+    build_snapshot.add_argument("--trade-date", required=True)
+    build_snapshot.add_argument("--force", action="store_true")
+    build_snapshot.set_defaults(func=_cmd_build_clean_snapshot)
+
+    validate_snapshot = subparsers.add_parser("validate-clean-snapshot")
+    validate_snapshot.add_argument("--trade-date", required=True)
+    validate_snapshot.set_defaults(func=_cmd_validate_clean_snapshot)
 
     show_log = subparsers.add_parser("show-update-log")
     show_log.add_argument("--trade-date", required=True)

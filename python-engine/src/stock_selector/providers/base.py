@@ -2,11 +2,8 @@ from abc import ABC, abstractmethod
 
 import pandas as pd
 
-from stock_selector.storage.partition import SUPPORTED_DATASETS, validate_dataset
+from stock_selector.storage.partition import PROVIDER_DATASETS, validate_dataset
 from stock_selector.utils.date_validator import validate_trade_date
-
-
-PROVIDER_DATASETS = SUPPORTED_DATASETS
 
 
 class ProviderConfigurationError(RuntimeError):

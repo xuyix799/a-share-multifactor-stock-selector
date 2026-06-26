@@ -35,6 +35,8 @@ def validate_dataset_frame(dataset: str, df: pd.DataFrame, trade_date: str) -> N
         "financial": _validate_financial,
         "st_history": _validate_st_history,
         "benchmark_price": _validate_benchmark_price,
+        "adjusted_price": _validate_adjusted_price,
+        "clean_daily_snapshot": _validate_clean_daily_snapshot,
     }
     validators[dataset](df, trade_date)
 
@@ -168,3 +170,92 @@ def _validate_benchmark_price(df: pd.DataFrame, trade_date: str) -> None:
         raise DataValidationError("benchmark open and close must be positive")
     if (df["high"] < df["low"]).any():
         raise DataValidationError("benchmark high must be greater than or equal to low")
+
+
+def _validate_adjusted_price(df: pd.DataFrame, trade_date: str) -> None:
+    _require_columns(
+        df,
+        [
+            "stock_code",
+            "trade_date",
+            "adj_open",
+            "adj_high",
+            "adj_low",
+            "adj_close",
+            "volume",
+            "amount",
+            "pct_chg",
+            "is_paused",
+            "limit_up",
+            "limit_down",
+        ],
+    )
+    _validate_trade_date_column(df, trade_date)
+    _validate_stock_codes(df)
+    _validate_unique(df, ["stock_code", "trade_date"])
+    if (df[["adj_open", "adj_high", "adj_low", "adj_close"]] <= 0).any().any():
+        raise DataValidationError("adjusted OHLC prices must be positive")
+    if (df["adj_high"] < df["adj_low"]).any():
+        raise DataValidationError("adjusted high must be greater than or equal to adjusted low")
+    if (df["volume"] < 0).any() or (df["amount"] < 0).any():
+        raise DataValidationError("volume and amount must be non-negative")
+
+
+def _validate_clean_daily_snapshot(df: pd.DataFrame, trade_date: str) -> None:
+    _require_columns(
+        df,
+        [
+            "stock_code",
+            "trade_date",
+            "stock_name",
+            "industry",
+            "market_type",
+            "open",
+            "high",
+            "low",
+            "close",
+            "pre_close",
+            "volume",
+            "amount",
+            "pct_chg",
+            "is_paused",
+            "limit_up",
+            "limit_down",
+            "adj_open",
+            "adj_high",
+            "adj_low",
+            "adj_close",
+            "pe_ttm",
+            "pb",
+            "ps_ttm",
+            "total_mv",
+            "circ_mv",
+            "turnover_rate",
+            "report_period",
+            "announce_date",
+            "revenue_yoy",
+            "net_profit_yoy",
+            "roe",
+            "gross_margin",
+            "debt_ratio",
+            "operating_cashflow",
+            "is_st_on_date",
+            "listed_days",
+        ],
+    )
+    _validate_trade_date_column(df, trade_date)
+    _validate_stock_codes(df)
+    _validate_unique(df, ["stock_code", "trade_date"])
+    if (df[["open", "high", "low", "close", "pre_close", "adj_open", "adj_high", "adj_low", "adj_close"]] <= 0).any().any():
+        raise DataValidationError("snapshot prices must be positive")
+    if (df["high"] < df["low"]).any() or (df["adj_high"] < df["adj_low"]).any():
+        raise DataValidationError("snapshot high must be greater than or equal to low")
+    if (df["volume"] < 0).any() or (df["amount"] < 0).any():
+        raise DataValidationError("volume and amount must be non-negative")
+    if (df["listed_days"] < 0).any():
+        raise DataValidationError("listed_days must be non-negative")
+    for value in df["announce_date"].dropna().astype(str):
+        if validate_trade_date(value) > trade_date:
+            raise DataValidationError("snapshot announce_date must be <= trade_date")
+    for value in df["report_period"].dropna().astype(str):
+        validate_trade_date(value)

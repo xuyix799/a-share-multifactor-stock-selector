@@ -35,3 +35,26 @@ def test_inspect_schema_returns_cli_safe_metadata():
     assert "announce_date" in info["columns"]
     assert "debt_ratio" in info["numeric_columns"]
 
+
+def test_schema_contract_includes_goal4_derived_datasets():
+    adjusted = get_schema_contract("adjusted_price")
+    snapshot = get_schema_contract("clean_daily_snapshot")
+
+    assert adjusted.columns == [
+        "stock_code",
+        "trade_date",
+        "adj_open",
+        "adj_high",
+        "adj_low",
+        "adj_close",
+        "volume",
+        "amount",
+        "pct_chg",
+        "is_paused",
+        "limit_up",
+        "limit_down",
+    ]
+    assert "announce_date" in snapshot.columns
+    assert "is_st_on_date" in snapshot.bool_columns
+    assert "listed_days" in snapshot.numeric_columns
+

@@ -4,7 +4,7 @@ from pathlib import Path
 from stock_selector.utils.date_validator import validate_trade_date
 
 
-SUPPORTED_DATASETS = (
+RAW_DATASETS = (
     "stock_basic",
     "daily_price",
     "adj_factor",
@@ -13,6 +13,14 @@ SUPPORTED_DATASETS = (
     "st_history",
     "benchmark_price",
 )
+
+DERIVED_DATASETS = (
+    "adjusted_price",
+    "clean_daily_snapshot",
+)
+
+PROVIDER_DATASETS = RAW_DATASETS
+SUPPORTED_DATASETS = RAW_DATASETS + DERIVED_DATASETS
 
 
 class DatasetValidationError(ValueError):
