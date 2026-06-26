@@ -58,3 +58,57 @@ def test_schema_contract_includes_goal4_derived_datasets():
     assert "is_st_on_date" in snapshot.bool_columns
     assert "listed_days" in snapshot.numeric_columns
 
+
+def test_schema_contract_includes_goal5_universe_datasets():
+    risk_filter = get_schema_contract("risk_filter")
+    eligible = get_schema_contract("eligible_universe")
+    factor_input = get_schema_contract("factor_input_table")
+
+    assert risk_filter.columns == [
+        "stock_code",
+        "trade_date",
+        "is_eligible",
+        "exclude_reasons",
+        "risk_flags",
+        "is_st_on_date",
+        "is_paused",
+        "listed_days",
+        "amount",
+        "roe",
+        "debt_ratio",
+        "report_period",
+        "announce_date",
+    ]
+    assert "is_eligible" in risk_filter.bool_columns
+    assert eligible.columns == [
+        "stock_code",
+        "trade_date",
+        "stock_name",
+        "industry",
+        "market_type",
+        "listed_days",
+        "amount",
+        "roe",
+        "debt_ratio",
+    ]
+    assert factor_input.columns == [
+        "stock_code",
+        "trade_date",
+        "industry",
+        "market_type",
+        "adj_close",
+        "amount",
+        "turnover_rate",
+        "pe_ttm",
+        "pb",
+        "ps_ttm",
+        "total_mv",
+        "circ_mv",
+        "revenue_yoy",
+        "net_profit_yoy",
+        "roe",
+        "gross_margin",
+        "debt_ratio",
+        "operating_cashflow",
+    ]
+

@@ -17,6 +17,9 @@ RAW_DATASETS = (
 DERIVED_DATASETS = (
     "adjusted_price",
     "clean_daily_snapshot",
+    "risk_filter",
+    "eligible_universe",
+    "factor_input_table",
 )
 
 PROVIDER_DATASETS = RAW_DATASETS

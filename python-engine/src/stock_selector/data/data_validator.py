@@ -37,6 +37,9 @@ def validate_dataset_frame(dataset: str, df: pd.DataFrame, trade_date: str) -> N
         "benchmark_price": _validate_benchmark_price,
         "adjusted_price": _validate_adjusted_price,
         "clean_daily_snapshot": _validate_clean_daily_snapshot,
+        "risk_filter": _validate_risk_filter,
+        "eligible_universe": _validate_eligible_universe,
+        "factor_input_table": _validate_factor_input_table,
     }
     validators[dataset](df, trade_date)
 
@@ -259,3 +262,99 @@ def _validate_clean_daily_snapshot(df: pd.DataFrame, trade_date: str) -> None:
             raise DataValidationError("snapshot announce_date must be <= trade_date")
     for value in df["report_period"].dropna().astype(str):
         validate_trade_date(value)
+
+
+def _validate_risk_filter(df: pd.DataFrame, trade_date: str) -> None:
+    _require_columns(
+        df,
+        [
+            "stock_code",
+            "trade_date",
+            "is_eligible",
+            "exclude_reasons",
+            "risk_flags",
+            "is_st_on_date",
+            "is_paused",
+            "listed_days",
+            "amount",
+            "roe",
+            "debt_ratio",
+            "report_period",
+            "announce_date",
+        ],
+    )
+    _validate_trade_date_column(df, trade_date)
+    _validate_stock_codes(df)
+    _validate_unique(df, ["stock_code", "trade_date"])
+    if df[["exclude_reasons", "risk_flags"]].isna().any().any():
+        raise DataValidationError("risk reason fields must not be null")
+    if (df["listed_days"] < 0).any():
+        raise DataValidationError("listed_days must be non-negative")
+    if (df["amount"] < 0).any():
+        raise DataValidationError("amount must be non-negative")
+    for value in df["announce_date"].dropna().astype(str):
+        if validate_trade_date(value) > trade_date:
+            raise DataValidationError("risk_filter announce_date must be <= trade_date")
+    for value in df["report_period"].dropna().astype(str):
+        validate_trade_date(value)
+
+
+def _validate_eligible_universe(df: pd.DataFrame, trade_date: str) -> None:
+    _require_columns(
+        df,
+        [
+            "stock_code",
+            "trade_date",
+            "stock_name",
+            "industry",
+            "market_type",
+            "listed_days",
+            "amount",
+            "roe",
+            "debt_ratio",
+        ],
+    )
+    _validate_trade_date_column(df, trade_date)
+    _validate_stock_codes(df)
+    _validate_unique(df, ["stock_code", "trade_date"])
+    if (df["listed_days"] < 0).any():
+        raise DataValidationError("listed_days must be non-negative")
+    if (df["amount"] < 0).any():
+        raise DataValidationError("amount must be non-negative")
+    if df[["roe", "debt_ratio"]].isna().any().any():
+        raise DataValidationError("eligible_universe financial fields must not be null")
+
+
+def _validate_factor_input_table(df: pd.DataFrame, trade_date: str) -> None:
+    _require_columns(
+        df,
+        [
+            "stock_code",
+            "trade_date",
+            "industry",
+            "market_type",
+            "adj_close",
+            "amount",
+            "turnover_rate",
+            "pe_ttm",
+            "pb",
+            "ps_ttm",
+            "total_mv",
+            "circ_mv",
+            "revenue_yoy",
+            "net_profit_yoy",
+            "roe",
+            "gross_margin",
+            "debt_ratio",
+            "operating_cashflow",
+        ],
+    )
+    _validate_trade_date_column(df, trade_date)
+    _validate_stock_codes(df)
+    _validate_unique(df, ["stock_code", "trade_date"])
+    if df[["roe", "debt_ratio"]].isna().any().any():
+        raise DataValidationError("factor_input_table financial fields must not be null")
+    if (df["adj_close"] <= 0).any():
+        raise DataValidationError("adj_close must be positive")
+    if (df["amount"] < 0).any():
+        raise DataValidationError("amount must be non-negative")

@@ -14,3 +14,13 @@ def test_cli_accepts_goal4_cleaning_commands():
     assert snapshot.command == "build-clean-snapshot"
     assert snapshot.force is False
     assert validate.command == "validate-clean-snapshot"
+
+
+def test_cli_accepts_goal5_universe_command():
+    parser = build_parser()
+
+    universe = parser.parse_args(["build-universe-inputs", "--trade-date", "2026-06-19", "--force"])
+
+    assert universe.command == "build-universe-inputs"
+    assert universe.trade_date == "2026-06-19"
+    assert universe.force is True

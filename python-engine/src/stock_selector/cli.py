@@ -24,6 +24,7 @@ from stock_selector.storage.duckdb_query import query_dataset_file, query_stock_
 from stock_selector.storage.minio_client import create_minio_client, ensure_buckets, get_required_buckets
 from stock_selector.storage.partition import PROVIDER_DATASETS, DatasetValidationError, build_partition, validate_dataset
 from stock_selector.storage.postgres_client import create_postgres_client
+from stock_selector.universe.universe_pipeline import build_universe_inputs_for_date
 from stock_selector.utils.date_validator import DateValidationError, validate_date_range, validate_trade_date
 from stock_selector.utils.logger import get_logger
 
@@ -347,6 +348,19 @@ def _cmd_validate_clean_snapshot(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_universe_inputs(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+
+    _ensure_db_schema()
+    result = build_universe_inputs_for_date(trade_date, force=args.force, read_dataset_fn=_read_dataset, write_dataset_fn=_write_dataset)
+    print(json.dumps({"trade_date": trade_date, "force": args.force, "result": result}, ensure_ascii=False, default=str))
+    return 0
+
+
 def _cmd_show_update_log(args: argparse.Namespace) -> int:
     try:
         trade_date = validate_trade_date(args.trade_date)
@@ -536,6 +550,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate_snapshot = subparsers.add_parser("validate-clean-snapshot")
     validate_snapshot.add_argument("--trade-date", required=True)
     validate_snapshot.set_defaults(func=_cmd_validate_clean_snapshot)
+
+    build_universe = subparsers.add_parser("build-universe-inputs")
+    build_universe.add_argument("--trade-date", required=True)
+    build_universe.add_argument("--force", action="store_true")
+    build_universe.set_defaults(func=_cmd_build_universe_inputs)
 
     show_log = subparsers.add_parser("show-update-log")
     show_log.add_argument("--trade-date", required=True)

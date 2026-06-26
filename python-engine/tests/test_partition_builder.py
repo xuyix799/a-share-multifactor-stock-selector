@@ -7,6 +7,12 @@ def test_validate_dataset_accepts_whitelisted_dataset():
     assert validate_dataset("daily_price") == "daily_price"
 
 
+def test_validate_dataset_accepts_goal5_universe_datasets():
+    assert validate_dataset("risk_filter") == "risk_filter"
+    assert validate_dataset("eligible_universe") == "eligible_universe"
+    assert validate_dataset("factor_input_table") == "factor_input_table"
+
+
 def test_validate_dataset_rejects_unknown_or_unsafe_dataset():
     with pytest.raises(DatasetValidationError):
         validate_dataset("../daily_price")
