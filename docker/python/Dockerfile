@@ -17,6 +17,6 @@ COPY python-engine /app/python-engine
 COPY config /app/config
 COPY docker/postgres/init/001_schema.sql /app/docker/postgres/init/001_schema.sql
 
-WORKDIR /app/python-engine
+WORKDIR /app
 
 CMD ["python", "-m", "stock_selector.cli", "health-check"]

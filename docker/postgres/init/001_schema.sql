@@ -1,12 +1,17 @@
 CREATE TABLE IF NOT EXISTS update_log (
     trade_date DATE NOT NULL,
     step_name TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'done', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'done', 'failed')),
     object_key TEXT,
     message TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (trade_date, step_name)
 );
+
+ALTER TABLE update_log DROP CONSTRAINT IF EXISTS update_log_status_check;
+ALTER TABLE update_log
+    ADD CONSTRAINT update_log_status_check
+    CHECK (status IN ('pending', 'running', 'done', 'failed'));
 
 CREATE TABLE IF NOT EXISTS selection_snapshot (
     id BIGSERIAL PRIMARY KEY,

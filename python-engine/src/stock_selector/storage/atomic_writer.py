@@ -1,6 +1,10 @@
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import shutil
 from uuid import uuid4
+
+import pandas as pd
 
 from stock_selector.utils.path_validator import safe_object_key
 
@@ -48,7 +52,25 @@ class AtomicObjectWriter:
     @staticmethod
     def _temp_key_for(final_key: str) -> str:
         path = PureObjectKey(final_key)
-        return path.with_name(f".tmp-{uuid4().hex}-{path.name}")
+        parent = path.parent
+        if parent.startswith("raw/"):
+            parent = parent[len("raw/") :]
+        suffix = Path(path.name).suffix or ".parquet"
+        return safe_object_key(f"_raw_tmp/{parent}/{uuid4().hex}{suffix}")
+
+
+def write_parquet_local_atomic(df: pd.DataFrame, final_path: Path | str) -> Path:
+    final_path = Path(final_path)
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dir = final_path.parent / f".tmp-{uuid4().hex}"
+    tmp_dir.mkdir(parents=True, exist_ok=False)
+    tmp_file = tmp_dir / final_path.name
+    try:
+        df.to_parquet(tmp_file, index=False)
+        os.replace(tmp_file, final_path)
+        return final_path
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 class PureObjectKey:

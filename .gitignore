@@ -1,8 +1,8 @@
 .env
 .env.*
 !.env.example
-data/
-logs/
+/data/
+/logs/
 *.parquet
 *.duckdb
 *.db

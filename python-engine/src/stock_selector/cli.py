@@ -1,15 +1,24 @@
 import argparse
+from datetime import date, timedelta
+import json
 import sys
 import tempfile
 from pathlib import Path
 
 import pandas as pd
+from minio.error import S3Error
 
 from stock_selector.config.config_loader import load_settings
+from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame, validate_stock_code
+from stock_selector.data.mock_data import generate_mock_dataset
+from stock_selector.data.update_log import create_update_log_repository
 from stock_selector.storage.atomic_writer import AtomicObjectWriter
+from stock_selector.storage.atomic_writer import write_parquet_local_atomic
+from stock_selector.storage.duckdb_query import query_dataset_file, query_stock_price_files
 from stock_selector.storage.minio_client import create_minio_client, ensure_buckets, get_required_buckets
+from stock_selector.storage.partition import SUPPORTED_DATASETS, DatasetValidationError, build_partition, validate_dataset
 from stock_selector.storage.postgres_client import create_postgres_client
-from stock_selector.utils.date_validator import DateValidationError, validate_trade_date
+from stock_selector.utils.date_validator import DateValidationError, validate_date_range, validate_trade_date
 from stock_selector.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -23,6 +32,17 @@ def _cmd_validate_date(args: argparse.Namespace) -> int:
         return 2
 
     print(f"valid trade_date: {trade_date}")
+    return 0
+
+
+def _cmd_validate_range(args: argparse.Namespace) -> int:
+    try:
+        start_date, end_date = validate_date_range(args.start_date, args.end_date)
+    except DateValidationError as exc:
+        print(f"invalid date range: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"valid date range: {start_date}..{end_date}")
     return 0
 
 
@@ -104,6 +124,201 @@ def _cmd_storage_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_generate_mock_data(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+        datasets = _resolve_datasets(args.dataset)
+    except (DateValidationError, DatasetValidationError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    written = []
+    for dataset in datasets:
+        df = generate_mock_dataset(dataset, trade_date)
+        validate_dataset_frame(dataset, df, trade_date)
+        written.append(_write_dataset(dataset, trade_date, df))
+
+    print(json.dumps({"trade_date": trade_date, "written": written}, ensure_ascii=False))
+    return 0
+
+
+def _cmd_validate_data(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+        datasets = _resolve_datasets(args.dataset)
+    except (DateValidationError, DatasetValidationError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="stock-validate-") as tmp:
+        for dataset in datasets:
+            path = _materialize_dataset(dataset, trade_date, Path(tmp))
+            df = pd.read_parquet(path)
+            validate_dataset_frame(dataset, df, trade_date)
+
+    print(json.dumps({"trade_date": trade_date, "validated": datasets}, ensure_ascii=False))
+    return 0
+
+
+def _cmd_update_mock_data(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+
+    _ensure_db_schema()
+    repo = create_update_log_repository()
+    results = []
+    for dataset in SUPPORTED_DATASETS:
+        step_name = f"mock_data:{dataset}"
+        if not repo.should_run_step(trade_date, step_name, force=args.force):
+            results.append({"dataset": dataset, "status": "skipped"})
+            continue
+
+        try:
+            repo.mark_step_running(trade_date, step_name)
+            df = generate_mock_dataset(dataset, trade_date)
+            validate_dataset_frame(dataset, df, trade_date)
+            object_key = _write_dataset(dataset, trade_date, df)
+            repo.mark_step_done(trade_date, step_name, object_key)
+            results.append({"dataset": dataset, "status": "done", "object_key": object_key})
+        except Exception as exc:
+            repo.mark_step_failed(trade_date, step_name, str(exc))
+            raise
+
+    print(json.dumps({"trade_date": trade_date, "force": args.force, "results": results}, ensure_ascii=False))
+    return 0
+
+
+def _cmd_query_parquet(args: argparse.Namespace) -> int:
+    try:
+        dataset = validate_dataset(args.dataset)
+        trade_date = validate_trade_date(args.trade_date)
+    except (DatasetValidationError, DateValidationError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="stock-query-") as tmp:
+        path = _materialize_dataset(dataset, trade_date, Path(tmp))
+        rows = query_dataset_file(path, limit=10)
+
+    print(json.dumps({"dataset": dataset, "trade_date": trade_date, "row_count": len(rows), "rows": rows}, ensure_ascii=False, default=str))
+    return 0
+
+
+def _cmd_query_stock_price(args: argparse.Namespace) -> int:
+    try:
+        stock_code = validate_stock_code(args.stock_code)
+        start_date, end_date = validate_date_range(args.start_date, args.end_date)
+    except (DataValidationError, DateValidationError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="stock-price-query-") as tmp:
+        paths = []
+        for day in _iter_dates(start_date, end_date):
+            path = _try_materialize_dataset("daily_price", day, Path(tmp))
+            if path:
+                paths.append(path)
+        rows = query_stock_price_files(paths, stock_code, start_date, end_date)
+
+    print(json.dumps({"stock_code": stock_code, "start_date": start_date, "end_date": end_date, "row_count": len(rows), "rows": rows}, ensure_ascii=False, default=str))
+    return 0
+
+
+def _cmd_show_update_log(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+
+    _ensure_db_schema()
+    repo = create_update_log_repository()
+    rows = repo.list_by_trade_date(trade_date)
+    print(json.dumps({"trade_date": trade_date, "rows": rows}, ensure_ascii=False, default=str))
+    return 0
+
+
+def _resolve_datasets(dataset: str) -> list[str]:
+    if dataset == "all":
+        return list(SUPPORTED_DATASETS)
+    return [validate_dataset(dataset)]
+
+
+def _ensure_db_schema() -> None:
+    client = create_postgres_client()
+    client.initialize_schema(client.schema_sql_path)
+
+
+def _storage_backend(settings: dict) -> str:
+    import os
+
+    backend = os.getenv("STOCK_PARQUET_BACKEND") or settings["storage"].get("parquet_backend", "minio")
+    if backend not in {"local", "minio"}:
+        raise ValueError(f"unsupported storage backend: {backend}")
+    return backend
+
+
+def _local_root(settings: dict) -> Path:
+    import os
+
+    return Path(os.getenv("STOCK_LOCAL_DATA_DIR") or settings["storage"].get("local_data_dir", "data"))
+
+
+def _write_dataset(dataset: str, trade_date: str, df: pd.DataFrame) -> str:
+    settings = load_settings()
+    partition = build_partition(dataset, trade_date, local_root=_local_root(settings))
+    backend = _storage_backend(settings)
+    if backend == "local":
+        write_parquet_local_atomic(df, partition.local_path)
+        return partition.local_path.as_posix()
+
+    minio_client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_raw"]
+    ensure_buckets(minio_client, [bucket])
+    with tempfile.TemporaryDirectory(prefix="stock-write-") as tmp:
+        local_file = Path(tmp) / "part.parquet"
+        df.to_parquet(local_file, index=False)
+        result = AtomicObjectWriter(minio_client, tmp_dir=Path(tmp)).write_file_atomic(bucket, partition.object_key, local_file)
+    return result.final_key
+
+
+def _materialize_dataset(dataset: str, trade_date: str, tmp_root: Path) -> Path:
+    path = _try_materialize_dataset(dataset, trade_date, tmp_root)
+    if not path:
+        raise FileNotFoundError(f"missing parquet for {dataset} {trade_date}")
+    return path
+
+
+def _try_materialize_dataset(dataset: str, trade_date: str, tmp_root: Path) -> Path | None:
+    settings = load_settings()
+    partition = build_partition(dataset, trade_date, local_root=_local_root(settings))
+    if _storage_backend(settings) == "local":
+        return partition.local_path if partition.local_path.exists() else None
+
+    minio_client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_raw"]
+    target = tmp_root / partition.object_key
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        minio_client.fget_object(bucket, partition.object_key, str(target))
+    except S3Error as exc:
+        if exc.code in {"NoSuchKey", "NoSuchBucket", "NoSuchObject"}:
+            return None
+        raise
+    return target
+
+
+def _iter_dates(start_date: str, end_date: str):
+    current = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date)
+    while current <= end:
+        yield current.isoformat()
+        current += timedelta(days=1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="stock-selector")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -115,6 +330,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--trade-date", required=True)
     validate.set_defaults(func=_cmd_validate_date)
 
+    validate_range = subparsers.add_parser("validate-range")
+    validate_range.add_argument("--start-date", required=True)
+    validate_range.add_argument("--end-date", required=True)
+    validate_range.set_defaults(func=_cmd_validate_range)
+
     init_db = subparsers.add_parser("init-db")
     init_db.set_defaults(func=_cmd_init_db)
 
@@ -124,6 +344,36 @@ def build_parser() -> argparse.ArgumentParser:
     smoke = subparsers.add_parser("storage-smoke")
     smoke.add_argument("--trade-date", required=True)
     smoke.set_defaults(func=_cmd_storage_smoke)
+
+    generate = subparsers.add_parser("generate-mock-data")
+    generate.add_argument("--trade-date", required=True)
+    generate.add_argument("--dataset", required=True)
+    generate.set_defaults(func=_cmd_generate_mock_data)
+
+    validate_data = subparsers.add_parser("validate-data")
+    validate_data.add_argument("--trade-date", required=True)
+    validate_data.add_argument("--dataset", required=True)
+    validate_data.set_defaults(func=_cmd_validate_data)
+
+    update_mock = subparsers.add_parser("update-mock-data")
+    update_mock.add_argument("--trade-date", required=True)
+    update_mock.add_argument("--force", action="store_true")
+    update_mock.set_defaults(func=_cmd_update_mock_data)
+
+    query = subparsers.add_parser("query-parquet")
+    query.add_argument("--dataset", required=True)
+    query.add_argument("--trade-date", required=True)
+    query.set_defaults(func=_cmd_query_parquet)
+
+    query_stock = subparsers.add_parser("query-stock-price")
+    query_stock.add_argument("--stock-code", required=True)
+    query_stock.add_argument("--start-date", required=True)
+    query_stock.add_argument("--end-date", required=True)
+    query_stock.set_defaults(func=_cmd_query_stock_price)
+
+    show_log = subparsers.add_parser("show-update-log")
+    show_log.add_argument("--trade-date", required=True)
+    show_log.set_defaults(func=_cmd_show_update_log)
 
     return parser
 
