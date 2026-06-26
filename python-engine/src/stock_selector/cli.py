@@ -11,7 +11,11 @@ from minio.error import S3Error
 from stock_selector.config.config_loader import load_settings
 from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame, validate_stock_code
 from stock_selector.data.mock_data import generate_mock_dataset
+from stock_selector.data.update_pipeline import update_provider_data
 from stock_selector.data.update_log import create_update_log_repository
+from stock_selector.providers.provider_factory import list_providers
+from stock_selector.providers.schema_contract import inspect_schema
+from stock_selector.providers.schema_mapper import SchemaMappingError, normalize_date, normalize_stock_code
 from stock_selector.storage.atomic_writer import AtomicObjectWriter
 from stock_selector.storage.atomic_writer import write_parquet_local_atomic
 from stock_selector.storage.duckdb_query import query_dataset_file, query_stock_price_files
@@ -191,6 +195,78 @@ def _cmd_update_mock_data(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_list_providers(args: argparse.Namespace) -> int:
+    _ = args
+    print(json.dumps(list_providers(), ensure_ascii=False))
+    return 0
+
+
+def _cmd_update_provider_data(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+
+    _ensure_db_schema()
+    results = update_provider_data(
+        trade_date,
+        provider_name=args.provider,
+        force=args.force,
+        write_dataset_fn=_write_dataset,
+    )
+    print(json.dumps({"trade_date": trade_date, "provider": args.provider, "force": args.force, "results": results}, ensure_ascii=False))
+    return 0
+
+
+def _cmd_validate_provider_data(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+        datasets = _resolve_datasets(args.dataset)
+    except (DateValidationError, DatasetValidationError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="stock-provider-validate-") as tmp:
+        for dataset in datasets:
+            path = _materialize_dataset(dataset, trade_date, Path(tmp))
+            df = pd.read_parquet(path)
+            validate_dataset_frame(dataset, df, trade_date)
+
+    print(json.dumps({"trade_date": trade_date, "validated": datasets}, ensure_ascii=False))
+    return 0
+
+
+def _cmd_inspect_schema(args: argparse.Namespace) -> int:
+    try:
+        info = inspect_schema(args.dataset)
+    except DatasetValidationError as exc:
+        print(f"invalid dataset: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(info, ensure_ascii=False))
+    return 0
+
+
+def _cmd_normalize_stock_code(args: argparse.Namespace) -> int:
+    try:
+        normalized = normalize_stock_code(args.stock_code)
+    except SchemaMappingError as exc:
+        print(f"invalid stock_code: {exc}", file=sys.stderr)
+        return 2
+    print(normalized)
+    return 0
+
+
+def _cmd_normalize_date(args: argparse.Namespace) -> int:
+    try:
+        normalized = normalize_date(args.date)
+    except SchemaMappingError as exc:
+        print(f"invalid date: {exc}", file=sys.stderr)
+        return 2
+    print(normalized)
+    return 0
+
+
 def _cmd_query_parquet(args: argparse.Namespace) -> int:
     try:
         dataset = validate_dataset(args.dataset)
@@ -359,6 +435,32 @@ def build_parser() -> argparse.ArgumentParser:
     update_mock.add_argument("--trade-date", required=True)
     update_mock.add_argument("--force", action="store_true")
     update_mock.set_defaults(func=_cmd_update_mock_data)
+
+    list_provider_parser = subparsers.add_parser("list-providers")
+    list_provider_parser.set_defaults(func=_cmd_list_providers)
+
+    update_provider = subparsers.add_parser("update-provider-data")
+    update_provider.add_argument("--trade-date", required=True)
+    update_provider.add_argument("--provider", default="mock")
+    update_provider.add_argument("--force", action="store_true")
+    update_provider.set_defaults(func=_cmd_update_provider_data)
+
+    validate_provider_data = subparsers.add_parser("validate-provider-data")
+    validate_provider_data.add_argument("--trade-date", required=True)
+    validate_provider_data.add_argument("--dataset", required=True)
+    validate_provider_data.set_defaults(func=_cmd_validate_provider_data)
+
+    inspect_schema_parser = subparsers.add_parser("inspect-schema")
+    inspect_schema_parser.add_argument("--dataset", required=True)
+    inspect_schema_parser.set_defaults(func=_cmd_inspect_schema)
+
+    normalize_code = subparsers.add_parser("normalize-stock-code")
+    normalize_code.add_argument("--stock-code", required=True)
+    normalize_code.set_defaults(func=_cmd_normalize_stock_code)
+
+    normalize_date_parser = subparsers.add_parser("normalize-date")
+    normalize_date_parser.add_argument("--date", required=True)
+    normalize_date_parser.set_defaults(func=_cmd_normalize_date)
 
     query = subparsers.add_parser("query-parquet")
     query.add_argument("--dataset", required=True)

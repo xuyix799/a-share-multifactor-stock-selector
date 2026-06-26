@@ -12,6 +12,7 @@ class DataValidationError(ValueError):
 
 
 STOCK_CODE_PATTERN = re.compile(r"^\d{6}\.(SZ|SH|BJ)$")
+REQUIRED_BENCHMARK_INDEXES = {"000300.SH", "000905.SH", "000906.SH"}
 
 
 def validate_stock_code(stock_code: str) -> str:
@@ -61,9 +62,13 @@ def _validate_unique(df: pd.DataFrame, columns: list[str]) -> None:
 
 
 def _validate_stock_basic(df: pd.DataFrame, trade_date: str) -> None:
-    _require_columns(df, ["stock_code", "stock_name", "exchange", "list_date", "industry", "market_type", "is_st", "trade_date"])
+    _require_columns(df, ["stock_code", "stock_name", "exchange", "list_date", "delist_date", "industry", "market_type", "is_st", "trade_date"])
     _validate_trade_date_column(df, trade_date)
     _validate_stock_codes(df)
+    for value in df["list_date"].astype(str):
+        validate_trade_date(value)
+    for value in df["delist_date"].dropna().astype(str):
+        validate_trade_date(value)
     _validate_unique(df, ["stock_code", "trade_date"])
 
 
@@ -156,6 +161,9 @@ def _validate_st_history(df: pd.DataFrame, trade_date: str) -> None:
 def _validate_benchmark_price(df: pd.DataFrame, trade_date: str) -> None:
     _require_columns(df, ["index_code", "trade_date", "open", "high", "low", "close", "pct_chg"])
     _validate_trade_date_column(df, trade_date)
+    missing = sorted(REQUIRED_BENCHMARK_INDEXES - set(df["index_code"].astype(str)))
+    if missing:
+        raise DataValidationError(f"missing benchmark indexes: {', '.join(missing)}")
     if (df["close"] <= 0).any() or (df["open"] <= 0).any():
         raise DataValidationError("benchmark open and close must be positive")
     if (df["high"] < df["low"]).any():

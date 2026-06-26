@@ -26,6 +26,19 @@ storage:
   minio_bucket_processed: "stock-processed"
   minio_bucket_backtest: "stock-backtest"
 
+provider:
+  default: "mock"
+  retry:
+    max_attempts: 3
+    backoff_seconds: 2
+  tushare:
+    enabled: false
+    token_env: "TUSHARE_TOKEN"
+  akshare:
+    enabled: false
+  baostock:
+    enabled: false
+
 service:
   metadata_db: "postgresql"
   api_backend: "springboot"
