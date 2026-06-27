@@ -40,6 +40,20 @@ CREATE TABLE IF NOT EXISTS backtest_summary (
     detail_object_key TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE backtest_summary ADD COLUMN IF NOT EXISTS run_key TEXT;
+ALTER TABLE backtest_summary ADD COLUMN IF NOT EXISTS rebalance_mode TEXT;
+ALTER TABLE backtest_summary ADD COLUMN IF NOT EXISTS initial_cash DOUBLE PRECISION;
+ALTER TABLE backtest_summary ADD COLUMN IF NOT EXISTS commission_rate DOUBLE PRECISION;
+ALTER TABLE backtest_summary ADD COLUMN IF NOT EXISTS slippage_bps DOUBLE PRECISION;
+ALTER TABLE backtest_summary ADD COLUMN IF NOT EXISTS stamp_tax_rate DOUBLE PRECISION;
+ALTER TABLE backtest_summary ADD COLUMN IF NOT EXISTS top_n INTEGER;
+ALTER TABLE backtest_summary ADD COLUMN IF NOT EXISTS execution_rule TEXT;
+ALTER TABLE backtest_summary ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'done';
+ALTER TABLE backtest_summary DROP CONSTRAINT IF EXISTS backtest_summary_status_check;
+ALTER TABLE backtest_summary
+    ADD CONSTRAINT backtest_summary_status_check
+    CHECK (status IN ('done', 'failed'));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_backtest_summary_run_key ON backtest_summary(run_key) WHERE run_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS factor_config (
     id BIGSERIAL PRIMARY KEY,

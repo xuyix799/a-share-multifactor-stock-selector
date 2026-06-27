@@ -8,9 +8,10 @@ from pathlib import Path
 import pandas as pd
 from minio.error import S3Error
 
+from stock_selector.backtesting.backtest_pipeline import BacktestConfig, run_backtest
 from stock_selector.cleaning.clean_pipeline import build_adjusted_price_for_date, build_clean_snapshot_for_date
 from stock_selector.cleaning.snapshot_validator import validate_clean_daily_snapshot
-from stock_selector.config.config_loader import load_settings
+from stock_selector.config.config_loader import load_factor_weights_config, load_settings
 from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame, validate_stock_code
 from stock_selector.data.mock_data import generate_mock_dataset
 from stock_selector.data.update_pipeline import update_provider_data
@@ -423,6 +424,37 @@ def _cmd_validate_selection(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_run_backtest(args: argparse.Namespace) -> int:
+    try:
+        start_date, end_date = validate_date_range(args.start_date, args.end_date)
+        settings = load_settings()
+        backtest_settings = settings.get("backtest", {})
+        factor_weights = load_factor_weights_config()
+        top_n_default = int(factor_weights.get("scoring", {}).get("top_n", 50))
+        slippage_default = float(backtest_settings.get("slippage", 0.0)) * 10000
+        config = BacktestConfig(
+            strategy_name=args.strategy_name or "selection_equal_weight",
+            start_date=start_date,
+            end_date=end_date,
+            rebalance_mode=args.rebalance or backtest_settings.get("rebalance", "monthly"),
+            initial_cash=float(args.initial_cash if args.initial_cash is not None else backtest_settings.get("init_cash", 100000)),
+            commission_rate=float(args.commission_rate if args.commission_rate is not None else backtest_settings.get("commission", 0.0)),
+            slippage_bps=float(args.slippage_bps if args.slippage_bps is not None else slippage_default),
+            stamp_tax_rate=float(args.stamp_tax_rate if args.stamp_tax_rate is not None else backtest_settings.get("stamp_tax", 0.0)),
+            top_n=int(args.top_n if args.top_n is not None else top_n_default),
+            execution_rule=args.execution_rule or backtest_settings.get("execution", "next_open"),
+        )
+        config.normalized()
+    except (DateValidationError, ValueError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    _ensure_db_schema()
+    result = run_backtest(config, force=args.force)
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return 0
+
+
 def _cmd_show_update_log(args: argparse.Namespace) -> int:
     try:
         trade_date = validate_trade_date(args.trade_date)
@@ -635,6 +667,20 @@ def build_parser() -> argparse.ArgumentParser:
     validate_selection = subparsers.add_parser("validate-selection")
     validate_selection.add_argument("--trade-date", required=True)
     validate_selection.set_defaults(func=_cmd_validate_selection)
+
+    run_backtest_parser = subparsers.add_parser("run-backtest")
+    run_backtest_parser.add_argument("--strategy-name")
+    run_backtest_parser.add_argument("--start-date", required=True)
+    run_backtest_parser.add_argument("--end-date", required=True)
+    run_backtest_parser.add_argument("--rebalance", choices=["monthly", "quarterly"])
+    run_backtest_parser.add_argument("--initial-cash", type=float)
+    run_backtest_parser.add_argument("--commission-rate", type=float)
+    run_backtest_parser.add_argument("--slippage-bps", type=float)
+    run_backtest_parser.add_argument("--stamp-tax-rate", type=float)
+    run_backtest_parser.add_argument("--top-n", type=int)
+    run_backtest_parser.add_argument("--execution-rule")
+    run_backtest_parser.add_argument("--force", action="store_true")
+    run_backtest_parser.set_defaults(func=_cmd_run_backtest)
 
     show_log = subparsers.add_parser("show-update-log")
     show_log.add_argument("--trade-date", required=True)
