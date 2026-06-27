@@ -1,6 +1,6 @@
 # A股中长线多因子选股系统
 
-本仓库是一个本地 Docker 部署的 A股中长线多因子选股系统。当前已推进到 Goal 9：Spring Boot 最小结果查询 API。
+本仓库是一个本地 Docker 部署的 A股中长线多因子选股系统。当前已推进到 Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke。
 
 系统定位：
 
@@ -20,17 +20,21 @@
 
 - Goal 1：Docker 基础设施，包含 `stock-postgres`、`stock-minio`、`stock-python`、`stock-api`。
 - Goal 2：mock 数据安全闭环，支持 Parquet / MinIO / `update_log` / DuckDB 查询 / 幂等重跑。
-- Goal 3：provider adapter 层，已实现 `MockProvider`、schema contract、schema mapping、provider pipeline；真实 Tushare / AKShare / Baostock 只保留骨架且默认禁用。
+- Goal 3：provider adapter 层，已实现 `MockProvider`、schema contract、schema mapping、provider pipeline；真实 provider 默认禁用。
 - Goal 4：clean snapshot 层，已实现 `adjusted_price`、financial as-of join、ST 历史判断、`clean_daily_snapshot`。
 - Goal 5：风险过滤与候选股票池输入层，已实现 `risk_filter`、`eligible_universe`、`factor_input_table`。
 - Goal 6：中长线基础因子计算层，已实现 `factor_daily`，包含质量、成长、估值、趋势、行业强度和五个子评分。
 - Goal 7：综合评分与候选结果层，已实现 `total_score`、`risk_level`、规则化 `reason` / `suggestion`、`selection_result` 和 PostgreSQL `selection_snapshot` 摘要。
 - Goal 8：回测核心层，已实现 T 日信号、T+1 成交、月度/季度调仓、交易成本、滑点、印花税、涨跌停/停牌约束、三指数 benchmark 对比、回测明细 Parquet 和 PostgreSQL `backtest_summary` 摘要。
 - Goal 9：Spring Boot 最小结果查询 API，已实现 PostgreSQL 摘要查询，不读取 MinIO / Parquet，不执行 Python 计算或回测。
+- Goal 10：Tushare 最小真实数据 smoke，已接入 `stock_basic`、`daily_price`、`adj_factor`、`daily_basic` 的可选真实拉取和标准层校验链路；默认禁用，不影响 mock 测试。当前 Tushare smoke 受账号权限和频控限制，不作为主验收。
+- Goal 10B：AKShare / Baostock 最小真实数据 smoke，已验证 AKShare `benchmark_price` 可标准化写入 `smoke/akshare/...` 并通过 DuckDB 查询；字段不足的数据集不会绕过 validator 写入标准层。
+- Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke，新增 smoke-only `daily_price_raw_smoke`，只允许写入 `smoke/<provider>/daily_price_raw_smoke/...`，不进入标准 `raw/daily_price/...`。
 
 当前未实现：
 
-- 真实行情 API 接入。
+- 完整真实行情 API 接入。
+- 真实财务数据接入。
 - LLM 解释。
 - 复杂 Spring Boot 业务 API / 前端页面。
 - 自动交易或券商账户接入。
@@ -188,6 +192,146 @@ docker compose run --rm stock-python python -m stock_selector.cli query-parquet 
 docker compose run --rm stock-python python -m stock_selector.cli show-update-log --trade-date 2026-06-19
 ```
 
+## 可选真实 Provider Smoke
+
+真实 provider smoke 只用于验证真实数据经过 provider adapter、schema mapping、`data_validator`、MinIO / Parquet 和 DuckDB 查询；它不是实盘策略入口，也不会自动调度。所有非 mock provider 都必须加 `--smoke`，只允许写入：
+
+```text
+smoke/<provider>/<dataset>/trade_date=YYYY-MM-DD/part.parquet
+```
+
+不允许真实 provider 直接写标准 `raw/<dataset>/...` 路径。
+
+### AKShare benchmark smoke
+
+AKShare 不需要 token。当前只把 `benchmark_price` 作为标准化 smoke 数据集：AKShare 指数日线提供 `date/open/high/low/close`，系统用前一交易日 close 计算 `pct_chg`，写出三只 benchmark 指数 `000300.SH`、`000905.SH`、`000906.SH`。
+
+```powershell
+$env:STOCK_AKSHARE_ENABLED='1'
+$env:AKSHARE_SMOKE_TRADE_DATE='2024-06-19'
+
+docker compose run --rm stock-python python -m stock_selector.cli update-provider-data `
+  --provider akshare `
+  --trade-date $env:AKSHARE_SMOKE_TRADE_DATE `
+  --dataset benchmark_price `
+  --smoke `
+  --force
+
+docker compose run --rm stock-python python -m stock_selector.cli query-parquet --dataset benchmark_price --trade-date $env:AKSHARE_SMOKE_TRADE_DATE --smoke-provider akshare
+```
+
+可选真实集成测试默认跳过；只有同时设置 `RUN_AKSHARE_SMOKE=1`、`STOCK_AKSHARE_ENABLED=1` 和 `AKSHARE_SMOKE_TRADE_DATE` 时才运行：
+
+```powershell
+$env:RUN_AKSHARE_SMOKE='1'
+docker compose run --rm stock-python pytest python-engine/tests/test_akshare_smoke_integration.py -q
+```
+
+AKShare `stock_basic` 当前缺少标准层要求的 `list_date`、`industry`、`market_type`、`is_st` 等稳定全量字段；AKShare `daily_price` 缺少标准层必需的 `limit_up` / `limit_down` / `is_paused`。这些 dataset 会明确输出 provider capability 不足，不会伪造字段或绕过 validator。
+
+### Goal 11 daily raw smoke
+
+`daily_price_raw_smoke` 是 smoke-only 数据集，只用于真实 provider 字段探测和最小日线连通性验证。它不是标准 `daily_price`，不会进入 `raw/daily_price/...`，也不会进入清洗、因子、评分或回测链路。
+
+写入路径固定为：
+
+```text
+smoke/<provider>/daily_price_raw_smoke/trade_date=YYYY-MM-DD/part.parquet
+```
+
+当前 raw smoke 字段：
+
+```text
+stock_code, trade_date, open, high, low, close, volume, amount, pct_chg, source_symbol
+```
+
+AKShare 日线 raw smoke：
+
+```powershell
+$env:STOCK_AKSHARE_ENABLED='1'
+$env:AKSHARE_SMOKE_TRADE_DATE='2024-06-19'
+
+docker compose run --rm stock-python python -m stock_selector.cli update-provider-data `
+  --provider akshare `
+  --trade-date $env:AKSHARE_SMOKE_TRADE_DATE `
+  --dataset daily_price_raw_smoke `
+  --smoke `
+  --force
+
+docker compose run --rm stock-python python -m stock_selector.cli query-parquet --dataset daily_price_raw_smoke --trade-date $env:AKSHARE_SMOKE_TRADE_DATE --smoke-provider akshare
+```
+
+Baostock 日线 raw smoke：
+
+```powershell
+$env:STOCK_BAOSTOCK_ENABLED='1'
+$env:BAOSTOCK_SMOKE_TRADE_DATE='2024-06-19'
+
+docker compose run --rm stock-python python -m stock_selector.cli update-provider-data `
+  --provider baostock `
+  --trade-date $env:BAOSTOCK_SMOKE_TRADE_DATE `
+  --dataset daily_price_raw_smoke `
+  --smoke `
+  --force
+
+docker compose run --rm stock-python python -m stock_selector.cli query-parquet --dataset daily_price_raw_smoke --trade-date $env:BAOSTOCK_SMOKE_TRADE_DATE --smoke-provider baostock
+```
+
+如果 Baostock 登录返回 `10002007 网络接收错误`，保持 Baostock smoke blocked；不要改写为标准 `daily_price`，也不要补假字段。
+
+可选真实集成测试默认跳过；只有显式设置对应环境变量才运行：
+
+```powershell
+$env:RUN_AKSHARE_SMOKE='1'
+docker compose run --rm stock-python pytest python-engine/tests/test_akshare_smoke_integration.py -q
+
+$env:RUN_BAOSTOCK_SMOKE='1'
+docker compose run --rm stock-python pytest python-engine/tests/test_baostock_smoke_integration.py -q
+```
+
+### Tushare Smoke
+
+当前 Tushare smoke 标记为 blocked：已确认账号权限不足且存在频控限制，不作为 Goal 11 验收项。以下命令仅保留为历史调试说明，当前阶段不要重跑 Tushare。
+
+Tushare smoke 只用于验证真实数据经过 provider adapter、schema mapping、`data_validator`、MinIO / Parquet 和 DuckDB 查询；它不是实盘策略入口，也不会自动调度。
+
+默认 mock 链路不需要 token，也不会访问网络。只有显式设置以下环境变量时才启用 Tushare：
+
+```powershell
+$env:STOCK_TUSHARE_ENABLED='1'
+$env:TUSHARE_TOKEN='<your-token>'
+$env:TUSHARE_SMOKE_TRADE_DATE='YYYY-MM-DD'
+```
+
+最小真实拉取只覆盖四个数据集：
+
+```powershell
+docker compose run --rm stock-python python -m stock_selector.cli update-provider-data `
+  --provider tushare `
+  --trade-date $env:TUSHARE_SMOKE_TRADE_DATE `
+  --dataset stock_basic `
+  --dataset daily_price `
+  --dataset adj_factor `
+  --dataset daily_basic `
+  --smoke `
+  --force
+```
+
+写入后可用 DuckDB 查询已落地的 Parquet：
+
+```powershell
+docker compose run --rm stock-python python -m stock_selector.cli query-parquet --dataset daily_price --trade-date $env:TUSHARE_SMOKE_TRADE_DATE --smoke-provider tushare
+```
+
+可选真实集成测试默认跳过；只有同时设置 `RUN_TUSHARE_SMOKE=1`、`STOCK_TUSHARE_ENABLED=1`、`TUSHARE_TOKEN` 和 `TUSHARE_SMOKE_TRADE_DATE` 时才运行：
+
+```powershell
+$env:RUN_TUSHARE_SMOKE='1'
+docker compose run --rm stock-python pytest python-engine/tests/test_tushare_smoke_integration.py -q
+```
+
+Goal 10 / 10B 不做十年全量数据，不执行因子、选股、回测或自动交易。
+
 ## 幂等与重跑
 
 所有关键派生任务通过 PostgreSQL `update_log` 记录状态：
@@ -223,12 +367,12 @@ $env:PYTHONPATH='src;tests'
 python -m pytest
 ```
 
-当前基线：`122 passed`。
+当前 Docker 基线：`152 passed, 1 skipped`。
 
 ## 开发约束
 
 - 所有测试必须能在 mock provider、无网络、无真实 token 下通过。
-- 真实 Tushare / AKShare / Baostock provider 默认禁用。
+- 真实 Tushare / AKShare / Baostock provider 默认禁用；Tushare smoke 必须显式 opt-in。
 - 价格类因子只使用 `adjusted_price`。
 - 财务因子只使用已清洗的 as-of 结果，不读取未来财务数据。
 - benchmark 比较使用 `benchmark_price`，默认指数 `000300.SH`。

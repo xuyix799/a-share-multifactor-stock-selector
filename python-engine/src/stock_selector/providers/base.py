@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 
 import pandas as pd
 
-from stock_selector.storage.partition import PROVIDER_DATASETS, validate_dataset
+from stock_selector.storage.partition import PROVIDER_DATASETS, validate_provider_smoke_dataset
 from stock_selector.utils.date_validator import validate_trade_date
 
 
@@ -18,9 +18,12 @@ class MarketDataProvider(ABC):
     name: str
 
     def fetch_dataset(self, dataset: str, trade_date: str) -> pd.DataFrame:
-        dataset = validate_dataset(dataset)
+        dataset = validate_provider_smoke_dataset(dataset)
         trade_date = validate_trade_date(trade_date)
-        return getattr(self, f"fetch_{dataset}")(trade_date)
+        fetch_method = getattr(self, f"fetch_{dataset}", None)
+        if fetch_method is None:
+            raise ProviderFetchError(f"provider capability insufficient: {self.name} {dataset} is not implemented")
+        return fetch_method(trade_date)
 
     @abstractmethod
     def fetch_stock_basic(self, trade_date: str) -> pd.DataFrame:

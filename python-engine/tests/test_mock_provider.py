@@ -32,6 +32,22 @@ def test_provider_factory_lists_mock_and_disabled_real_provider_skeletons():
     assert create_provider("mock").name == "mock"
 
 
+def test_provider_factory_can_enable_tushare_with_explicit_env_flag(monkeypatch):
+    monkeypatch.setenv("STOCK_TUSHARE_ENABLED", "1")
+
+    providers = list_providers()
+
+    assert providers["tushare"]["enabled"] is True
+
+
+def test_provider_factory_can_enable_akshare_with_explicit_env_flag(monkeypatch):
+    monkeypatch.setenv("STOCK_AKSHARE_ENABLED", "1")
+
+    providers = list_providers()
+
+    assert providers["akshare"]["enabled"] is True
+
+
 def test_real_provider_without_token_has_clear_error_but_does_not_affect_mock():
     assert create_provider("mock").name == "mock"
 

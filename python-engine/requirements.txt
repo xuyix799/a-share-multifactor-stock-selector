@@ -1,7 +1,10 @@
 duckdb==1.4.3
+akshare==1.18.64
+baostock==0.8.9
 minio==7.2.20
 pandas==2.3.3
 psycopg2-binary==2.9.11
 pyarrow==22.0.0
 pytest==9.0.2
 PyYAML==6.0.3
+tushare==1.4.29

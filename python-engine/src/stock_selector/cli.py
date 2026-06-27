@@ -27,7 +27,14 @@ from stock_selector.storage.atomic_writer import AtomicObjectWriter
 from stock_selector.storage.atomic_writer import write_parquet_local_atomic
 from stock_selector.storage.duckdb_query import query_dataset_file, query_stock_price_files
 from stock_selector.storage.minio_client import create_minio_client, ensure_buckets, get_required_buckets
-from stock_selector.storage.partition import PROVIDER_DATASETS, DatasetValidationError, build_partition, validate_dataset
+from stock_selector.storage.partition import (
+    PROVIDER_DATASETS,
+    DatasetValidationError,
+    build_partition,
+    build_provider_smoke_partition,
+    validate_dataset,
+    validate_provider_smoke_dataset,
+)
 from stock_selector.storage.postgres_client import create_postgres_client
 from stock_selector.universe.universe_pipeline import build_universe_inputs_for_date
 from stock_selector.utils.date_validator import DateValidationError, validate_date_range, validate_trade_date
@@ -215,15 +222,27 @@ def _cmd_update_provider_data(args: argparse.Namespace) -> int:
     except DateValidationError as exc:
         print(f"invalid trade_date: {exc}", file=sys.stderr)
         return 2
+    provider_name = args.provider.lower()
+    if provider_name != "mock" and not args.smoke:
+        print("external provider updates must use --smoke to avoid standard raw data pollution", file=sys.stderr)
+        return 2
 
     _ensure_db_schema()
+    writer = _write_dataset
+    step_prefix = "provider_data"
+    if args.smoke:
+        writer = lambda dataset, requested_date, df: _write_provider_smoke_dataset(provider_name, dataset, requested_date, df)
+        step_prefix = f"provider_smoke:{provider_name}"
     results = update_provider_data(
         trade_date,
-        provider_name=args.provider,
+        provider_name=provider_name,
         force=args.force,
-        write_dataset_fn=_write_dataset,
+        datasets=args.dataset,
+        step_prefix=step_prefix,
+        write_dataset_fn=writer,
+        allow_smoke_datasets=args.smoke,
     )
-    print(json.dumps({"trade_date": trade_date, "provider": args.provider, "force": args.force, "results": results}, ensure_ascii=False))
+    print(json.dumps({"trade_date": trade_date, "provider": provider_name, "force": args.force, "smoke": args.smoke, "results": results}, ensure_ascii=False))
     return 0
 
 
@@ -277,17 +296,34 @@ def _cmd_normalize_date(args: argparse.Namespace) -> int:
 
 def _cmd_query_parquet(args: argparse.Namespace) -> int:
     try:
-        dataset = validate_dataset(args.dataset)
+        provider_name = args.smoke_provider.lower() if args.smoke_provider else None
+        dataset = validate_provider_smoke_dataset(args.dataset) if provider_name else validate_dataset(args.dataset)
         trade_date = validate_trade_date(args.trade_date)
     except (DatasetValidationError, DateValidationError) as exc:
         print(f"invalid input: {exc}", file=sys.stderr)
         return 2
 
     with tempfile.TemporaryDirectory(prefix="stock-query-") as tmp:
-        path = _materialize_dataset(dataset, trade_date, Path(tmp))
+        if provider_name:
+            path = _materialize_provider_smoke_dataset(provider_name, dataset, trade_date, Path(tmp))
+        else:
+            path = _materialize_dataset(dataset, trade_date, Path(tmp))
         rows = query_dataset_file(path, limit=10)
 
-    print(json.dumps({"dataset": dataset, "trade_date": trade_date, "row_count": len(rows), "rows": rows}, ensure_ascii=False, default=str))
+    print(
+        json.dumps(
+            {
+                "dataset": dataset,
+                "trade_date": trade_date,
+                "smoke": bool(args.smoke_provider),
+                "provider": provider_name,
+                "row_count": len(rows),
+                "rows": rows,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    )
     return 0
 
 
@@ -513,6 +549,24 @@ def _write_dataset(dataset: str, trade_date: str, df: pd.DataFrame) -> str:
     return result.final_key
 
 
+def _write_provider_smoke_dataset(provider_name: str, dataset: str, trade_date: str, df: pd.DataFrame) -> str:
+    settings = load_settings()
+    partition = build_provider_smoke_partition(provider_name, dataset, trade_date, local_root=_local_root(settings))
+    backend = _storage_backend(settings)
+    if backend == "local":
+        write_parquet_local_atomic(df, partition.local_path)
+        return partition.local_path.as_posix()
+
+    minio_client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_raw"]
+    ensure_buckets(minio_client, [bucket])
+    with tempfile.TemporaryDirectory(prefix="stock-smoke-write-") as tmp:
+        local_file = Path(tmp) / "part.parquet"
+        df.to_parquet(local_file, index=False)
+        result = AtomicObjectWriter(minio_client, tmp_dir=Path(tmp)).write_file_atomic(bucket, partition.object_key, local_file)
+    return result.final_key
+
+
 def _read_dataset(dataset: str, trade_date: str) -> pd.DataFrame:
     with tempfile.TemporaryDirectory(prefix="stock-read-") as tmp:
         path = _materialize_dataset(dataset, trade_date, Path(tmp))
@@ -526,9 +580,35 @@ def _materialize_dataset(dataset: str, trade_date: str, tmp_root: Path) -> Path:
     return path
 
 
+def _materialize_provider_smoke_dataset(provider_name: str, dataset: str, trade_date: str, tmp_root: Path) -> Path:
+    path = _try_materialize_provider_smoke_dataset(provider_name, dataset, trade_date, tmp_root)
+    if not path:
+        raise FileNotFoundError(f"missing provider smoke parquet for {provider_name}/{dataset} {trade_date}")
+    return path
+
+
 def _try_materialize_dataset(dataset: str, trade_date: str, tmp_root: Path) -> Path | None:
     settings = load_settings()
     partition = build_partition(dataset, trade_date, local_root=_local_root(settings))
+    if _storage_backend(settings) == "local":
+        return partition.local_path if partition.local_path.exists() else None
+
+    minio_client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_raw"]
+    target = tmp_root / partition.object_key
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        minio_client.fget_object(bucket, partition.object_key, str(target))
+    except S3Error as exc:
+        if exc.code in {"NoSuchKey", "NoSuchBucket", "NoSuchObject"}:
+            return None
+        raise
+    return target
+
+
+def _try_materialize_provider_smoke_dataset(provider_name: str, dataset: str, trade_date: str, tmp_root: Path) -> Path | None:
+    settings = load_settings()
+    partition = build_provider_smoke_partition(provider_name, dataset, trade_date, local_root=_local_root(settings))
     if _storage_backend(settings) == "local":
         return partition.local_path if partition.local_path.exists() else None
 
@@ -600,6 +680,8 @@ def build_parser() -> argparse.ArgumentParser:
     update_provider = subparsers.add_parser("update-provider-data")
     update_provider.add_argument("--trade-date", required=True)
     update_provider.add_argument("--provider", default="mock")
+    update_provider.add_argument("--dataset", action="append")
+    update_provider.add_argument("--smoke", action="store_true")
     update_provider.add_argument("--force", action="store_true")
     update_provider.set_defaults(func=_cmd_update_provider_data)
 
@@ -623,6 +705,7 @@ def build_parser() -> argparse.ArgumentParser:
     query = subparsers.add_parser("query-parquet")
     query.add_argument("--dataset", required=True)
     query.add_argument("--trade-date", required=True)
+    query.add_argument("--smoke-provider")
     query.set_defaults(func=_cmd_query_parquet)
 
     query_stock = subparsers.add_parser("query-stock-price")

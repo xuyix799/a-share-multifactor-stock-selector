@@ -1,4 +1,4 @@
-from stock_selector.cli import build_parser
+from stock_selector.cli import build_parser, main
 
 
 def test_cli_accepts_goal4_cleaning_commands():
@@ -121,3 +121,86 @@ def test_cli_accepts_goal8_backtest_command_with_config_defaults():
     assert backtest.top_n is None
     assert backtest.execution_rule is None
     assert backtest.force is True
+
+
+def test_cli_accepts_goal10_provider_dataset_selection():
+    parser = build_parser()
+
+    update = parser.parse_args(
+        [
+            "update-provider-data",
+            "--trade-date",
+            "2026-06-19",
+            "--provider",
+            "tushare",
+            "--dataset",
+            "stock_basic",
+            "--dataset",
+            "daily_price",
+            "--force",
+        ]
+    )
+
+    assert update.command == "update-provider-data"
+    assert update.provider == "tushare"
+    assert update.dataset == ["stock_basic", "daily_price"]
+    assert update.force is True
+
+
+def test_cli_accepts_goal10_tushare_smoke_mode():
+    parser = build_parser()
+
+    update = parser.parse_args(
+        [
+            "update-provider-data",
+            "--trade-date",
+            "2026-06-19",
+            "--provider",
+            "tushare",
+            "--dataset",
+            "stock_basic",
+            "--smoke",
+        ]
+    )
+
+    assert update.command == "update-provider-data"
+    assert update.provider == "tushare"
+    assert update.dataset == ["stock_basic"]
+    assert update.smoke is True
+
+
+def test_cli_rejects_external_provider_update_without_smoke_mode(capsys):
+    exit_code = main(
+        [
+            "update-provider-data",
+            "--trade-date",
+            "2026-06-19",
+            "--provider",
+            "akshare",
+            "--dataset",
+            "stock_basic",
+        ]
+    )
+
+    assert exit_code == 2
+    assert "external provider updates must use --smoke" in capsys.readouterr().err
+
+
+def test_cli_accepts_query_parquet_smoke_provider():
+    parser = build_parser()
+
+    query = parser.parse_args(
+        [
+            "query-parquet",
+            "--dataset",
+            "daily_price",
+            "--trade-date",
+            "2026-06-19",
+            "--smoke-provider",
+            "tushare",
+        ]
+    )
+
+    assert query.command == "query-parquet"
+    assert query.dataset == "daily_price"
+    assert query.smoke_provider == "tushare"
