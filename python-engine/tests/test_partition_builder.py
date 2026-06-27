@@ -36,3 +36,11 @@ def test_build_partition_returns_local_path_object_key_and_tmp_prefix():
     assert partition.local_path.as_posix() == "data/raw/daily_price/trade_date=2026-06-19/part.parquet"
     assert partition.object_key == "raw/daily_price/trade_date=2026-06-19/part.parquet"
     assert partition.tmp_prefix == "_raw_tmp/daily_price/trade_date=2026-06-19"
+
+
+def test_build_partition_uses_processed_prefix_for_selection_result():
+    partition = build_partition("selection_result", "2026-06-19", local_root="data")
+
+    assert partition.local_path.as_posix() == "data/processed/selection_result/trade_date=2026-06-19/part.parquet"
+    assert partition.object_key == "processed/selection_result/trade_date=2026-06-19/part.parquet"
+    assert partition.tmp_prefix == "_processed_tmp/selection_result/trade_date=2026-06-19"

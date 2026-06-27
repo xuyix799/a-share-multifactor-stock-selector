@@ -54,7 +54,7 @@ def test_duckdb_can_query_selection_result(tmp_path, monkeypatch, capsys):
     )
 
     assert result["status"] == "done"
-    output_path = tmp_path / "raw" / "selection_result" / f"trade_date={trade_date}" / "part.parquet"
+    output_path = tmp_path / "processed" / "selection_result" / f"trade_date={trade_date}" / "part.parquet"
     rows = query_dataset_file(output_path)
     assert rows
     assert "total_score" in rows[0]

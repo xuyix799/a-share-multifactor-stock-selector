@@ -52,7 +52,7 @@ def test_build_selection_for_date_is_idempotent_and_force_reruns():
 
     def write_dataset(dataset, requested_date, df):
         writes.append((dataset, requested_date, len(df), tuple(df.columns)))
-        return f"raw/{dataset}/trade_date={requested_date}/part.parquet"
+        return f"processed/{dataset}/trade_date={requested_date}/part.parquet"
 
     first = build_selection_for_date(
         trade_date,
@@ -82,7 +82,8 @@ def test_build_selection_for_date_is_idempotent_and_force_reruns():
     assert forced["status"] == "done"
     assert [item[0] for item in writes] == ["selection_result", "selection_result"]
     assert len(snapshot_repo.snapshots) == 2
-    assert snapshot_repo.snapshots[-1]["object_key"] == f"raw/selection_result/trade_date={trade_date}/part.parquet"
+    assert snapshot_repo.snapshots[-1]["object_key"] == f"processed/selection_result/trade_date={trade_date}/part.parquet"
+    assert snapshot_repo.snapshots[-1]["top_stocks"]
     assert update_repo.done_marks[-1][1] == SELECTION_RESULT_STEP_NAME
     assert update_repo.done_marks[-1][2] == snapshot_repo.snapshots[-1]["object_key"]
     assert reads.count(("factor_daily", trade_date)) == 2

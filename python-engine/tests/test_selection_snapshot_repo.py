@@ -1,4 +1,5 @@
 import sqlite3
+import json
 
 from selection_test_helpers import eligible_universe_frame, factor_daily_frame, risk_filter_frame
 from stock_selector.scoring.score_engine import parse_scoring_config
@@ -48,16 +49,22 @@ def _selection(trade_date="2026-06-19"):
     )
 
 
-def test_summarize_selection_result_contains_only_summary_and_object_key():
+def test_summarize_selection_result_contains_summary_object_key_and_top_stocks():
     df = _selection()
 
-    summary = summarize_selection_result(df, trade_date="2026-06-19", top_n=50, object_key="raw/selection_result/trade_date=2026-06-19/part.parquet")
+    summary = summarize_selection_result(df, trade_date="2026-06-19", top_n=1, object_key="processed/selection_result/trade_date=2026-06-19/part.parquet")
 
     assert summary["trade_date"] == "2026-06-19"
-    assert summary["top_n"] == 50
-    assert summary["object_key"].endswith("part.parquet")
+    assert summary["top_n"] == 1
+    assert summary["object_key"] == "processed/selection_result/trade_date=2026-06-19/part.parquet"
     assert summary["stock_count"] == len(df)
-    assert "stock_code" not in summary
+    assert summary["top_stocks"] == [
+        {
+            "stock_code": df.iloc[0]["stock_code"],
+            "rank": 1,
+            "total_score": float(df.iloc[0]["total_score"]),
+        }
+    ]
 
 
 def test_selection_snapshot_repo_replaces_existing_summary_for_trade_date():
@@ -70,10 +77,11 @@ def test_selection_snapshot_repo_replaces_existing_summary_for_trade_date():
     repo.upsert_snapshot(second)
 
     rows = conn.execute(
-        "SELECT trade_date, top_n, object_key, stock_count, avg_total_score, max_total_score, min_total_score FROM selection_snapshot"
+        "SELECT trade_date, top_n, object_key, stock_count, avg_total_score, max_total_score, min_total_score, top_stocks FROM selection_snapshot"
     ).fetchall()
     assert len(rows) == 1
     assert rows[0][0] == "2026-06-19"
     assert rows[0][1] == 10
     assert rows[0][2] == "new"
     assert rows[0][3] == 2
+    assert json.loads(rows[0][7])[0]["stock_code"] == _selection().iloc[0]["stock_code"]

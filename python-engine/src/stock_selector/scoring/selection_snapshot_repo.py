@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass
+import json
 from typing import Any
 
 import pandas as pd
@@ -15,6 +16,7 @@ def _placeholders(style: str, count: int) -> str:
 def summarize_selection_result(selection_result: pd.DataFrame, *, trade_date: str, top_n: int, object_key: str) -> dict[str, Any]:
     trade_date = validate_trade_date(trade_date)
     scores = pd.to_numeric(selection_result["total_score"], errors="coerce")
+    top_stocks = _top_stocks(selection_result, top_n)
     return {
         "trade_date": trade_date,
         "top_n": int(top_n),
@@ -23,6 +25,7 @@ def summarize_selection_result(selection_result: pd.DataFrame, *, trade_date: st
         "avg_total_score": float(scores.mean()) if not scores.empty else None,
         "max_total_score": float(scores.max()) if not scores.empty else None,
         "min_total_score": float(scores.min()) if not scores.empty else None,
+        "top_stocks": top_stocks,
     }
 
 
@@ -37,7 +40,7 @@ class SelectionSnapshotRepository:
             trade_date,
             "daily",
             int(summary["stock_count"]),
-            self._empty_json_array(),
+            self._json_value(summary.get("top_stocks", [])),
             str(summary["object_key"]),
             int(summary["top_n"]),
             int(summary["stock_count"]),
@@ -73,12 +76,26 @@ class SelectionSnapshotRepository:
     def _p(self) -> str:
         return "?" if self.placeholder == "?" else "%s"
 
-    def _empty_json_array(self):
+    def _json_value(self, value):
         if self.placeholder == "?":
-            return "[]"
+            return json.dumps(value, ensure_ascii=False)
         from psycopg2.extras import Json
 
-        return Json([])
+        return Json(value)
+
+
+def _top_stocks(selection_result: pd.DataFrame, top_n: int) -> list[dict[str, Any]]:
+    top_rows = selection_result.head(int(top_n))
+    stocks = []
+    for row in top_rows.to_dict(orient="records"):
+        stocks.append(
+            {
+                "stock_code": str(row["stock_code"]),
+                "rank": int(row["rank"]),
+                "total_score": float(row["total_score"]),
+            }
+        )
+    return stocks
 
 
 def create_selection_snapshot_repository() -> SelectionSnapshotRepository:

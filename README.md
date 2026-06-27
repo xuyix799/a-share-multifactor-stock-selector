@@ -98,12 +98,13 @@ PostgreSQL `selection_snapshot` 只保存摘要和对象 key：
 - `top_n`
 - `object_key`
 - `stock_count`
+- `top_stocks`：前 N 只股票的 `stock_code`、`rank`、`total_score`
 - `avg_total_score`
 - `max_total_score`
 - `min_total_score`
 - `created_at`
 
-`selection_result` 明细只写 Parquet / MinIO，不写入 PostgreSQL。
+`selection_result` 明细只写 Parquet / MinIO，不写入 PostgreSQL；当前对象路径为 `processed/selection_result/trade_date=<YYYY-MM-DD>/part.parquet`。
 
 ## 本地启动
 
@@ -190,7 +191,7 @@ $env:PYTHONPATH='src;tests'
 python -m pytest
 ```
 
-当前基线：`121 passed`。
+当前基线：`122 passed`。
 
 ## 开发约束
 
