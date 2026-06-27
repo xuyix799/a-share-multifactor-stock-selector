@@ -20,6 +20,8 @@ from stock_selector.factors.factor_validator import validate_factor_daily
 from stock_selector.providers.provider_factory import list_providers
 from stock_selector.providers.schema_contract import inspect_schema
 from stock_selector.providers.schema_mapper import SchemaMappingError, normalize_date, normalize_stock_code
+from stock_selector.scoring.selection_pipeline import build_selection_for_date
+from stock_selector.scoring.selection_validator import validate_selection_result
 from stock_selector.storage.atomic_writer import AtomicObjectWriter
 from stock_selector.storage.atomic_writer import write_parquet_local_atomic
 from stock_selector.storage.duckdb_query import query_dataset_file, query_stock_price_files
@@ -392,6 +394,35 @@ def _cmd_validate_factors(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_build_selection(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+
+    _ensure_db_schema()
+    result = build_selection_for_date(trade_date, force=args.force, read_dataset_fn=_read_dataset, write_dataset_fn=_write_dataset)
+    print(json.dumps({"trade_date": trade_date, "force": args.force, "result": result}, ensure_ascii=False, default=str))
+    return 0
+
+
+def _cmd_validate_selection(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory(prefix="stock-selection-validate-") as tmp:
+        path = _materialize_dataset("selection_result", trade_date, Path(tmp))
+        df = pd.read_parquet(path)
+        validate_selection_result(df, trade_date)
+
+    print(json.dumps({"trade_date": trade_date, "dataset": "selection_result", "status": "valid"}, ensure_ascii=False))
+    return 0
+
+
 def _cmd_show_update_log(args: argparse.Namespace) -> int:
     try:
         trade_date = validate_trade_date(args.trade_date)
@@ -595,6 +626,15 @@ def build_parser() -> argparse.ArgumentParser:
     validate_factors = subparsers.add_parser("validate-factors")
     validate_factors.add_argument("--trade-date", required=True)
     validate_factors.set_defaults(func=_cmd_validate_factors)
+
+    build_selection = subparsers.add_parser("build-selection")
+    build_selection.add_argument("--trade-date", required=True)
+    build_selection.add_argument("--force", action="store_true")
+    build_selection.set_defaults(func=_cmd_build_selection)
+
+    validate_selection = subparsers.add_parser("validate-selection")
+    validate_selection.add_argument("--trade-date", required=True)
+    validate_selection.set_defaults(func=_cmd_validate_selection)
 
     show_log = subparsers.add_parser("show-update-log")
     show_log.add_argument("--trade-date", required=True)

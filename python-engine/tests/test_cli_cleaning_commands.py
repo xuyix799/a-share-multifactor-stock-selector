@@ -37,3 +37,16 @@ def test_cli_accepts_goal6_factor_commands():
     assert build.force is True
     assert validate.command == "validate-factors"
     assert validate.trade_date == "2026-06-19"
+
+
+def test_cli_accepts_goal7_selection_commands():
+    parser = build_parser()
+
+    build = parser.parse_args(["build-selection", "--trade-date", "2026-06-19", "--force"])
+    validate = parser.parse_args(["validate-selection", "--trade-date", "2026-06-19"])
+
+    assert build.command == "build-selection"
+    assert build.trade_date == "2026-06-19"
+    assert build.force is True
+    assert validate.command == "validate-selection"
+    assert validate.trade_date == "2026-06-19"

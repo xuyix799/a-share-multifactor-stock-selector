@@ -41,6 +41,7 @@ def validate_dataset_frame(dataset: str, df: pd.DataFrame, trade_date: str) -> N
         "eligible_universe": _validate_eligible_universe,
         "factor_input_table": _validate_factor_input_table,
         "factor_daily": _validate_factor_daily,
+        "selection_result": _validate_selection_result,
     }
     validators[dataset](df, trade_date)
 
@@ -410,3 +411,9 @@ def _validate_factor_daily(df: pd.DataFrame, trade_date: str) -> None:
             raise DataValidationError(f"{column} must be between 0 and 100")
     if (df["liquidity_amount"] < 0).any():
         raise DataValidationError("liquidity_amount must be non-negative")
+
+
+def _validate_selection_result(df: pd.DataFrame, trade_date: str) -> None:
+    from stock_selector.scoring.selection_validator import validate_selection_result
+
+    validate_selection_result(df, trade_date)

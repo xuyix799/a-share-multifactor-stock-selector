@@ -154,3 +154,28 @@ def test_schema_contract_includes_goal6_factor_daily_dataset():
     assert "total_score" not in factor_daily.columns
     assert "quality_score" in factor_daily.numeric_columns
 
+
+def test_schema_contract_includes_goal7_selection_result_dataset():
+    selection_result = get_schema_contract("selection_result")
+
+    assert selection_result.columns == [
+        "stock_code",
+        "trade_date",
+        "industry",
+        "market_type",
+        "quality_score",
+        "growth_score",
+        "valuation_score",
+        "trend_score",
+        "industry_score",
+        "total_score",
+        "risk_level",
+        "rank",
+        "suggestion",
+        "reason",
+        "exclude_reasons",
+        "risk_flags",
+    ]
+    assert "total_score" in selection_result.numeric_columns
+    assert "rank" in selection_result.numeric_columns
+

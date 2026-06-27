@@ -21,6 +21,7 @@ DERIVED_DATASETS = (
     "eligible_universe",
     "factor_input_table",
     "factor_daily",
+    "selection_result",
 )
 
 PROVIDER_DATASETS = RAW_DATASETS

@@ -23,6 +23,13 @@ CREATE TABLE IF NOT EXISTS selection_snapshot (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE selection_snapshot ADD COLUMN IF NOT EXISTS top_n INTEGER;
+ALTER TABLE selection_snapshot ADD COLUMN IF NOT EXISTS stock_count INTEGER;
+ALTER TABLE selection_snapshot ADD COLUMN IF NOT EXISTS avg_total_score DOUBLE PRECISION;
+ALTER TABLE selection_snapshot ADD COLUMN IF NOT EXISTS max_total_score DOUBLE PRECISION;
+ALTER TABLE selection_snapshot ADD COLUMN IF NOT EXISTS min_total_score DOUBLE PRECISION;
+CREATE INDEX IF NOT EXISTS idx_selection_snapshot_trade_date ON selection_snapshot(trade_date);
+
 CREATE TABLE IF NOT EXISTS backtest_summary (
     id BIGSERIAL PRIMARY KEY,
     strategy_name TEXT NOT NULL,

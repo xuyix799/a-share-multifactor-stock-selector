@@ -36,5 +36,10 @@ def load_settings() -> dict[str, Any]:
 
 
 def load_factor_weights() -> dict[str, float]:
-    weights = _load_yaml(get_config_dir() / "factor_weights.yaml")
-    return {key: float(value) for key, value in weights.items()}
+    weights = load_factor_weights_config()
+    score_keys = {"quality_score", "growth_score", "valuation_score", "industry_score", "trend_score"}
+    return {key: float(value) for key, value in weights.items() if key in score_keys}
+
+
+def load_factor_weights_config() -> dict[str, Any]:
+    return _load_yaml(get_config_dir() / "factor_weights.yaml")
