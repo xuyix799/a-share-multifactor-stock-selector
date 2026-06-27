@@ -1,6 +1,6 @@
 # A股中长线多因子选股系统
 
-本仓库是一个本地 Docker 部署的 A股中长线多因子选股系统。当前已推进到 Goal 7：综合评分、风险等级、规则化解释和 `selection_result`。
+本仓库是一个本地 Docker 部署的 A股中长线多因子选股系统。当前已推进到 Goal 9：Spring Boot 最小结果查询 API。
 
 系统定位：
 
@@ -11,7 +11,7 @@
 - 不输出“必涨”“稳赚”“满仓”“目标价”“无脑买入”等确定性投资结论。
 - `selection_result` 只是中长线候选池结果，不代表自动交易信号。
 - Python 负责数据采集、清洗、因子、评分、候选池生成和后续回测能力。
-- Spring Boot 当前只保留基础 API / 任务服务骨架，不承载复杂业务逻辑。
+- Spring Boot 当前只提供健康检查、结果摘要查询和任务状态查询 API，不承载复杂业务逻辑。
 - PostgreSQL 只保存任务状态、配置、摘要和对象 key，不保存全量行情、全量因子或回测明细。
 - MinIO 保存 Parquet、报告、图表和后续回测明细。
 - DuckDB 查询 Parquet。
@@ -25,13 +25,14 @@
 - Goal 5：风险过滤与候选股票池输入层，已实现 `risk_filter`、`eligible_universe`、`factor_input_table`。
 - Goal 6：中长线基础因子计算层，已实现 `factor_daily`，包含质量、成长、估值、趋势、行业强度和五个子评分。
 - Goal 7：综合评分与候选结果层，已实现 `total_score`、`risk_level`、规则化 `reason` / `suggestion`、`selection_result` 和 PostgreSQL `selection_snapshot` 摘要。
+- Goal 8：回测核心层，已实现 T 日信号、T+1 成交、月度/季度调仓、交易成本、滑点、印花税、涨跌停/停牌约束、三指数 benchmark 对比、回测明细 Parquet 和 PostgreSQL `backtest_summary` 摘要。
+- Goal 9：Spring Boot 最小结果查询 API，已实现 PostgreSQL 摘要查询，不读取 MinIO / Parquet，不执行 Python 计算或回测。
 
 当前未实现：
 
 - 真实行情 API 接入。
-- 正式回测。
 - LLM 解释。
-- 复杂 Spring Boot 业务 API。
+- 复杂 Spring Boot 业务 API / 前端页面。
 - 自动交易或券商账户接入。
 
 ## 服务
@@ -121,6 +122,36 @@ curl http://localhost:18080/actuator/health
 curl http://localhost:18080/api/health
 ```
 
+## Spring Boot 查询 API
+
+Spring Boot 只查询 PostgreSQL 中的摘要和任务状态表，不读取 MinIO 对象，不解析 Parquet，不生成 presigned URL，不执行 Python、因子计算或回测。
+
+结果摘要查询：
+
+```powershell
+curl "http://localhost:18080/api/selections?limit=20&offset=0"
+curl http://localhost:18080/api/selections/2026-06-19
+curl "http://localhost:18080/api/backtests?limit=20&offset=0&status=done&rebalanceMode=monthly"
+curl http://localhost:18080/api/backtests/<runKey>
+```
+
+任务状态查询：
+
+```powershell
+curl http://localhost:18080/api/update-logs/2026-06-19
+curl "http://localhost:18080/api/task-logs?status=done&taskType=backtest&limit=20"
+```
+
+API 说明：
+
+- `GET /api/selections` 查询 `selection_snapshot` 列表，参数 `limit` 为 `1..100`、默认 `20`，`offset` 为 `>=0`、默认 `0`。
+- `GET /api/selections/{tradeDate}` 查询单日 `selection_snapshot`，`tradeDate` 必须是合法 `YYYY-MM-DD` 日期。
+- `GET /api/backtests` 查询 `backtest_summary` 列表，参数 `limit` 为 `1..100`、默认 `20`，`offset` 为 `>=0`、默认 `0`，`status` 可选 `pending` / `running` / `done` / `failed`，`rebalanceMode` 可选 `monthly` / `quarterly`。
+- `GET /api/backtests/{runKey}` 查询单个回测摘要，`runKey` 必须是 16 位小写 hex。
+- `GET /api/update-logs/{tradeDate}` 是数据链路任务状态查询接口，查询指定日期 `update_log`。
+- `GET /api/task-logs` 是通用任务状态查询接口，参数 `status` 可选 `pending` / `running` / `done` / `failed`，`limit` 为 `1..100`、默认 `20`。
+- 错误响应统一为 `{ "code": "...", "message": "...", "path": "..." }`，不会向客户端暴露数据库密码、连接串或 stack trace。
+
 ## Python CLI 链路
 
 初始化与健康检查：
@@ -180,6 +211,7 @@ docker compose run --rm stock-python python -m stock_selector.cli show-update-lo
 容器内测试：
 
 ```powershell
+docker compose run --rm --no-deps stock-api mvn test
 docker compose run --rm stock-python pytest python-engine/tests -q
 ```
 

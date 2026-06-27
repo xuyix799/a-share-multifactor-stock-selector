@@ -13,6 +13,7 @@ __pycache__/
 .ipynb_checkpoints/
 target/
 **/target/
+**/.mvn-build/
 *.egg-info/
 .venv/
 venv/

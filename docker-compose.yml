@@ -72,8 +72,6 @@ services:
       - "18080:8080"
     volumes:
       - ./spring-api:/workspace/spring-api
-    tmpfs:
-      - /workspace/spring-api/target
     depends_on:
       stock-postgres:
         condition: service_healthy
