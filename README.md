@@ -1,6 +1,6 @@
 # A股中长线多因子选股系统
 
-本仓库是一个本地 Docker 部署的 A股中长线多因子选股系统。当前已推进到 Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke。
+本仓库是一个本地 Docker 部署的 A股中长线多因子选股系统。当前已推进到 Goal 12A：真实数据标准层契约与数据质量等级冻结。
 
 系统定位：
 
@@ -30,6 +30,7 @@
 - Goal 10：Tushare 最小真实数据 smoke，已接入 `stock_basic`、`daily_price`、`adj_factor`、`daily_basic` 的可选真实拉取和标准层校验链路；默认禁用，不影响 mock 测试。当前 Tushare smoke 受账号权限和频控限制，不作为主验收。
 - Goal 10B：AKShare / Baostock 最小真实数据 smoke，已验证 AKShare `benchmark_price` 可标准化写入 `smoke/akshare/...` 并通过 DuckDB 查询；字段不足的数据集不会绕过 validator 写入标准层。
 - Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke，新增 smoke-only `daily_price_raw_smoke`，只允许写入 `smoke/<provider>/daily_price_raw_smoke/...`，不进入标准 `raw/daily_price/...`。
+- Goal 12A：真实数据标准层契约与数据质量等级冻结，详见 `docs/goal12A_real_data_contract.md`；本阶段只新增契约、守门规则和测试，不接入真实 provider 主链路，不做真实回测。
 
 当前未实现：
 
