@@ -104,7 +104,7 @@ def _provider(monkeypatch, pro_client):
     return TushareProvider(settings=settings, pro_client=pro_client)
 
 
-@pytest.mark.parametrize("dataset", ["stock_basic", "daily_price", "adj_factor", "daily_basic"])
+@pytest.mark.parametrize("dataset", ["stock_basic", "adj_factor", "daily_basic"])
 def test_tushare_provider_fetches_goal10_smoke_datasets_and_maps_to_standard_schema(monkeypatch, dataset):
     provider = _provider(monkeypatch, FakeTusharePro())
 
@@ -117,14 +117,13 @@ def test_tushare_provider_fetches_goal10_smoke_datasets_and_maps_to_standard_sch
         assert mapped.iloc[0]["trade_date"] == "2026-06-19"
 
 
-def test_tushare_daily_price_uses_trade_date_and_limit_endpoint(monkeypatch):
+def test_tushare_daily_price_does_not_fake_suspension_status(monkeypatch):
     fake = FakeTusharePro()
     provider = _provider(monkeypatch, fake)
 
-    raw = provider.fetch_daily_price("2026-06-19")
+    with pytest.raises(ProviderFetchError, match="is_paused.*not available"):
+        provider.fetch_daily_price("2026-06-19")
 
-    assert raw.iloc[0]["up_limit"] == 11.0
-    assert raw.iloc[0]["down_limit"] == 9.0
     assert ("daily", {"trade_date": "20260619"}) in [(name, {"trade_date": call["trade_date"]}) for name, call in fake.calls if "trade_date" in call]
     assert any(name == "stk_limit" and call["trade_date"] == "20260619" for name, call in fake.calls)
 

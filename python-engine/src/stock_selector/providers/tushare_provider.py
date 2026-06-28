@@ -58,8 +58,7 @@ class TushareProvider(ExternalProviderSkeleton):
         merged = daily.merge(limits[["ts_code", "trade_date", "up_limit", "down_limit"]], on=["ts_code", "trade_date"], how="left")
         if merged[["up_limit", "down_limit"]].isna().any().any():
             raise ProviderFetchError("missing Tushare limit prices for daily_price smoke")
-        merged["is_paused"] = False
-        return merged
+        raise ProviderFetchError("Tushare daily_price smoke has price and limit fields, but is_paused is not available from a trusted source")
 
     def fetch_adj_factor(self, trade_date: str) -> pd.DataFrame:
         compact_date = _compact_trade_date(validate_trade_date(trade_date))
@@ -81,6 +80,9 @@ class TushareProvider(ExternalProviderSkeleton):
 
     def fetch_benchmark_price(self, trade_date: str) -> pd.DataFrame:
         return self._unsupported("benchmark_price", trade_date)
+
+    def fetch_raw_endpoint(self, endpoint: str, **kwargs) -> pd.DataFrame:
+        return self._fetch(endpoint, **kwargs)
 
     def _fetch(self, endpoint: str, **kwargs) -> pd.DataFrame:
         method = getattr(self._pro, endpoint)

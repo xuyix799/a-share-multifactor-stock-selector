@@ -65,7 +65,7 @@ Forbidden:
 - AKShare `benchmark_price` can be promoted to `DQ2` and used only for `benchmark_price` or `price_only_diagnostic`.
 - AKShare stock daily lacks `limit_up`, `limit_down`, and `is_paused`; it remains `DQ1` and may only enter `daily_price_raw` or `daily_price_raw_smoke`.
 - Baostock stock daily remains `DQ1` even if a future local login succeeds, unless it also has trustworthy `limit_up`, `limit_down`, and `is_paused`.
-- Tushare is not strict-tradable-ready with the current account: 120 points, missing `stk_limit`, `adj_factor`, and `daily_basic` permissions, plus rate-limit risk.
+- Tushare status must be determined by the current Goal 10R capability matrix. If `daily`, `stk_limit`, `adj_factor`, and `daily_basic` are available but no trusted `is_paused` source is available, Tushare stock daily can reach at most DQ2 and must not be promoted to DQ3 `daily_price`.
 - No provider may bypass `schema_contract` or `data_validator` to write `daily_price`.
 - The `daily_price` standard must not be lowered to make incomplete real data run.
 

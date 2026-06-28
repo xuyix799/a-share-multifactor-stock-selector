@@ -28,6 +28,10 @@ DERIVED_DATASETS = (
 PROVIDER_DATASETS = RAW_DATASETS
 SMOKE_ONLY_DATASETS = (
     "daily_price_raw_smoke",
+    "daily",
+    "stk_limit",
+    "index_daily",
+    "fina_indicator",
 )
 PROVIDER_SMOKE_DATASETS = PROVIDER_DATASETS + SMOKE_ONLY_DATASETS
 SUPPORTED_DATASETS = RAW_DATASETS + DERIVED_DATASETS
