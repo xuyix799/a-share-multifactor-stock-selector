@@ -54,6 +54,47 @@ def test_query_parquet_reads_provider_raw_smoke_dataset_only_from_smoke_namespac
     assert output["row_count"] == 1
 
 
+def test_query_parquet_reads_goal12b_tushare_smoke_candidates(tmp_path, monkeypatch, capsys):
+    trade_date = "2026-06-19"
+    monkeypatch.setenv("STOCK_PARQUET_BACKEND", "local")
+    monkeypatch.setenv("STOCK_LOCAL_DATA_DIR", str(tmp_path))
+    trade_cal_partition = build_provider_smoke_partition("tushare", "trade_cal", trade_date, local_root=tmp_path)
+    suspend_d_partition = build_provider_smoke_partition("tushare", "suspend_d", trade_date, local_root=tmp_path)
+    write_parquet_local_atomic(
+        pd.DataFrame(
+            [
+                {
+                    "exchange": "SSE",
+                    "cal_date": "20260619",
+                    "is_open": 1,
+                    "pretrade_date": "20260618",
+                }
+            ]
+        ),
+        trade_cal_partition.local_path,
+    )
+    write_parquet_local_atomic(
+        pd.DataFrame(columns=["ts_code", "trade_date", "suspend_timing", "suspend_type"]),
+        suspend_d_partition.local_path,
+    )
+
+    trade_cal_exit = main(["query-parquet", "--dataset", "trade_cal", "--trade-date", trade_date, "--smoke-provider", "tushare"])
+    trade_cal_output = json.loads(capsys.readouterr().out)
+    suspend_exit = main(["query-parquet", "--dataset", "suspend_d", "--trade-date", trade_date, "--smoke-provider", "tushare"])
+    suspend_output = json.loads(capsys.readouterr().out)
+
+    assert trade_cal_exit == 0
+    assert trade_cal_output["dataset"] == "trade_cal"
+    assert trade_cal_output["provider"] == "tushare"
+    assert trade_cal_output["smoke"] is True
+    assert trade_cal_output["row_count"] == 1
+    assert suspend_exit == 0
+    assert suspend_output["dataset"] == "suspend_d"
+    assert suspend_output["provider"] == "tushare"
+    assert suspend_output["smoke"] is True
+    assert suspend_output["row_count"] == 0
+
+
 def test_query_parquet_rejects_raw_smoke_dataset_without_smoke_provider(capsys):
     exit_code = main(["query-parquet", "--dataset", "daily_price_raw_smoke", "--trade-date", "2026-06-19"])
 

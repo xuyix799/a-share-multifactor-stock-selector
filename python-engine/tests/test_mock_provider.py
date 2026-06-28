@@ -22,7 +22,11 @@ def test_mock_provider_returns_provider_raw_field_names_before_mapping():
     assert "volume" not in df.columns
 
 
-def test_provider_factory_lists_mock_and_disabled_real_provider_skeletons():
+def test_provider_factory_lists_mock_and_disabled_real_provider_skeletons(monkeypatch):
+    monkeypatch.delenv("STOCK_TUSHARE_ENABLED", raising=False)
+    monkeypatch.delenv("STOCK_AKSHARE_ENABLED", raising=False)
+    monkeypatch.delenv("STOCK_BAOSTOCK_ENABLED", raising=False)
+
     providers = list_providers()
 
     assert providers["mock"]["enabled"] is True
@@ -48,7 +52,9 @@ def test_provider_factory_can_enable_akshare_with_explicit_env_flag(monkeypatch)
     assert providers["akshare"]["enabled"] is True
 
 
-def test_real_provider_without_token_has_clear_error_but_does_not_affect_mock():
+def test_real_provider_without_token_has_clear_error_but_does_not_affect_mock(monkeypatch):
+    monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
+
     assert create_provider("mock").name == "mock"
 
     with pytest.raises(ProviderConfigurationError, match="TUSHARE_TOKEN"):

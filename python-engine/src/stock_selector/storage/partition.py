@@ -30,6 +30,8 @@ SMOKE_ONLY_DATASETS = (
     "daily_price_raw_smoke",
     "daily",
     "stk_limit",
+    "trade_cal",
+    "suspend_d",
     "index_daily",
     "fina_indicator",
 )

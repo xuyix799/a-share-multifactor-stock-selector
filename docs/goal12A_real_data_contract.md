@@ -66,15 +66,41 @@ Forbidden:
 - AKShare stock daily lacks `limit_up`, `limit_down`, and `is_paused`; it remains `DQ1` and may only enter `daily_price_raw` or `daily_price_raw_smoke`.
 - Baostock stock daily remains `DQ1` even if a future local login succeeds, unless it also has trustworthy `limit_up`, `limit_down`, and `is_paused`.
 - Tushare status must be determined by the current Goal 10R capability matrix. If `daily`, `stk_limit`, `adj_factor`, and `daily_basic` are available but no trusted `is_paused` source is available, Tushare stock daily can reach at most DQ2 and must not be promoted to DQ3 `daily_price`.
+- Goal 12B may mark Tushare `suspend_d` as a `suspension_status_candidate` event source if the smoke status is `PASS_WITH_ROWS` or `PASS_EMPTY` and required fields are present. This is not standard `suspension_status` table landing and does not promote Tushare stock daily to DQ3.
 - No provider may bypass `schema_contract` or `data_validator` to write `daily_price`.
 - The `daily_price` standard must not be lowered to make incomplete real data run.
 
-## Goal 12B Prerequisites
+## Goal 12B Smoke Contract
 
-Goal 12B must not start a real standard-layer backtest until all of these are true:
+Goal 12B verifies Tushare `trade_cal` and `suspend_d` as smoke-only candidate sources.
+
+Allowed writes:
+
+- `smoke/tushare/trade_cal/trade_date=YYYY-MM-DD/part.parquet`
+- `smoke/tushare/suspend_d/trade_date=YYYY-MM-DD/part.parquet`
+
+Status values:
+
+- `PASS_WITH_ROWS`: API reachable, required fields present, and at least one row returned.
+- `PASS_EMPTY`: API reachable and required fields present, but no rows returned. This is allowed for `suspend_d`.
+- `BLOCKED`: permission, points, rate limit, token, or provider configuration blocked the probe.
+- `API_ERROR`: non-blocking provider exception or upstream error.
+- `SCHEMA_MISMATCH`: response fields do not satisfy the candidate contract.
+
+Candidate semantics:
+
+- `trade_cal` is only a `trading_calendar_candidate`; it must not carry per-stock suspension, limit, adjustment, or quote semantics.
+- `suspend_d` is only a `suspension_status_candidate`; a hit can be interpreted as `is_paused=true` candidate evidence.
+- `suspend_d` missing on a date must not be interpreted as `is_paused=false` until coverage range and source completeness are explicitly audited.
+- Goal 12B does not land a standard `suspension_status` table.
+
+## DQ3 Prerequisites
+
+The system must not start a real standard-layer backtest until all of these are true:
 
 - A real provider or trusted composition can supply `trading_limit`.
 - A real provider or trusted composition can supply `suspension_status`.
 - Trading calendar consistency checks are defined.
 - Standard-layer records preserve `provider`, ingestion batch, and `dq_level` audit data.
 - The existing `daily_price` validator remains strict.
+- Standard-layer staging, join dry-run, coverage audit, and validator verification have all passed.

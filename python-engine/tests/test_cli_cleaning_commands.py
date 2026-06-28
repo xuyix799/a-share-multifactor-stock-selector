@@ -190,6 +190,27 @@ def test_cli_accepts_goal10r_tushare_probe_command():
     assert probe.sleep_seconds == 12
 
 
+def test_cli_accepts_goal12b_tushare_probe_command():
+    parser = build_parser()
+
+    probe = parser.parse_args(
+        [
+            "probe-tushare-goal12b",
+            "--trade-date",
+            "2024-06-19",
+            "--sample-limit",
+            "3",
+            "--sleep-seconds",
+            "12",
+        ]
+    )
+
+    assert probe.command == "probe-tushare-goal12b"
+    assert probe.trade_date == "2024-06-19"
+    assert probe.sample_limit == 3
+    assert probe.sleep_seconds == 12
+
+
 def test_cli_rejects_external_provider_update_without_smoke_mode(capsys):
     exit_code = main(
         [

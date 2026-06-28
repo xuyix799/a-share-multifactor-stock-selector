@@ -28,6 +28,7 @@
 - Goal 8：回测核心层，已实现 T 日信号、T+1 成交、月度/季度调仓、交易成本、滑点、印花税、涨跌停/停牌约束、三指数 benchmark 对比、回测明细 Parquet 和 PostgreSQL `backtest_summary` 摘要。
 - Goal 9：Spring Boot 最小结果查询 API，已实现 PostgreSQL 摘要查询，不读取 MinIO / Parquet，不执行 Python 计算或回测。
 - Goal 10 / 10R：Tushare 真实数据 smoke，当前以 2000 积分账号重新探测 `stock_basic`、`daily`、`stk_limit`、`adj_factor`、`daily_basic`、`index_daily`、`fina_indicator`；真实数据只写 `smoke/tushare/...`，不伪造 `limit_up` / `limit_down` / `is_paused`。
+- Goal 12B：Tushare `trade_cal` / `suspend_d` smoke 与 `suspension_status_candidate` 契约验证；只写 `smoke/tushare/trade_cal/...` 和 `smoke/tushare/suspend_d/...`，不写标准 `daily_price`。
 - Goal 10B：AKShare / Baostock 最小真实数据 smoke，已验证 AKShare `benchmark_price` 可标准化写入 `smoke/akshare/...` 并通过 DuckDB 查询；字段不足的数据集不会绕过 validator 写入标准层。
 - Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke，新增 smoke-only `daily_price_raw_smoke`，只允许写入 `smoke/<provider>/daily_price_raw_smoke/...`，不进入标准 `raw/daily_price/...`。
 - Goal 12A：真实数据标准层契约与数据质量等级冻结，详见 `docs/goal12A_real_data_contract.md`；本阶段只新增契约、守门规则和测试，不接入真实 provider 主链路，不做真实回测。
@@ -326,6 +327,43 @@ docker compose run --rm stock-python pytest python-engine/tests/test_tushare_smo
 ```
 
 即使 `daily` + `stk_limit` + `daily_basic` + `adj_factor` 字段完整，只要没有可信 `is_paused` 来源，Tushare stock daily 最多只能判为 DQ2，不能晋级 DQ3 标准 `daily_price`。Goal 10 / 10B / 10R 不做十年全量数据，不执行因子、选股、回测或自动交易。
+
+### Tushare Goal 12B Suspension Smoke
+
+Goal 12B 只验证 Tushare `trade_cal` / `suspend_d` 作为标准层候选来源的可用性，不写标准 `daily_price`，不写真实 raw 主链路，不进入清洗、因子、选股或真实回测。
+
+状态含义：
+
+- `PASS_WITH_ROWS`：接口可用且字段满足契约，并返回样本行。
+- `PASS_EMPTY`：接口可用且字段满足契约，但该日期没有事件行；`suspend_d` 空结果不是失败。
+- `BLOCKED`：权限、积分、频率或配置阻塞。
+- `API_ERROR`：接口调用发生其他异常。
+- `SCHEMA_MISMATCH`：接口可达，但返回字段不满足本系统契约。
+
+运行：
+
+```powershell
+docker compose run --rm stock-python python -m stock_selector.cli probe-tushare-goal12b `
+  --trade-date $env:TUSHARE_SMOKE_TRADE_DATE `
+  --sample-limit 5 `
+  --sleep-seconds 12
+```
+
+Goal 12B 只允许以下 smoke 路径：
+
+```text
+smoke/tushare/trade_cal/trade_date=YYYY-MM-DD/part.parquet
+smoke/tushare/suspend_d/trade_date=YYYY-MM-DD/part.parquet
+```
+
+写入后可用 DuckDB 查询：
+
+```powershell
+docker compose run --rm stock-python python -m stock_selector.cli query-parquet --dataset trade_cal --trade-date $env:TUSHARE_SMOKE_TRADE_DATE --smoke-provider tushare
+docker compose run --rm stock-python python -m stock_selector.cli query-parquet --dataset suspend_d --trade-date $env:TUSHARE_SMOKE_TRADE_DATE --smoke-provider tushare
+```
+
+`trade_cal` 只是 `trading_calendar_candidate` 证据；`suspend_d` 只是 `suspension_status_candidate` 事件来源候选。`suspend_d` 命中可以成立为 `is_paused=true` candidate；`suspend_d` 未命中不能推断为 `is_paused=false`，必须等后续标准层 staging、join dry-run、覆盖范围审计和 validator 验证完成。
 
 ## 幂等与重跑
 

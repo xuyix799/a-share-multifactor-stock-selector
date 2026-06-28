@@ -22,6 +22,7 @@ from stock_selector.providers.provider_factory import list_providers
 from stock_selector.providers.schema_contract import inspect_schema
 from stock_selector.providers.schema_mapper import SchemaMappingError, normalize_date, normalize_stock_code
 from stock_selector.providers.tushare_goal10r_probe import probe_tushare_goal10r
+from stock_selector.providers.tushare_goal12b_probe import probe_tushare_goal12b
 from stock_selector.providers.tushare_provider import TushareProvider
 from stock_selector.scoring.selection_pipeline import build_selection_for_date
 from stock_selector.scoring.selection_validator import validate_selection_result
@@ -264,6 +265,32 @@ def _cmd_probe_tushare_goal10r(args: argparse.Namespace) -> int:
     settings = load_settings()
     provider = TushareProvider(settings=settings)
     result = probe_tushare_goal10r(
+        provider,
+        trade_date,
+        write_dataset_fn=lambda dataset, requested_date, df: _write_provider_smoke_dataset("tushare", dataset, requested_date, df),
+        sample_limit=args.sample_limit,
+        sleep_seconds=args.sleep_seconds,
+    )
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return 0
+
+
+def _cmd_probe_tushare_goal12b(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+    if args.sample_limit <= 0:
+        print("invalid input: sample_limit must be positive", file=sys.stderr)
+        return 2
+    if args.sleep_seconds < 0:
+        print("invalid input: sleep_seconds must be non-negative", file=sys.stderr)
+        return 2
+
+    settings = load_settings()
+    provider = TushareProvider(settings=settings)
+    result = probe_tushare_goal12b(
         provider,
         trade_date,
         write_dataset_fn=lambda dataset, requested_date, df: _write_provider_smoke_dataset("tushare", dataset, requested_date, df),
@@ -718,6 +745,12 @@ def build_parser() -> argparse.ArgumentParser:
     probe_tushare_goal10r_parser.add_argument("--sample-limit", type=int, default=5)
     probe_tushare_goal10r_parser.add_argument("--sleep-seconds", type=float, default=12.0)
     probe_tushare_goal10r_parser.set_defaults(func=_cmd_probe_tushare_goal10r)
+
+    probe_tushare_goal12b_parser = subparsers.add_parser("probe-tushare-goal12b")
+    probe_tushare_goal12b_parser.add_argument("--trade-date", required=True)
+    probe_tushare_goal12b_parser.add_argument("--sample-limit", type=int, default=5)
+    probe_tushare_goal12b_parser.add_argument("--sleep-seconds", type=float, default=12.0)
+    probe_tushare_goal12b_parser.set_defaults(func=_cmd_probe_tushare_goal12b)
 
     validate_provider_data = subparsers.add_parser("validate-provider-data")
     validate_provider_data.add_argument("--trade-date", required=True)

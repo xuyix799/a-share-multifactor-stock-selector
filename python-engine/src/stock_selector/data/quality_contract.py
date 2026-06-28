@@ -37,6 +37,38 @@ class BacktestModeContract:
     result_label: str
 
 
+@dataclass(frozen=True)
+class TradingCalendarCandidateContract:
+    provider_name: str
+    source_interface: str
+    candidate_dataset: str
+    dq_level: DataQualityLevel
+    event_source_candidate_available: bool
+    standard_trading_calendar_ready: bool
+    standard_daily_price_ready: bool
+    standard_daily_price_written: bool
+    real_backtest_allowed: bool
+    required_future_gates: tuple[str, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
+class SuspensionStatusCandidateContract:
+    provider_name: str
+    source_interface: str
+    candidate_dataset: str
+    dq_level: DataQualityLevel
+    event_source_candidate_available: bool
+    hit_means_is_paused_true_candidate: bool
+    miss_means_is_paused_false_candidate: bool
+    standard_suspension_status_ready: bool
+    standard_daily_price_ready: bool
+    standard_daily_price_written: bool
+    real_backtest_allowed: bool
+    required_future_gates: tuple[str, ...]
+    reason: str
+
+
 REQUIRED_DAILY_PRICE_FIELDS = frozenset(
     {
         "stock_code",
@@ -53,6 +85,11 @@ REQUIRED_DAILY_PRICE_FIELDS = frozenset(
         "limit_down",
     }
 )
+
+REQUIRED_TUSHARE_TRADE_CAL_FIELDS = frozenset({"exchange", "cal_date", "is_open", "pretrade_date"})
+REQUIRED_TUSHARE_SUSPEND_D_FIELDS = frozenset({"ts_code", "trade_date", "suspend_timing", "suspend_type"})
+PASS_SMOKE_STATUSES = frozenset({"PASS_WITH_ROWS", "PASS_EMPTY"})
+GOAL12B_FUTURE_GATES = ("staging", "join_dry_run", "coverage_audit", "validator_verification")
 
 
 def classify_provider_dataset(provider_name: str, dataset: str) -> ProviderDatasetContract:
@@ -137,6 +174,57 @@ def get_backtest_mode_contract(mode: BacktestMode | str) -> BacktestModeContract
         allowed_datasets=("benchmark_price",),
         tradable=False,
         result_label="diagnostic_non_tradable",
+    )
+
+
+def classify_tushare_trading_calendar_candidate(
+    smoke_status: str,
+    fields: Iterable[str],
+) -> TradingCalendarCandidateContract:
+    field_set = set(fields)
+    available = smoke_status in PASS_SMOKE_STATUSES and REQUIRED_TUSHARE_TRADE_CAL_FIELDS.issubset(field_set)
+    return TradingCalendarCandidateContract(
+        provider_name="tushare",
+        source_interface="trade_cal",
+        candidate_dataset="trading_calendar_candidate",
+        dq_level=DataQualityLevel.DQ1,
+        event_source_candidate_available=available,
+        standard_trading_calendar_ready=False,
+        standard_daily_price_ready=False,
+        standard_daily_price_written=False,
+        real_backtest_allowed=False,
+        required_future_gates=GOAL12B_FUTURE_GATES,
+        reason=(
+            "Tushare trade_cal is only a trading_calendar candidate in Goal 12B; standard staging, "
+            "calendar consistency checks, audit fields, and validator verification are still required."
+        ),
+    )
+
+
+def classify_tushare_suspension_status_candidate(
+    smoke_status: str,
+    fields: Iterable[str],
+) -> SuspensionStatusCandidateContract:
+    field_set = set(fields)
+    available = smoke_status in PASS_SMOKE_STATUSES and REQUIRED_TUSHARE_SUSPEND_D_FIELDS.issubset(field_set)
+    return SuspensionStatusCandidateContract(
+        provider_name="tushare",
+        source_interface="suspend_d",
+        candidate_dataset="suspension_status_candidate",
+        dq_level=DataQualityLevel.DQ1,
+        event_source_candidate_available=available,
+        hit_means_is_paused_true_candidate=smoke_status == "PASS_WITH_ROWS" and available,
+        miss_means_is_paused_false_candidate=False,
+        standard_suspension_status_ready=False,
+        standard_daily_price_ready=False,
+        standard_daily_price_written=False,
+        real_backtest_allowed=False,
+        required_future_gates=GOAL12B_FUTURE_GATES,
+        reason=(
+            "Tushare suspend_d can only be used as a suspension_status_candidate event source in Goal 12B. "
+            "A hit can mean is_paused=true candidate; a miss cannot mean is_paused=false until coverage "
+            "and source completeness are audited."
+        ),
     )
 
 

@@ -84,6 +84,16 @@ class TushareProvider(ExternalProviderSkeleton):
     def fetch_raw_endpoint(self, endpoint: str, **kwargs) -> pd.DataFrame:
         return self._fetch(endpoint, **kwargs)
 
+    def fetch_raw_endpoint_allow_empty(self, endpoint: str, **kwargs) -> pd.DataFrame:
+        method = getattr(self._pro, endpoint)
+        try:
+            df = self._run_tushare_call(lambda: method(**kwargs))
+        except Exception as exc:
+            raise ProviderFetchError(f"tushare {endpoint} fetch failed: {exc}") from exc
+        if df is None:
+            return pd.DataFrame()
+        return df.copy()
+
     def _fetch(self, endpoint: str, **kwargs) -> pd.DataFrame:
         method = getattr(self._pro, endpoint)
         try:

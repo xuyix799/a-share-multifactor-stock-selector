@@ -59,3 +59,59 @@ def test_optional_real_tushare_smoke_writes_isolated_minio_parquet_and_duckdb_re
     assert composition["standard_daily_price_possible"] is False
     assert composition["suspension_status_available"] is False
     assert "is_paused" in composition["missing_for_dq3"]
+
+
+def test_optional_real_tushare_goal12b_smoke_writes_calendar_and_suspend_candidates(tmp_path, capsys):
+    if os.getenv("RUN_TUSHARE_SMOKE") != "1":
+        pytest.skip("set RUN_TUSHARE_SMOKE=1 to run optional real Tushare smoke")
+    if not os.getenv("TUSHARE_TOKEN"):
+        pytest.skip("set TUSHARE_TOKEN to run optional real Tushare smoke")
+    trade_date = os.getenv("TUSHARE_SMOKE_TRADE_DATE")
+    if not trade_date:
+        pytest.skip("set TUSHARE_SMOKE_TRADE_DATE=YYYY-MM-DD to run optional real Tushare smoke")
+    if not os.getenv("STOCK_MINIO_ACCESS_KEY") or not os.getenv("STOCK_MINIO_SECRET_KEY"):
+        pytest.skip("set MinIO credentials to run optional real Tushare smoke")
+
+    exit_code = main(
+        [
+            "probe-tushare-goal12b",
+            "--trade-date",
+            trade_date,
+            "--sample-limit",
+            "3",
+            "--sleep-seconds",
+            os.getenv("TUSHARE_SMOKE_SLEEP_SECONDS", "12"),
+        ]
+    )
+    assert exit_code == 0
+    output = __import__("json").loads(capsys.readouterr().out)
+    results = output["interfaces"]
+
+    settings = {
+        "storage": {
+            "minio_endpoint": os.getenv("STOCK_MINIO_ENDPOINT", "stock-minio:9000"),
+            "minio_bucket_raw": os.getenv("STOCK_MINIO_BUCKET_RAW", "stock-raw"),
+        }
+    }
+    minio_client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_raw"]
+    for result in results:
+        assert result["interface"] in {"trade_cal", "suspend_d"}
+        if not result["status"].startswith("PASS"):
+            continue
+        assert result["object_key"].startswith(f"smoke/tushare/{result['interface']}/trade_date={trade_date}/")
+        target = Path(tmp_path) / result["object_key"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        minio_client.fget_object(bucket, result["object_key"], str(target))
+        rows = query_dataset_file(target, limit=5)
+        if result["status"] == "PASS_WITH_ROWS":
+            assert rows, result["interface"]
+
+    contract = output["suspension_status_candidate_contract"]
+    assert contract["candidate_dataset"] == "suspension_status_candidate"
+    assert contract["miss_means_is_paused_false_candidate"] is False
+    assert contract["standard_suspension_status_ready"] is False
+    assert contract["standard_daily_price_ready"] is False
+    assert output["standard_daily_price_written"] is False
+    assert output["real_backtest_run"] is False
+    assert output["is_paused_fabricated"] is False

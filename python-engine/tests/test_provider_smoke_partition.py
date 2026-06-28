@@ -20,3 +20,16 @@ def test_provider_smoke_partition_accepts_raw_smoke_dataset_but_standard_partiti
 
     with pytest.raises(DatasetValidationError):
         partition.build_partition("daily_price_raw_smoke", "2026-06-19", local_root=tmp_path)
+
+
+def test_provider_smoke_partition_accepts_goal12b_tushare_interfaces_only_in_smoke_namespace(tmp_path):
+    trade_cal = partition.build_provider_smoke_partition("tushare", "trade_cal", "2026-06-19", local_root=tmp_path)
+    suspend_d = partition.build_provider_smoke_partition("tushare", "suspend_d", "2026-06-19", local_root=tmp_path)
+
+    assert trade_cal.object_key == "smoke/tushare/trade_cal/trade_date=2026-06-19/part.parquet"
+    assert suspend_d.object_key == "smoke/tushare/suspend_d/trade_date=2026-06-19/part.parquet"
+
+    with pytest.raises(DatasetValidationError):
+        partition.build_partition("trade_cal", "2026-06-19", local_root=tmp_path)
+    with pytest.raises(DatasetValidationError):
+        partition.build_partition("suspend_d", "2026-06-19", local_root=tmp_path)
