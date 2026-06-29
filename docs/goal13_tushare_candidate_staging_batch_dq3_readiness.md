@@ -56,6 +56,8 @@ candidate/tushare/suspend_d_staging/batch_id=<batch_id>/part.parquet
 candidate/tushare/daily_price_candidate_batch/batch_id=<batch_id>/part.parquet
 candidate/tushare/suspension_status_candidate_batch/batch_id=<batch_id>/part.parquet
 candidate/tushare/provider_coverage_report/batch_id=<batch_id>/report.json
+candidate/tushare/fetch_semantics_report/batch_id=<batch_id>/report.json
+candidate/tushare/coverage_gap_report/batch_id=<batch_id>/report.json
 candidate/tushare/dq3_readiness_audit/batch_id=<batch_id>/report.json
 ```
 

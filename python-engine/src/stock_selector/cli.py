@@ -416,13 +416,21 @@ def _cmd_build_tushare_candidate_staging_batch(args: argparse.Namespace) -> int:
         max_codes=args.max_codes,
         max_trade_days=args.max_trade_days,
         no_provider_call=args.no_provider_call,
+        reuse_existing_staging=args.reuse_existing_staging,
+        coverage_expansion=args.coverage_expansion,
+        fetch_semantics_audit=args.fetch_semantics_audit,
+        load_parquet_fn=_load_tushare_candidate_batch_parquet,
         write_parquet_fn=_write_tushare_candidate_batch_parquet,
         write_json_fn=_write_tushare_candidate_batch_json,
         cli_command=" ".join(sys.argv),
     )
     output = _tushare_candidate_staging_batch_cli_output(result)
     print(json.dumps(output, ensure_ascii=False, default=str))
-    return 0 if result["status"] == "CANDIDATE_BATCH_COMPLETED_NOT_PROMOTABLE" else 1
+    if result["status"] != "CANDIDATE_BATCH_COMPLETED_NOT_PROMOTABLE":
+        return 1
+    if args.fail_on_incomplete_critical_coverage and _has_incomplete_critical_coverage(result):
+        return 1
+    return 0
 
 
 def _cmd_validate_provider_data(args: argparse.Namespace) -> int:
@@ -918,12 +926,20 @@ def _write_tushare_candidate_batch_json(object_key: str, payload: dict) -> str:
     return object_key
 
 
+def _load_tushare_candidate_batch_parquet(object_key: str) -> pd.DataFrame:
+    with tempfile.TemporaryDirectory(prefix="stock-tushare-candidate-batch-read-") as tmp:
+        path = _try_materialize_object_key(object_key, Path(tmp))
+        if not path:
+            raise FileNotFoundError(f"missing candidate staging parquet: {object_key}")
+        return pd.read_parquet(path)
+
+
 def _tushare_candidate_staging_batch_cli_output(result: dict) -> dict:
     keys = result.get("output_object_keys", {})
     dq3_audit = result.get("dq3_readiness_audit", {})
     return {
         "provider": "tushare",
-        "goal": "13",
+        "goal": "13B",
         "status": result["status"],
         "batch_id": result["batch_id"],
         "start_date": result["start_date"],
@@ -932,6 +948,8 @@ def _tushare_candidate_staging_batch_cli_output(result: dict) -> dict:
         "trade_dates": result.get("trade_dates", []),
         "manifest_key": keys.get("manifest"),
         "provider_coverage_report_key": keys.get("provider_coverage_report"),
+        "fetch_semantics_report_key": keys.get("fetch_semantics_report"),
+        "coverage_gap_report_key": keys.get("coverage_gap_report"),
         "dq3_readiness_audit_key": keys.get("dq3_readiness_audit"),
         "daily_price_candidate_batch_key": keys.get("daily_price_candidate_batch"),
         "suspension_status_candidate_batch_key": keys.get("suspension_status_candidate_batch"),
@@ -945,9 +963,26 @@ def _tushare_candidate_staging_batch_cli_output(result: dict) -> dict:
         "ready_for_promotion_validator": result.get("ready_for_promotion_validator", False),
         "ready_for_dq3_promotion": result.get("ready_for_dq3_promotion", False),
         "blocked_reasons": result.get("blocked_reasons", []),
+        "coverage_expansion": result.get("coverage_expansion", False),
+        "fetch_semantics_audit": result.get("fetch_semantics_audit", False),
+        "reused_existing_staging": result.get("reused_existing_staging", False),
         "safety": result.get("safety", {}),
         "inference_guards": result.get("inference_guards", {}),
     }
+
+
+def _has_incomplete_critical_coverage(result: dict) -> bool:
+    blocking = {
+        "INCOMPLETE_DAILY_COVERAGE",
+        "INCOMPLETE_LIMIT_PRICE_COVERAGE",
+        "INCOMPLETE_ADJ_FACTOR_COVERAGE",
+        "INCOMPLETE_DAILY_BASIC_COVERAGE",
+        "SAMPLE_TRUNCATED",
+        "PROVIDER_FETCH_INCOMPLETE",
+        "SCHEMA_MISMATCH",
+        "DUPLICATE_KEYS_FOUND",
+    }
+    return bool(blocking & set(result.get("blocked_reasons", [])))
 
 
 def _parse_codes_arg(value: str | None) -> list[str]:
@@ -1139,6 +1174,10 @@ def build_parser() -> argparse.ArgumentParser:
     build_tushare_candidate_staging_batch.add_argument("--sleep-seconds", type=float, default=12.0)
     build_tushare_candidate_staging_batch.add_argument("--dry-run", action="store_true")
     build_tushare_candidate_staging_batch.add_argument("--no-provider-call", action="store_true")
+    build_tushare_candidate_staging_batch.add_argument("--reuse-existing-staging", action="store_true")
+    build_tushare_candidate_staging_batch.add_argument("--coverage-expansion", action="store_true")
+    build_tushare_candidate_staging_batch.add_argument("--fetch-semantics-audit", action="store_true")
+    build_tushare_candidate_staging_batch.add_argument("--fail-on-incomplete-critical-coverage", action="store_true")
     build_tushare_candidate_staging_batch.add_argument("--write-candidate", action="store_true", default=True)
     build_tushare_candidate_staging_batch.set_defaults(func=_cmd_build_tushare_candidate_staging_batch)
 

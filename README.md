@@ -34,6 +34,7 @@
 - Goal 12C：Tushare `daily_price_candidate` join dry-run；只读已有 `daily` / `stk_limit` / `adj_factor` / `trade_cal` / `suspend_d` smoke，输出诊断报告，不写标准 `daily_price`，详见 `docs/goal12C_tushare_daily_price_candidate_dry_run.md`。
 - Goal 12D：Tushare `suspension_status_candidate` staging 与 coverage audit；输出 candidate-only 停牌状态和覆盖审计报告，当前 sample-truncated `suspend_d` 不能生成 `false_candidate`，仍未写 standard `daily_price` 或 standard `suspension_status`，真实数据仍未进入正式选股/回测主链路，详见 `docs/goal12D_suspension_status_candidate_coverage_audit.md`。
 - Goal 13：Tushare 小范围 real-provider candidate/staging batch 与 DQ3 readiness audit；只写 `candidate/tushare/...` manifest、staging、candidate batch、coverage report 和 DQ3 audit，不写 standard `daily_price` / `suspension_status`，不进入真实选股或真实回测，详见 `docs/goal13_tushare_candidate_staging_batch_dq3_readiness.md`。
+- Goal 13B：新增 Tushare candidate batch coverage expansion 与 fetch semantics audit；真实数据仍未进入 standard `daily_price` 或真实回测主链路，详见 `docs/goal13B_tushare_candidate_batch_coverage_expansion.md`。
 - Goal 10B：AKShare / Baostock 最小真实数据 smoke，已验证 AKShare `benchmark_price` 可标准化写入 `smoke/akshare/...` 并通过 DuckDB 查询；字段不足的数据集不会绕过 validator 写入标准层。
 - Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke，新增 smoke-only `daily_price_raw_smoke`，只允许写入 `smoke/<provider>/daily_price_raw_smoke/...`，不进入标准 `raw/daily_price/...`。
 - Goal 12A：真实数据标准层契约与数据质量等级冻结，详见 `docs/goal12A_real_data_contract.md`；本阶段只新增契约、守门规则和测试，不接入真实 provider 主链路，不做真实回测。
@@ -370,16 +371,19 @@ docker compose run --rm stock-python python -m stock_selector.cli query-parquet 
 
 `trade_cal` 只是 `trading_calendar_candidate` 证据；`suspend_d` 只是 `suspension_status_candidate` 事件来源候选。`suspend_d` 命中可以成立为 `is_paused=true` candidate；`suspend_d` 未命中不能推断为 `is_paused=false`，必须等后续标准层 staging、join dry-run、覆盖范围审计和 validator 验证完成。
 
-### Tushare Goal 13 Candidate Batch
+### Tushare Goal 13 / 13B Candidate Batch
 
-Goal 13 可以显式调用 Tushare，构建小范围 candidate/staging batch：
+Goal 13 可以显式调用 Tushare，构建小范围 candidate/staging batch。Goal 13B 在同一 candidate/staging 边界内增加 coverage expansion、fetch semantics audit 和 coverage gap report：
 
 ```powershell
 docker compose run --rm stock-python python -m stock_selector.cli build-tushare-candidate-staging-batch `
   --start-date 2024-06-01 `
   --end-date 2024-07-31 `
   --codes 000001.SZ,600519.SH,300750.SZ,000333.SZ,601318.SH,600036.SH,000858.SZ,601899.SH,600900.SH,002415.SZ `
-  --sleep-seconds 12
+  --max-trade-days 20 `
+  --sleep-seconds 12 `
+  --coverage-expansion `
+  --fetch-semantics-audit
 ```
 
 该命令只允许写入：
@@ -390,8 +394,12 @@ candidate/tushare/*_staging/batch_id=<batch_id>/...
 candidate/tushare/daily_price_candidate_batch/batch_id=<batch_id>/part.parquet
 candidate/tushare/suspension_status_candidate_batch/batch_id=<batch_id>/part.parquet
 candidate/tushare/provider_coverage_report/batch_id=<batch_id>/report.json
+candidate/tushare/fetch_semantics_report/batch_id=<batch_id>/report.json
+candidate/tushare/coverage_gap_report/batch_id=<batch_id>/report.json
 candidate/tushare/dq3_readiness_audit/batch_id=<batch_id>/report.json
 ```
+
+Goal 13B 中 `stk_limit` coverage expansion 按目标交易日拉取后过滤目标股票，`adj_factor`、`daily`、`daily_basic` 保持按股票区间拉取。`--no-provider-call --reuse-existing-staging` 可以只复用已有 candidate/staging 重建审计报告；`--fail-on-incomplete-critical-coverage` 只在关键 price coverage 不完整时让 CLI 非零退出。
 
 这些对象不是 `raw/daily_price` 或标准 `suspension_status`，不会被 `clean_daily_snapshot`、`factor_daily`、`selection_result` 或 `run-backtest` 读取。`suspend_d` 未命中仍不能推断为 `is_paused=false`；缺少完整事件覆盖审计时，DQ3 readiness 必须保持 blocked。
 

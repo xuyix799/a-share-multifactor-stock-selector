@@ -36,7 +36,7 @@ def test_goal13_builds_candidate_staging_batch_reports_and_never_writes_standard
     assert result["status"] == "CANDIDATE_BATCH_COMPLETED_NOT_PROMOTABLE"
     assert result["batch_id"] == BATCH_ID
     assert result["provider"] == "tushare"
-    assert result["goal"] == "13"
+    assert result["goal"] == "13B"
     assert result["start_date"] == START_DATE
     assert result["end_date"] == END_DATE
     assert result["codes"] == CODES
@@ -54,6 +54,8 @@ def test_goal13_builds_candidate_staging_batch_reports_and_never_writes_standard
     assert set(writer.json_payloads) == {
         keys["manifest"],
         keys["provider_coverage_report"],
+        keys["fetch_semantics_report"],
+        keys["coverage_gap_report"],
         keys["dq3_readiness_audit"],
     }
     assert keys["daily_staging"]["2024-06-03"] in writer.parquet_payloads
@@ -121,7 +123,7 @@ def test_goal13_builds_candidate_staging_batch_reports_and_never_writes_standard
     dq3 = writer.json_payloads[keys["dq3_readiness_audit"]]
     assert dq3["ready_for_dq3_promotion"] is False
     assert dq3["status"] == "BLOCKED_BY_UNRESOLVED_IS_PAUSED"
-    assert "suspend_d event source full coverage is not proven" in dq3["blocked_reasons"]
+    assert "INCOMPLETE_OR_UNKNOWN_SUSPEND_D_COVERAGE" in dq3["blocked_reasons"]
     assert dq3["duplicate_check"]["ok"] is True
     assert dq3["schema_check"]["ok"] is True
     assert dq3["safety"]["standard_daily_price_written"] is False
@@ -147,6 +149,163 @@ def test_goal13_builds_candidate_staging_batch_reports_and_never_writes_standard
     assert build_partition("clean_daily_snapshot", "2024-06-03").object_key != keys["daily_price_candidate_batch"]
     assert build_partition("factor_daily", "2024-06-03").object_key != keys["daily_price_candidate_batch"]
     assert build_partition("selection_result", "2024-06-03").object_key != keys["daily_price_candidate_batch"]
+
+
+def test_goal13b_coverage_expansion_records_fetch_semantics_and_uses_date_strategy_for_stk_limit():
+    from stock_selector.data.tushare_candidate_staging_batch import build_tushare_candidate_staging_batch
+
+    writer = _MemoryWriter()
+    provider = _FakeTushareBatchProvider(complete_limit_coverage=True)
+    result = build_tushare_candidate_staging_batch(
+        start_date=START_DATE,
+        end_date=END_DATE,
+        codes=CODES,
+        provider=provider,
+        batch_id=BATCH_ID,
+        sleep_seconds=0,
+        coverage_expansion=True,
+        fetch_semantics_audit=True,
+        write_parquet_fn=writer.write_parquet,
+        write_json_fn=writer.write_json,
+        generated_at_fn=lambda: "2026-06-29T00:00:00Z",
+    )
+
+    fetch_report = writer.json_payloads[result["output_object_keys"]["fetch_semantics_report"]]
+    matrix = {item["interface"]: item for item in fetch_report["fetch_semantics_matrix"]}
+
+    assert result["coverage_expansion"] is True
+    assert result["fetch_semantics_audit"] is True
+    assert matrix["daily"]["fetch_strategy"] == "by_code_range"
+    assert matrix["daily"]["loops_per_code"] is True
+    assert matrix["stk_limit"]["fetch_strategy"] == "by_trade_date"
+    assert matrix["stk_limit"]["loops_per_code"] is False
+    assert matrix["stk_limit"]["loops_per_trade_day"] is True
+    assert [call["parameters"]["trade_date"] for call in matrix["stk_limit"]["calls"]] == ["20240603", "20240604"]
+    assert all("ts_code" not in call["parameters"] for call in matrix["stk_limit"]["calls"])
+    assert matrix["adj_factor"]["fetch_strategy"] == "by_code_range"
+    assert matrix["adj_factor"]["loops_per_code"] is True
+    assert matrix["daily_basic"]["fetch_strategy"] == "by_code_range"
+    assert matrix["trade_cal"]["fetch_strategy"] == "by_date_range"
+    assert matrix["suspend_d"]["fetch_strategy"] == "by_date_range"
+    assert matrix["stk_limit"]["row_count_alignment"]["status"] == "ALIGNED"
+    assert fetch_report["sample_limit_policy"]["critical_staging_sample_limit_allowed"] is False
+    assert fetch_report["sample_limit_policy"]["sample_limit_applied"] is False
+    assert "TUSHARE_TOKEN" not in json.dumps(fetch_report)
+
+
+def test_goal13b_coverage_gap_report_lists_missing_keys_and_reason_codes():
+    from stock_selector.data.tushare_candidate_staging_batch import build_tushare_candidate_staging_batch
+
+    writer = _MemoryWriter()
+    result = build_tushare_candidate_staging_batch(
+        start_date=START_DATE,
+        end_date=END_DATE,
+        codes=CODES,
+        provider=_FakeTushareBatchProvider(half_limit_coverage=True, half_adj_factor_coverage=True),
+        batch_id=BATCH_ID,
+        sleep_seconds=0,
+        coverage_expansion=True,
+        fetch_semantics_audit=True,
+        write_parquet_fn=writer.write_parquet,
+        write_json_fn=writer.write_json,
+        generated_at_fn=lambda: "2026-06-29T00:00:00Z",
+    )
+
+    coverage = result["provider_coverage_report"]
+    gap = writer.json_payloads[result["output_object_keys"]["coverage_gap_report"]]
+
+    assert coverage["stk_limit_coverage"]["numerator"] == 2
+    assert coverage["stk_limit_coverage"]["denominator"] == 4
+    assert coverage["stk_limit_coverage"]["ratio"] == 0.5
+    assert coverage["adj_factor_coverage"]["numerator"] == 2
+    assert coverage["adj_factor_coverage"]["denominator"] == 4
+    assert coverage["daily_coverage"]["ratio"] == 1.0
+    assert coverage["daily_basic_coverage"]["ratio"] == 1.0
+    assert any(
+        item["ts_code"] == "000001.SZ"
+        and item["trade_date"] == "2024-06-04"
+        and item["missing_interface"] == "stk_limit"
+        and item["missing_fields"] == ["limit_up", "limit_down"]
+        and item["reason_code"] == "DATE_ALIGNMENT_GAP"
+        for item in gap["missing_key_examples"]
+    )
+    assert any(
+        item["ts_code"] == "600519.SH"
+        and item["trade_date"] == "2024-06-04"
+        and item["missing_interface"] == "adj_factor"
+        and item["missing_fields"] == ["adj_factor"]
+        and item["reason_code"] == "DATE_ALIGNMENT_GAP"
+        for item in gap["missing_key_examples"]
+    )
+    assert gap["interface_gap_summary"]["stk_limit"]["reason_codes"] == ["DATE_ALIGNMENT_GAP"]
+    assert gap["interface_gap_summary"]["adj_factor"]["reason_codes"] == ["DATE_ALIGNMENT_GAP"]
+    assert "stk_limit likely fetched by incomplete date set" in gap["fetch_strategy_suspicions"]
+    assert "adj_factor likely fetched by incomplete date set" in gap["fetch_strategy_suspicions"]
+    assert result["dq3_readiness_audit"]["blocked_reasons"][:2] == [
+        "INCOMPLETE_LIMIT_PRICE_COVERAGE",
+        "INCOMPLETE_ADJ_FACTOR_COVERAGE",
+    ]
+
+
+def test_goal13b_full_price_coverage_but_unresolved_pause_blocks_only_pause_and_suspend():
+    from stock_selector.data.tushare_candidate_staging_batch import build_tushare_candidate_staging_batch
+
+    writer = _MemoryWriter()
+    result = build_tushare_candidate_staging_batch(
+        start_date=START_DATE,
+        end_date=END_DATE,
+        codes=CODES,
+        provider=_FakeTushareBatchProvider(complete_limit_coverage=True, empty_suspend_d=True),
+        batch_id=BATCH_ID,
+        sleep_seconds=0,
+        coverage_expansion=True,
+        write_parquet_fn=writer.write_parquet,
+        write_json_fn=writer.write_json,
+        generated_at_fn=lambda: "2026-06-29T00:00:00Z",
+    )
+
+    dq3 = result["dq3_readiness_audit"]
+
+    assert result["provider_coverage_report"]["daily_coverage"]["ratio"] == 1.0
+    assert result["provider_coverage_report"]["stk_limit_coverage"]["ratio"] == 1.0
+    assert result["provider_coverage_report"]["adj_factor_coverage"]["ratio"] == 1.0
+    assert result["provider_coverage_report"]["daily_basic_coverage"]["ratio"] == 1.0
+    assert dq3["status"] == "BLOCKED_BY_UNRESOLVED_IS_PAUSED"
+    assert dq3["blocked_reasons"] == ["UNRESOLVED_IS_PAUSED", "INCOMPLETE_OR_UNKNOWN_SUSPEND_D_COVERAGE"]
+    assert dq3["ready_for_promotion_validator"] is False
+    assert dq3["ready_for_dq3_promotion"] is False
+    assert dq3["coverage_summary"]["critical_price_coverage_complete"] is True
+    assert dq3["coverage_summary"]["price_coverage_complete_pause_unresolved"] is True
+
+
+def test_goal13b_sample_truncated_critical_staging_blocks_full_coverage():
+    from stock_selector.data.tushare_candidate_staging_batch import build_tushare_candidate_staging_batch
+
+    writer = _MemoryWriter()
+    result = build_tushare_candidate_staging_batch(
+        start_date=START_DATE,
+        end_date=END_DATE,
+        codes=CODES,
+        provider=_FakeTushareBatchProvider(sample_truncated_interfaces={"stk_limit"}),
+        batch_id=BATCH_ID,
+        sleep_seconds=0,
+        coverage_expansion=True,
+        write_parquet_fn=writer.write_parquet,
+        write_json_fn=writer.write_json,
+        generated_at_fn=lambda: "2026-06-29T00:00:00Z",
+    )
+
+    coverage = result["provider_coverage_report"]
+    gap = writer.json_payloads[result["output_object_keys"]["coverage_gap_report"]]
+
+    assert coverage["sample_truncated"] is True
+    assert coverage["sample_truncation"]["stk_limit"]["sample_truncated"] is True
+    assert coverage["sample_truncation"]["stk_limit"]["full_coverage_proven"] is False
+    assert coverage["stk_limit_coverage"]["blocked_reason"] == "SAMPLE_TRUNCATED"
+    assert "SAMPLE_TRUNCATED" in result["dq3_readiness_audit"]["blocked_reasons"]
+    assert "PROVIDER_FETCH_INCOMPLETE" in result["dq3_readiness_audit"]["blocked_reasons"]
+    assert gap["interface_gap_summary"]["stk_limit"]["reason_codes"] == ["SAMPLE_TRUNCATED"]
+    assert "sample_limit may have truncated critical staging data" in gap["fetch_strategy_suspicions"]
 
 
 def test_goal13_missing_or_failed_interface_blocks_dq3_readiness_without_fake_rows():
@@ -391,6 +550,84 @@ def test_goal13_cli_writes_local_candidate_artifacts(monkeypatch, tmp_path, caps
     assert "processed/selection_result" not in output["daily_price_candidate_batch_key"]
 
 
+def test_goal13b_cli_supports_audit_flags_and_fail_on_incomplete_critical_coverage(monkeypatch, tmp_path, capsys):
+    import stock_selector.cli as cli_module
+
+    monkeypatch.setenv("STOCK_PARQUET_BACKEND", "local")
+    monkeypatch.setenv("STOCK_LOCAL_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("STOCK_TUSHARE_ENABLED", "true")
+    monkeypatch.setenv("TUSHARE_TOKEN", "fake-token")
+    monkeypatch.setattr(
+        cli_module,
+        "TushareProvider",
+        lambda settings=None: _FakeTushareBatchProvider(half_limit_coverage=True, half_adj_factor_coverage=True),
+    )
+
+    base_args = [
+        "build-tushare-candidate-staging-batch",
+        "--start-date",
+        START_DATE,
+        "--end-date",
+        END_DATE,
+        "--codes",
+        "000001.SZ,600519.SH",
+        "--batch-id",
+        BATCH_ID,
+        "--sleep-seconds",
+        "0",
+        "--coverage-expansion",
+        "--fetch-semantics-audit",
+    ]
+
+    assert main(base_args) == 0
+    audit_output = json.loads(capsys.readouterr().out)
+    assert audit_output["fetch_semantics_report_key"]
+    assert audit_output["coverage_gap_report_key"]
+    assert audit_output["coverage_summary"]["stk_limit"]["ratio"] == 0.5
+
+    assert main(base_args + ["--fail-on-incomplete-critical-coverage"]) == 1
+    fail_output = json.loads(capsys.readouterr().out)
+    assert fail_output["status"] == "CANDIDATE_BATCH_COMPLETED_NOT_PROMOTABLE"
+    assert "INCOMPLETE_LIMIT_PRICE_COVERAGE" in fail_output["blocked_reasons"]
+    assert "INCOMPLETE_ADJ_FACTOR_COVERAGE" in fail_output["blocked_reasons"]
+
+
+def test_goal13b_cli_no_provider_call_reuses_existing_staging(monkeypatch, tmp_path, capsys):
+    import stock_selector.cli as cli_module
+
+    monkeypatch.setenv("STOCK_PARQUET_BACKEND", "local")
+    monkeypatch.setenv("STOCK_LOCAL_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("STOCK_TUSHARE_ENABLED", "true")
+    monkeypatch.setenv("TUSHARE_TOKEN", "fake-token")
+    monkeypatch.setattr(cli_module, "TushareProvider", lambda settings=None: _FakeTushareBatchProvider(complete_limit_coverage=True))
+
+    build_args = [
+        "build-tushare-candidate-staging-batch",
+        "--start-date",
+        START_DATE,
+        "--end-date",
+        END_DATE,
+        "--codes",
+        "000001.SZ,600519.SH",
+        "--batch-id",
+        BATCH_ID,
+        "--sleep-seconds",
+        "0",
+        "--coverage-expansion",
+    ]
+    assert main(build_args) == 0
+    _ = capsys.readouterr()
+
+    monkeypatch.setattr(cli_module, "TushareProvider", lambda settings=None: _ProviderShouldNotBeConstructed())
+    assert main(build_args + ["--no-provider-call", "--reuse-existing-staging", "--fetch-semantics-audit"]) == 0
+    reuse_output = json.loads(capsys.readouterr().out)
+
+    assert reuse_output["reused_existing_staging"] is True
+    assert reuse_output["staging_row_counts"]["daily"] == 4
+    assert reuse_output["coverage_summary"]["daily"]["ratio"] == 1.0
+    assert reuse_output["fetch_semantics_report_key"]
+
+
 class _MemoryWriter:
     def __init__(self):
         self.parquet_payloads = {}
@@ -416,6 +653,7 @@ class _FakeTushareBatchProvider:
         empty_interfaces=None,
         half_limit_coverage=False,
         half_adj_factor_coverage=False,
+        sample_truncated_interfaces=None,
     ):
         self.fail_interfaces = fail_interfaces or {}
         self.include_pathological_rows = include_pathological_rows
@@ -424,6 +662,7 @@ class _FakeTushareBatchProvider:
         self.empty_interfaces = set(empty_interfaces or ())
         self.half_limit_coverage = half_limit_coverage
         self.half_adj_factor_coverage = half_adj_factor_coverage
+        self.sample_truncated_interfaces = set(sample_truncated_interfaces or ())
         self.calls = []
 
     def fetch_raw_endpoint_allow_empty(self, interface, **kwargs):
@@ -443,7 +682,18 @@ class _FakeTushareBatchProvider:
         frame = frames[interface].copy()
         if "ts_code" in kwargs and "ts_code" in frame.columns:
             frame = frame[frame["ts_code"] == kwargs["ts_code"]].copy()
+        if "trade_date" in kwargs and "trade_date" in frame.columns:
+            frame = frame[frame["trade_date"] == kwargs["trade_date"]].copy()
+        if interface in self.sample_truncated_interfaces:
+            frame.attrs["sample_truncated"] = True
+            frame.attrs["sample_limit"] = len(frame)
+            frame.attrs["full_coverage_proven"] = False
         return frame
+
+
+class _ProviderShouldNotBeConstructed:
+    def __init__(self):
+        raise AssertionError("TushareProvider should not be constructed when --no-provider-call reuses staging")
 
 
 def _provider_frames(*, include_pathological_rows=False, complete_limit_coverage=False, half_limit_coverage=False, half_adj_factor_coverage=False):

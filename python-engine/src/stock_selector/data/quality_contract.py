@@ -33,6 +33,18 @@ class DQ3ReadinessStatus(str, Enum):
     BLOCKED_BY_VALIDATOR = "BLOCKED_BY_VALIDATOR"
 
 
+class CoverageGapReason(str, Enum):
+    MISSING_PROVIDER_ROW = "MISSING_PROVIDER_ROW"
+    FETCH_STRATEGY_GAP = "FETCH_STRATEGY_GAP"
+    DATE_ALIGNMENT_GAP = "DATE_ALIGNMENT_GAP"
+    CODE_ALIGNMENT_GAP = "CODE_ALIGNMENT_GAP"
+    SAMPLE_TRUNCATED = "SAMPLE_TRUNCATED"
+    SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
+    PROVIDER_BLOCKED = "PROVIDER_BLOCKED"
+    RATE_LIMITED = "RATE_LIMITED"
+    UNKNOWN = "UNKNOWN"
+
+
 class PauseStatus(str, Enum):
     TRUE_CANDIDATE = "true_candidate"
     FALSE_CANDIDATE = "false_candidate"
@@ -152,6 +164,38 @@ class TushareCandidateBatchReadiness:
     status: DQ3ReadinessStatus
     reasons: tuple[str, ...]
     required_future_gates: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FetchSemanticsContract:
+    interface: str
+    fetch_strategy: str
+    expected_granularity: str
+    loops_per_code: bool
+    loops_per_trade_day: bool
+
+
+@dataclass(frozen=True)
+class ProviderCoverageContract:
+    interface: str
+    numerator: int
+    denominator: int
+    ratio: float
+    blocked_reason: CoverageGapReason | None
+
+
+@dataclass(frozen=True)
+class CriticalCoverageStatus:
+    complete: bool
+    blocked_reasons: tuple[CoverageGapReason, ...]
+
+
+@dataclass(frozen=True)
+class CandidateBatchCoverageReadiness:
+    critical_price_coverage_complete: bool
+    ready_for_promotion_validator: bool
+    ready_for_dq3_promotion: bool
+    blocked_reasons: tuple[str, ...]
 
 
 REQUIRED_DAILY_PRICE_FIELDS = frozenset(
@@ -530,6 +574,68 @@ def can_mark_tushare_candidate_batch_ready_for_promotion_validator(
         reasons=tuple(reasons),
         required_future_gates=TUSHARE_CANDIDATE_BATCH_FUTURE_GATES,
     )
+
+
+def can_mark_critical_price_coverage_complete(coverages: Iterable[ProviderCoverageContract]) -> CriticalCoverageStatus:
+    blocked = []
+    for coverage in coverages:
+        if coverage.denominator == 0 or coverage.numerator != coverage.denominator or coverage.ratio < 1.0:
+            blocked.append(coverage.blocked_reason or CoverageGapReason.MISSING_PROVIDER_ROW)
+    return CriticalCoverageStatus(complete=not blocked, blocked_reasons=tuple(blocked))
+
+
+def can_mark_ready_for_promotion_validator(
+    *,
+    critical_price_coverage_complete: bool,
+    pause_statuses: Iterable[PauseStatus | str],
+    suspend_d_full_event_coverage: bool,
+    duplicate_check_ok: bool,
+    schema_check_ok: bool,
+    validator_precheck_passed: bool,
+    dq_level: DataQualityLevel | str,
+) -> CandidateBatchCoverageReadiness:
+    readiness = can_mark_tushare_candidate_batch_ready_for_promotion_validator(
+        field_completeness_ok=critical_price_coverage_complete,
+        coverage_complete=suspend_d_full_event_coverage,
+        pause_statuses=pause_statuses,
+        duplicate_check_ok=duplicate_check_ok,
+        schema_check_ok=schema_check_ok,
+        validator_precheck_passed=validator_precheck_passed,
+        dq_level=dq_level,
+    )
+    return CandidateBatchCoverageReadiness(
+        critical_price_coverage_complete=critical_price_coverage_complete,
+        ready_for_promotion_validator=readiness.ready_for_promotion_validator,
+        ready_for_dq3_promotion=readiness.ready_for_dq3_promotion,
+        blocked_reasons=readiness.reasons,
+    )
+
+
+def detect_sample_truncation(sample_truncated: bool, *, interface: str) -> CoverageGapReason | None:
+    _ = interface
+    return CoverageGapReason.SAMPLE_TRUNCATED if sample_truncated else None
+
+
+def detect_fetch_strategy_gap(reason_codes: Iterable[CoverageGapReason | str]) -> bool:
+    normalized = set()
+    for reason in reason_codes:
+        try:
+            normalized.add(CoverageGapReason(str(reason)))
+        except ValueError:
+            continue
+    return bool(
+        normalized
+        & {
+            CoverageGapReason.FETCH_STRATEGY_GAP,
+            CoverageGapReason.DATE_ALIGNMENT_GAP,
+            CoverageGapReason.CODE_ALIGNMENT_GAP,
+        }
+    )
+
+
+def cannot_write_standard_daily_price(*, source_layer: str, explicit_standard_write_enabled: bool = False) -> bool:
+    _ = source_layer, explicit_standard_write_enabled
+    return True
 
 
 def can_write_standard_daily_price_from_tushare_candidate_batch(
