@@ -6,8 +6,13 @@ from stock_selector.data.quality_contract import (
     BacktestMode,
     DAILY_PRICE_CANDIDATE_REQUIRED_INPUTS,
     DataQualityLevel,
+    PauseStatus,
+    SuspensionCoverageStatus,
+    can_build_suspension_status_candidate,
     can_promote_to_daily_price,
     can_promote_daily_price_candidate_to_standard,
+    can_promote_suspension_status_candidate,
+    can_use_suspend_miss_as_false_candidate,
     can_use_in_price_only_diagnostic,
     can_use_in_strict_tradable_required,
     can_build_daily_price_candidate_dry_run,
@@ -180,6 +185,87 @@ def test_daily_price_candidate_promotion_requires_candidate_source_audit_boolean
 
     assert readiness.ready_for_dq3_promotion is True
     assert readiness.status == "READY_FOR_DQ3_PROMOTION"
+
+
+def test_suspension_status_candidate_requires_candidate_report_calendar_and_event_source():
+    assert can_build_suspension_status_candidate({"daily_price_candidate", "daily_price_candidate_report", "trade_cal", "suspend_d"}) is True
+    assert can_build_suspension_status_candidate({"daily_price_candidate", "trade_cal", "suspend_d"}) is False
+
+
+def test_suspend_miss_can_only_be_false_candidate_with_full_coverage_and_no_inference_shortcuts():
+    assert (
+        can_use_suspend_miss_as_false_candidate(
+            coverage_status=SuspensionCoverageStatus.FULL_EVENT_COVERAGE,
+            trade_cal_valid=True,
+            schema_valid=True,
+            volume_used_as_pause=False,
+            amount_used_as_pause=False,
+            missing_daily_used_as_pause=False,
+            unchanged_price_used_as_pause=False,
+        )
+        is True
+    )
+    assert (
+        can_use_suspend_miss_as_false_candidate(
+            coverage_status=SuspensionCoverageStatus.SAMPLE_TRUNCATED,
+            trade_cal_valid=True,
+            schema_valid=True,
+            volume_used_as_pause=False,
+            amount_used_as_pause=False,
+            missing_daily_used_as_pause=False,
+            unchanged_price_used_as_pause=False,
+        )
+        is False
+    )
+    assert (
+        can_use_suspend_miss_as_false_candidate(
+            coverage_status=SuspensionCoverageStatus.COVERAGE_UNKNOWN,
+            trade_cal_valid=True,
+            schema_valid=True,
+            volume_used_as_pause=False,
+            amount_used_as_pause=False,
+            missing_daily_used_as_pause=False,
+            unchanged_price_used_as_pause=False,
+        )
+        is False
+    )
+    assert (
+        can_use_suspend_miss_as_false_candidate(
+            coverage_status=SuspensionCoverageStatus.FULL_EVENT_COVERAGE,
+            trade_cal_valid=True,
+            schema_valid=True,
+            volume_used_as_pause=True,
+            amount_used_as_pause=False,
+            missing_daily_used_as_pause=False,
+            unchanged_price_used_as_pause=False,
+        )
+        is False
+    )
+
+
+def test_suspension_status_candidate_promotion_remains_blocked_without_validator_and_dq3():
+    readiness = can_promote_suspension_status_candidate(
+        coverage_status=SuspensionCoverageStatus.SAMPLE_TRUNCATED,
+        pause_statuses=[PauseStatus.TRUE_CANDIDATE, PauseStatus.UNKNOWN],
+        validator_passed=False,
+        dq_level=DataQualityLevel.DQ1,
+    )
+
+    assert readiness.ready_for_dq3_promotion is False
+    assert readiness.status == "BLOCKED_BY_INCOMPLETE_SUSPEND_D_COVERAGE"
+    assert "suspend_d event source coverage is not complete" in readiness.reasons
+
+    readiness = can_promote_suspension_status_candidate(
+        coverage_status=SuspensionCoverageStatus.FULL_EVENT_COVERAGE,
+        pause_statuses=[PauseStatus.TRUE_CANDIDATE, PauseStatus.FALSE_CANDIDATE],
+        validator_passed=False,
+        dq_level=DataQualityLevel.DQ2,
+    )
+
+    assert readiness.ready_for_dq3_promotion is False
+    assert readiness.status == "CANDIDATE_AUDIT_COMPLETED_NOT_PROMOTABLE"
+    assert "suspension_status promotion validator must pass" in readiness.reasons
+    assert "dq_level must be DQ3 or DQ4" in readiness.reasons
 
 
 def test_daily_price_schema_contract_keeps_trade_constraint_fields():

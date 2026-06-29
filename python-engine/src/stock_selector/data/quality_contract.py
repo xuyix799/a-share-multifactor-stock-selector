@@ -16,6 +16,29 @@ class BacktestMode(str, Enum):
     PRICE_ONLY_DIAGNOSTIC = "price_only_diagnostic"
 
 
+class SuspensionCoverageStatus(str, Enum):
+    FULL_EVENT_COVERAGE = "FULL_EVENT_COVERAGE"
+    SAMPLE_TRUNCATED = "SAMPLE_TRUNCATED"
+    COVERAGE_UNKNOWN = "COVERAGE_UNKNOWN"
+    MISSING_INPUT = "MISSING_INPUT"
+    SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
+
+
+class PauseStatus(str, Enum):
+    TRUE_CANDIDATE = "true_candidate"
+    FALSE_CANDIDATE = "false_candidate"
+    UNKNOWN = "unknown"
+
+
+class PauseEvidence(str, Enum):
+    SUSPEND_D_MATCH = "suspend_d_match"
+    FULL_EVENT_COVERAGE_NO_MATCH = "full_event_coverage_no_match"
+    UNRESOLVED_NO_EVENT_MATCH = "unresolved_no_event_match"
+    BLOCKED_BY_SAMPLE_TRUNCATED_SUSPEND_D = "blocked_by_sample_truncated_suspend_d"
+    BLOCKED_BY_MISSING_COVERAGE_METADATA = "blocked_by_missing_coverage_metadata"
+    BLOCKED_BY_MISSING_INPUT = "blocked_by_missing_input"
+
+
 @dataclass(frozen=True)
 class ProviderDatasetContract:
     provider_name: str
@@ -91,6 +114,14 @@ class DailyPriceCandidateReadiness:
     required_future_gates: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SuspensionStatusCandidateReadiness:
+    ready_for_dq3_promotion: bool
+    status: str
+    reasons: tuple[str, ...]
+    required_future_gates: tuple[str, ...]
+
+
 REQUIRED_DAILY_PRICE_FIELDS = frozenset(
     {
         "stock_code",
@@ -113,6 +144,12 @@ REQUIRED_TUSHARE_SUSPEND_D_FIELDS = frozenset({"ts_code", "trade_date", "suspend
 PASS_SMOKE_STATUSES = frozenset({"PASS_WITH_ROWS", "PASS_EMPTY"})
 GOAL12B_FUTURE_GATES = ("staging", "join_dry_run", "coverage_audit", "validator_verification")
 DAILY_PRICE_CANDIDATE_REQUIRED_INPUTS = ("daily", "stk_limit", "adj_factor", "trade_cal", "suspend_d")
+SUSPENSION_STATUS_CANDIDATE_REQUIRED_INPUTS = (
+    "daily_price_candidate",
+    "daily_price_candidate_report",
+    "trade_cal",
+    "suspend_d",
+)
 DAILY_PRICE_CANDIDATE_FUTURE_GATES = (
     "staging",
     "coverage_audit",
@@ -121,6 +158,13 @@ DAILY_PRICE_CANDIDATE_FUTURE_GATES = (
     "validator",
     "small_range_promotion",
     "mock_mainline_protection",
+)
+SUSPENSION_STATUS_CANDIDATE_FUTURE_GATES = (
+    "full_event_coverage_smoke",
+    "staging_audit",
+    "promotion_validator",
+    "small_range_standard_write",
+    "mainline_isolation_tests",
 )
 
 
@@ -283,6 +327,78 @@ def can_build_daily_price_candidate_dry_run(available_inputs: Iterable[str]) -> 
     return set(DAILY_PRICE_CANDIDATE_REQUIRED_INPUTS).issubset(set(available_inputs))
 
 
+def can_build_suspension_status_candidate(available_inputs: Iterable[str]) -> bool:
+    return set(SUSPENSION_STATUS_CANDIDATE_REQUIRED_INPUTS).issubset(set(available_inputs))
+
+
+def can_use_suspend_miss_as_false_candidate(
+    *,
+    coverage_status: SuspensionCoverageStatus | str,
+    trade_cal_valid: bool,
+    schema_valid: bool,
+    volume_used_as_pause: bool,
+    amount_used_as_pause: bool,
+    missing_daily_used_as_pause: bool,
+    unchanged_price_used_as_pause: bool,
+) -> bool:
+    status = _normalize_suspension_coverage_status(coverage_status)
+    return (
+        status == SuspensionCoverageStatus.FULL_EVENT_COVERAGE
+        and trade_cal_valid
+        and schema_valid
+        and not volume_used_as_pause
+        and not amount_used_as_pause
+        and not missing_daily_used_as_pause
+        and not unchanged_price_used_as_pause
+    )
+
+
+def can_promote_suspension_status_candidate(
+    *,
+    coverage_status: SuspensionCoverageStatus | str,
+    pause_statuses: Iterable[PauseStatus | str],
+    validator_passed: bool,
+    dq_level: DataQualityLevel | str,
+) -> SuspensionStatusCandidateReadiness:
+    status = _normalize_suspension_coverage_status(coverage_status)
+    normalized_pause_statuses = {_normalize_pause_status(item) for item in pause_statuses}
+    normalized_level = _normalize_dq_level(dq_level)
+    reasons = []
+
+    if status != SuspensionCoverageStatus.FULL_EVENT_COVERAGE:
+        reasons.append("suspend_d event source coverage is not complete")
+    if PauseStatus.UNKNOWN in normalized_pause_statuses:
+        reasons.append("pause_status contains unresolved unknown rows")
+    if not validator_passed:
+        reasons.append("suspension_status promotion validator must pass")
+    if normalized_level not in {DataQualityLevel.DQ3, DataQualityLevel.DQ4}:
+        reasons.append("dq_level must be DQ3 or DQ4")
+
+    if not reasons:
+        return SuspensionStatusCandidateReadiness(
+            ready_for_dq3_promotion=True,
+            status="READY_FOR_DQ3_PROMOTION",
+            reasons=(),
+            required_future_gates=(),
+        )
+
+    if status == SuspensionCoverageStatus.SAMPLE_TRUNCATED:
+        readiness_status = "BLOCKED_BY_INCOMPLETE_SUSPEND_D_COVERAGE"
+    elif status in {SuspensionCoverageStatus.COVERAGE_UNKNOWN, SuspensionCoverageStatus.MISSING_INPUT, SuspensionCoverageStatus.SCHEMA_MISMATCH}:
+        readiness_status = "BLOCKED_BY_UNRESOLVED_IS_PAUSED"
+    elif PauseStatus.UNKNOWN in normalized_pause_statuses:
+        readiness_status = "BLOCKED_BY_UNRESOLVED_IS_PAUSED"
+    else:
+        readiness_status = "CANDIDATE_AUDIT_COMPLETED_NOT_PROMOTABLE"
+
+    return SuspensionStatusCandidateReadiness(
+        ready_for_dq3_promotion=False,
+        status=readiness_status,
+        reasons=tuple(reasons),
+        required_future_gates=SUSPENSION_STATUS_CANDIDATE_FUTURE_GATES,
+    )
+
+
 def can_promote_daily_price_candidate_to_standard(
     *,
     source_layer: str,
@@ -365,6 +481,18 @@ def _normalize_dq_level(dq_level: DataQualityLevel | str) -> DataQualityLevel:
     if isinstance(dq_level, DataQualityLevel):
         return dq_level
     return DataQualityLevel(str(dq_level))
+
+
+def _normalize_suspension_coverage_status(status: SuspensionCoverageStatus | str) -> SuspensionCoverageStatus:
+    if isinstance(status, SuspensionCoverageStatus):
+        return status
+    return SuspensionCoverageStatus(str(status))
+
+
+def _normalize_pause_status(status: PauseStatus | str) -> PauseStatus:
+    if isinstance(status, PauseStatus):
+        return status
+    return PauseStatus(str(status))
 
 
 def _normalize_backtest_mode(mode: BacktestMode | str) -> BacktestMode:
