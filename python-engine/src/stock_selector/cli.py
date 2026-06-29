@@ -14,6 +14,10 @@ from stock_selector.cleaning.snapshot_validator import validate_clean_daily_snap
 from stock_selector.config.config_loader import load_factor_weights_config, load_settings
 from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame, validate_stock_code
 from stock_selector.data.mock_data import generate_mock_dataset
+from stock_selector.data.tushare_candidate_staging_batch import (
+    build_tushare_candidate_staging_batch,
+    build_tushare_candidate_staging_batch_blocked_report,
+)
 from stock_selector.data.tushare_daily_price_candidate import (
     SmokeInput,
     build_dry_run_output_keys,
@@ -30,6 +34,7 @@ from stock_selector.data.update_pipeline import update_provider_data
 from stock_selector.data.update_log import create_update_log_repository
 from stock_selector.factors.factor_pipeline import build_factor_daily_for_date
 from stock_selector.factors.factor_validator import validate_factor_daily
+from stock_selector.providers.base import ProviderConfigurationError
 from stock_selector.providers.provider_factory import list_providers
 from stock_selector.providers.schema_contract import inspect_schema
 from stock_selector.providers.schema_mapper import SchemaMappingError, normalize_date, normalize_stock_code
@@ -56,6 +61,19 @@ from stock_selector.utils.date_validator import DateValidationError, validate_da
 from stock_selector.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+DEFAULT_GOAL13_CODES = [
+    "000001.SZ",
+    "600519.SH",
+    "300750.SZ",
+    "000333.SZ",
+    "601318.SH",
+    "600036.SH",
+    "000858.SZ",
+    "601899.SH",
+    "600900.SH",
+    "002415.SZ",
+]
 
 
 def _cmd_validate_date(args: argparse.Namespace) -> int:
@@ -351,6 +369,60 @@ def _cmd_build_tushare_suspension_status_candidate(args: argparse.Namespace) -> 
     output = _write_tushare_suspension_status_candidate(report)
     print(json.dumps(output, ensure_ascii=False, default=str))
     return 0 if not report["status"].startswith("BLOCKED_BY_") else 1
+
+
+def _cmd_build_tushare_candidate_staging_batch(args: argparse.Namespace) -> int:
+    try:
+        start_date, end_date = validate_date_range(args.start_date, args.end_date)
+    except DateValidationError as exc:
+        print(f"invalid date range: {exc}", file=sys.stderr)
+        return 2
+    if args.sleep_seconds < 0:
+        print("invalid input: sleep_seconds must be non-negative", file=sys.stderr)
+        return 2
+    if args.max_codes is not None and args.max_codes <= 0:
+        print("invalid input: max_codes must be positive", file=sys.stderr)
+        return 2
+    if args.max_trade_days is not None and args.max_trade_days <= 0:
+        print("invalid input: max_trade_days must be positive", file=sys.stderr)
+        return 2
+
+    codes = _parse_codes_arg(args.codes)
+    settings = load_settings()
+    provider = None
+    if not args.no_provider_call:
+        try:
+            provider = TushareProvider(settings=settings)
+        except ProviderConfigurationError as exc:
+            status = _tushare_provider_config_status(exc)
+            report = build_tushare_candidate_staging_batch_blocked_report(
+                start_date=start_date,
+                end_date=end_date,
+                codes=codes,
+                batch_id=args.batch_id,
+                status=status,
+                blocked_reasons=[str(exc)],
+            )
+            print(json.dumps(_tushare_candidate_staging_batch_cli_output(report), ensure_ascii=False, default=str))
+            return 1
+
+    result = build_tushare_candidate_staging_batch(
+        start_date=start_date,
+        end_date=end_date,
+        codes=codes,
+        provider=provider,
+        batch_id=args.batch_id,
+        sleep_seconds=args.sleep_seconds,
+        max_codes=args.max_codes,
+        max_trade_days=args.max_trade_days,
+        no_provider_call=args.no_provider_call,
+        write_parquet_fn=_write_tushare_candidate_batch_parquet,
+        write_json_fn=_write_tushare_candidate_batch_json,
+        cli_command=" ".join(sys.argv),
+    )
+    output = _tushare_candidate_staging_batch_cli_output(result)
+    print(json.dumps(output, ensure_ascii=False, default=str))
+    return 0 if result["status"] == "CANDIDATE_BATCH_COMPLETED_NOT_PROMOTABLE" else 1
 
 
 def _cmd_validate_provider_data(args: argparse.Namespace) -> int:
@@ -805,6 +877,99 @@ def _write_tushare_suspension_status_candidate(report: dict) -> dict:
     }
 
 
+def _write_tushare_candidate_batch_parquet(object_key: str, frame: pd.DataFrame) -> str:
+    settings = load_settings()
+    backend = _storage_backend(settings)
+    if backend == "local":
+        path = _local_root(settings) / object_key
+        write_parquet_local_atomic(frame, path)
+        return object_key
+
+    minio_client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_raw"]
+    ensure_buckets(minio_client, [bucket])
+    with tempfile.TemporaryDirectory(prefix="stock-tushare-candidate-batch-write-") as tmp:
+        tmp_root = Path(tmp)
+        local_file = tmp_root / "part.parquet"
+        frame.to_parquet(local_file, index=False)
+        AtomicObjectWriter(client=minio_client, tmp_dir=tmp_root).write_file_atomic(bucket, object_key, local_file)
+    return object_key
+
+
+def _write_tushare_candidate_batch_json(object_key: str, payload: dict) -> str:
+    settings = load_settings()
+    backend = _storage_backend(settings)
+    if backend == "local":
+        path = _local_root(settings) / object_key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, default=str, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+        return object_key
+
+    minio_client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_raw"]
+    ensure_buckets(minio_client, [bucket])
+    with tempfile.TemporaryDirectory(prefix="stock-tushare-candidate-batch-json-") as tmp:
+        tmp_root = Path(tmp)
+        local_file = tmp_root / "payload.json"
+        local_file.write_text(json.dumps(payload, ensure_ascii=False, default=str, indent=2), encoding="utf-8")
+        AtomicObjectWriter(client=minio_client, tmp_dir=tmp_root).write_file_atomic(bucket, object_key, local_file)
+    return object_key
+
+
+def _tushare_candidate_staging_batch_cli_output(result: dict) -> dict:
+    keys = result.get("output_object_keys", {})
+    dq3_audit = result.get("dq3_readiness_audit", {})
+    return {
+        "provider": "tushare",
+        "goal": "13",
+        "status": result["status"],
+        "batch_id": result["batch_id"],
+        "start_date": result["start_date"],
+        "end_date": result["end_date"],
+        "codes": result.get("codes", []),
+        "trade_dates": result.get("trade_dates", []),
+        "manifest_key": keys.get("manifest"),
+        "provider_coverage_report_key": keys.get("provider_coverage_report"),
+        "dq3_readiness_audit_key": keys.get("dq3_readiness_audit"),
+        "daily_price_candidate_batch_key": keys.get("daily_price_candidate_batch"),
+        "suspension_status_candidate_batch_key": keys.get("suspension_status_candidate_batch"),
+        "output_object_keys": keys,
+        "staging_row_counts": result.get("staging_row_counts", {}),
+        "daily_price_candidate_row_count": result.get("daily_price_candidate_row_count", 0),
+        "suspension_status_candidate_row_count": result.get("suspension_status_candidate_row_count", 0),
+        "coverage_summary": result.get("coverage_summary", {}),
+        "pause_status_counts": result.get("pause_status_counts", {}),
+        "readiness_status": dq3_audit.get("status") or result["status"],
+        "ready_for_promotion_validator": result.get("ready_for_promotion_validator", False),
+        "ready_for_dq3_promotion": result.get("ready_for_dq3_promotion", False),
+        "blocked_reasons": result.get("blocked_reasons", []),
+        "safety": result.get("safety", {}),
+        "inference_guards": result.get("inference_guards", {}),
+    }
+
+
+def _parse_codes_arg(value: str | None) -> list[str]:
+    if not value:
+        return list(DEFAULT_GOAL13_CODES)
+    codes = []
+    for item in value.split(","):
+        code = item.strip().upper()
+        if code:
+            codes.append(code)
+    return codes or list(DEFAULT_GOAL13_CODES)
+
+
+def _tushare_provider_config_status(exc: ProviderConfigurationError) -> str:
+    message = str(exc).lower()
+    if "disabled" in message:
+        return "BLOCKED_BY_PROVIDER_DISABLED"
+    if "missing" in message and "tushare_token" in message:
+        return "BLOCKED_BY_MISSING_TUSHARE_TOKEN"
+    return "BLOCKED_BY_PROVIDER_CONFIGURATION"
+
+
 def _read_dataset(dataset: str, trade_date: str) -> pd.DataFrame:
     with tempfile.TemporaryDirectory(prefix="stock-read-") as tmp:
         path = _materialize_dataset(dataset, trade_date, Path(tmp))
@@ -963,6 +1128,19 @@ def build_parser() -> argparse.ArgumentParser:
     build_tushare_suspension_status_candidate.add_argument("--trade-date", required=True)
     build_tushare_suspension_status_candidate.add_argument("--sample-limit", type=int, default=5)
     build_tushare_suspension_status_candidate.set_defaults(func=_cmd_build_tushare_suspension_status_candidate)
+
+    build_tushare_candidate_staging_batch = subparsers.add_parser("build-tushare-candidate-staging-batch")
+    build_tushare_candidate_staging_batch.add_argument("--start-date", required=True)
+    build_tushare_candidate_staging_batch.add_argument("--end-date", required=True)
+    build_tushare_candidate_staging_batch.add_argument("--codes", default=",".join(DEFAULT_GOAL13_CODES))
+    build_tushare_candidate_staging_batch.add_argument("--batch-id")
+    build_tushare_candidate_staging_batch.add_argument("--max-codes", type=int)
+    build_tushare_candidate_staging_batch.add_argument("--max-trade-days", type=int)
+    build_tushare_candidate_staging_batch.add_argument("--sleep-seconds", type=float, default=12.0)
+    build_tushare_candidate_staging_batch.add_argument("--dry-run", action="store_true")
+    build_tushare_candidate_staging_batch.add_argument("--no-provider-call", action="store_true")
+    build_tushare_candidate_staging_batch.add_argument("--write-candidate", action="store_true", default=True)
+    build_tushare_candidate_staging_batch.set_defaults(func=_cmd_build_tushare_candidate_staging_batch)
 
     validate_provider_data = subparsers.add_parser("validate-provider-data")
     validate_provider_data.add_argument("--trade-date", required=True)

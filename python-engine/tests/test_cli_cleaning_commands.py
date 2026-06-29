@@ -211,6 +211,41 @@ def test_cli_accepts_goal12b_tushare_probe_command():
     assert probe.sleep_seconds == 12
 
 
+def test_cli_accepts_goal13_tushare_candidate_staging_batch_command():
+    parser = build_parser()
+
+    batch = parser.parse_args(
+        [
+            "build-tushare-candidate-staging-batch",
+            "--start-date",
+            "2024-06-01",
+            "--end-date",
+            "2024-07-31",
+            "--codes",
+            "000001.SZ,600519.SH",
+            "--batch-id",
+            "goal13-test",
+            "--max-codes",
+            "2",
+            "--max-trade-days",
+            "3",
+            "--sleep-seconds",
+            "0",
+            "--no-provider-call",
+        ]
+    )
+
+    assert batch.command == "build-tushare-candidate-staging-batch"
+    assert batch.start_date == "2024-06-01"
+    assert batch.end_date == "2024-07-31"
+    assert batch.codes == "000001.SZ,600519.SH"
+    assert batch.batch_id == "goal13-test"
+    assert batch.max_codes == 2
+    assert batch.max_trade_days == 3
+    assert batch.sleep_seconds == 0
+    assert batch.no_provider_call is True
+
+
 def test_cli_rejects_external_provider_update_without_smoke_mode(capsys):
     exit_code = main(
         [

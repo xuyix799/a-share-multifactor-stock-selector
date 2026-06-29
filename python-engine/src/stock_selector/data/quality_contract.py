@@ -24,6 +24,15 @@ class SuspensionCoverageStatus(str, Enum):
     SCHEMA_MISMATCH = "SCHEMA_MISMATCH"
 
 
+class DQ3ReadinessStatus(str, Enum):
+    READY_FOR_PROMOTION_VALIDATOR = "READY_FOR_PROMOTION_VALIDATOR"
+    BLOCKED_BY_UNRESOLVED_IS_PAUSED = "BLOCKED_BY_UNRESOLVED_IS_PAUSED"
+    BLOCKED_BY_INCOMPLETE_PROVIDER_COVERAGE = "BLOCKED_BY_INCOMPLETE_PROVIDER_COVERAGE"
+    BLOCKED_BY_FIELD_COMPLETENESS = "BLOCKED_BY_FIELD_COMPLETENESS"
+    BLOCKED_BY_SCHEMA_OR_DUPLICATE = "BLOCKED_BY_SCHEMA_OR_DUPLICATE"
+    BLOCKED_BY_VALIDATOR = "BLOCKED_BY_VALIDATOR"
+
+
 class PauseStatus(str, Enum):
     TRUE_CANDIDATE = "true_candidate"
     FALSE_CANDIDATE = "false_candidate"
@@ -107,6 +116,20 @@ class DailyPriceCandidateContract:
 
 
 @dataclass(frozen=True)
+class TushareCandidateBatchContract:
+    provider_name: str
+    candidate_dataset: str
+    source_layer: str
+    dq_level: DataQualityLevel
+    required_interfaces: tuple[str, ...]
+    standard_daily_price_written: bool
+    standard_suspension_status_written: bool
+    real_backtest_allowed: bool
+    required_future_gates: tuple[str, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
 class DailyPriceCandidateReadiness:
     ready_for_dq3_promotion: bool
     status: str
@@ -118,6 +141,15 @@ class DailyPriceCandidateReadiness:
 class SuspensionStatusCandidateReadiness:
     ready_for_dq3_promotion: bool
     status: str
+    reasons: tuple[str, ...]
+    required_future_gates: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TushareCandidateBatchReadiness:
+    ready_for_promotion_validator: bool
+    ready_for_dq3_promotion: bool
+    status: DQ3ReadinessStatus
     reasons: tuple[str, ...]
     required_future_gates: tuple[str, ...]
 
@@ -144,6 +176,7 @@ REQUIRED_TUSHARE_SUSPEND_D_FIELDS = frozenset({"ts_code", "trade_date", "suspend
 PASS_SMOKE_STATUSES = frozenset({"PASS_WITH_ROWS", "PASS_EMPTY"})
 GOAL12B_FUTURE_GATES = ("staging", "join_dry_run", "coverage_audit", "validator_verification")
 DAILY_PRICE_CANDIDATE_REQUIRED_INPUTS = ("daily", "stk_limit", "adj_factor", "trade_cal", "suspend_d")
+TUSHARE_CANDIDATE_BATCH_REQUIRED_INTERFACES = ("daily", "stk_limit", "adj_factor", "daily_basic", "trade_cal", "suspend_d")
 SUSPENSION_STATUS_CANDIDATE_REQUIRED_INPUTS = (
     "daily_price_candidate",
     "daily_price_candidate_report",
@@ -165,6 +198,16 @@ SUSPENSION_STATUS_CANDIDATE_FUTURE_GATES = (
     "promotion_validator",
     "small_range_standard_write",
     "mainline_isolation_tests",
+)
+TUSHARE_CANDIDATE_BATCH_FUTURE_GATES = (
+    "staging",
+    "coverage_audit",
+    "duplicate_check",
+    "missing_check",
+    "validator",
+    "promotion_validator",
+    "small_range_promotion",
+    "mock_mainline_protection",
 )
 
 
@@ -323,8 +366,40 @@ def classify_tushare_daily_price_candidate(source_layer: str) -> DailyPriceCandi
     )
 
 
+def classify_tushare_candidate_batch(source_layer: str) -> TushareCandidateBatchContract:
+    return TushareCandidateBatchContract(
+        provider_name="tushare",
+        candidate_dataset="tushare_candidate_staging_batch",
+        source_layer=source_layer,
+        dq_level=DataQualityLevel.DQ1,
+        required_interfaces=TUSHARE_CANDIDATE_BATCH_REQUIRED_INTERFACES,
+        standard_daily_price_written=False,
+        standard_suspension_status_written=False,
+        real_backtest_allowed=False,
+        required_future_gates=TUSHARE_CANDIDATE_BATCH_FUTURE_GATES,
+        reason=(
+            "Tushare candidate staging batch is a real-provider candidate-only audit artifact. It may "
+            "prepare coverage and readiness reports, but it must not write standard daily_price or "
+            "standard suspension_status in Goal 13."
+        ),
+    )
+
+
 def can_build_daily_price_candidate_dry_run(available_inputs: Iterable[str]) -> bool:
     return set(DAILY_PRICE_CANDIDATE_REQUIRED_INPUTS).issubset(set(available_inputs))
+
+
+def can_build_tushare_candidate_staging_batch(
+    *,
+    available_interfaces: Iterable[str],
+    provider_enabled: bool,
+    token_available: bool,
+) -> bool:
+    return (
+        provider_enabled
+        and token_available
+        and set(TUSHARE_CANDIDATE_BATCH_REQUIRED_INTERFACES).issubset(set(available_interfaces))
+    )
 
 
 def can_build_suspension_status_candidate(available_inputs: Iterable[str]) -> bool:
@@ -397,6 +472,73 @@ def can_promote_suspension_status_candidate(
         reasons=tuple(reasons),
         required_future_gates=SUSPENSION_STATUS_CANDIDATE_FUTURE_GATES,
     )
+
+
+def can_mark_tushare_candidate_batch_ready_for_promotion_validator(
+    *,
+    field_completeness_ok: bool,
+    coverage_complete: bool,
+    pause_statuses: Iterable[PauseStatus | str],
+    duplicate_check_ok: bool,
+    schema_check_ok: bool,
+    validator_precheck_passed: bool,
+    dq_level: DataQualityLevel | str,
+) -> TushareCandidateBatchReadiness:
+    normalized_pause_statuses = {_normalize_pause_status(item) for item in pause_statuses}
+    normalized_level = _normalize_dq_level(dq_level)
+    reasons = []
+
+    if not field_completeness_ok:
+        reasons.append("candidate batch field completeness is incomplete")
+    if not coverage_complete:
+        reasons.append("provider coverage is incomplete or unresolved")
+    if PauseStatus.UNKNOWN in normalized_pause_statuses:
+        reasons.append("pause_status contains unresolved unknown rows")
+    if not duplicate_check_ok:
+        reasons.append("duplicate key check must pass")
+    if not schema_check_ok:
+        reasons.append("schema check must pass")
+    if not validator_precheck_passed:
+        reasons.append("promotion validator precheck must pass")
+    if normalized_level not in {DataQualityLevel.DQ3, DataQualityLevel.DQ4}:
+        reasons.append("dq_level must be DQ3 or DQ4")
+
+    if not reasons:
+        return TushareCandidateBatchReadiness(
+            ready_for_promotion_validator=True,
+            ready_for_dq3_promotion=False,
+            status=DQ3ReadinessStatus.READY_FOR_PROMOTION_VALIDATOR,
+            reasons=(),
+            required_future_gates=("explicit_standard_promotion_goal", "standard_write_approval"),
+        )
+
+    if PauseStatus.UNKNOWN in normalized_pause_statuses:
+        status = DQ3ReadinessStatus.BLOCKED_BY_UNRESOLVED_IS_PAUSED
+    elif not coverage_complete:
+        status = DQ3ReadinessStatus.BLOCKED_BY_INCOMPLETE_PROVIDER_COVERAGE
+    elif not field_completeness_ok:
+        status = DQ3ReadinessStatus.BLOCKED_BY_FIELD_COMPLETENESS
+    elif not duplicate_check_ok or not schema_check_ok:
+        status = DQ3ReadinessStatus.BLOCKED_BY_SCHEMA_OR_DUPLICATE
+    else:
+        status = DQ3ReadinessStatus.BLOCKED_BY_VALIDATOR
+
+    return TushareCandidateBatchReadiness(
+        ready_for_promotion_validator=False,
+        ready_for_dq3_promotion=False,
+        status=status,
+        reasons=tuple(reasons),
+        required_future_gates=TUSHARE_CANDIDATE_BATCH_FUTURE_GATES,
+    )
+
+
+def can_write_standard_daily_price_from_tushare_candidate_batch(
+    readiness: TushareCandidateBatchReadiness,
+    *,
+    explicit_standard_write_enabled: bool,
+) -> bool:
+    _ = explicit_standard_write_enabled
+    return False
 
 
 def can_promote_daily_price_candidate_to_standard(

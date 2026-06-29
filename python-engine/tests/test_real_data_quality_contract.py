@@ -6,17 +6,23 @@ from stock_selector.data.quality_contract import (
     BacktestMode,
     DAILY_PRICE_CANDIDATE_REQUIRED_INPUTS,
     DataQualityLevel,
+    DQ3ReadinessStatus,
     PauseStatus,
     SuspensionCoverageStatus,
+    TUSHARE_CANDIDATE_BATCH_REQUIRED_INTERFACES,
     can_build_suspension_status_candidate,
+    can_build_tushare_candidate_staging_batch,
     can_promote_to_daily_price,
     can_promote_daily_price_candidate_to_standard,
     can_promote_suspension_status_candidate,
+    can_mark_tushare_candidate_batch_ready_for_promotion_validator,
+    can_write_standard_daily_price_from_tushare_candidate_batch,
     can_use_suspend_miss_as_false_candidate,
     can_use_in_price_only_diagnostic,
     can_use_in_strict_tradable_required,
     can_build_daily_price_candidate_dry_run,
     classify_tushare_daily_price_candidate,
+    classify_tushare_candidate_batch,
     classify_provider_dataset,
     get_backtest_mode_contract,
 )
@@ -137,6 +143,80 @@ def test_tushare_daily_price_candidate_dry_run_contract_is_smoke_only_and_non_pr
 def test_daily_price_candidate_dry_run_requires_all_tushare_smoke_inputs():
     assert can_build_daily_price_candidate_dry_run({"daily", "stk_limit", "adj_factor", "trade_cal", "suspend_d"}) is True
     assert can_build_daily_price_candidate_dry_run({"daily", "adj_factor", "trade_cal", "suspend_d"}) is False
+
+
+def test_tushare_candidate_staging_batch_contract_is_candidate_only_and_not_standard_writable():
+    contract = classify_tushare_candidate_batch(source_layer="candidate")
+
+    assert contract.provider_name == "tushare"
+    assert contract.candidate_dataset == "tushare_candidate_staging_batch"
+    assert contract.source_layer == "candidate"
+    assert contract.dq_level == DataQualityLevel.DQ1
+    assert contract.required_interfaces == TUSHARE_CANDIDATE_BATCH_REQUIRED_INTERFACES
+    assert contract.standard_daily_price_written is False
+    assert contract.standard_suspension_status_written is False
+    assert contract.real_backtest_allowed is False
+    assert "coverage_audit" in contract.required_future_gates
+    assert "promotion_validator" in contract.required_future_gates
+
+    assert (
+        can_build_tushare_candidate_staging_batch(
+            available_interfaces={"daily", "stk_limit", "adj_factor", "daily_basic", "trade_cal", "suspend_d"},
+            provider_enabled=True,
+            token_available=True,
+        )
+        is True
+    )
+    assert (
+        can_build_tushare_candidate_staging_batch(
+            available_interfaces={"daily", "stk_limit", "adj_factor", "trade_cal", "suspend_d"},
+            provider_enabled=True,
+            token_available=True,
+        )
+        is False
+    )
+    assert (
+        can_build_tushare_candidate_staging_batch(
+            available_interfaces={"daily", "stk_limit", "adj_factor", "daily_basic", "trade_cal", "suspend_d"},
+            provider_enabled=False,
+            token_available=True,
+        )
+        is False
+    )
+
+
+def test_tushare_candidate_batch_can_only_reach_ready_for_promotion_validator_not_standard_write():
+    readiness = can_mark_tushare_candidate_batch_ready_for_promotion_validator(
+        field_completeness_ok=True,
+        coverage_complete=True,
+        pause_statuses=[PauseStatus.TRUE_CANDIDATE, PauseStatus.FALSE_CANDIDATE],
+        duplicate_check_ok=True,
+        schema_check_ok=True,
+        validator_precheck_passed=True,
+        dq_level=DataQualityLevel.DQ3,
+    )
+
+    assert readiness.ready_for_promotion_validator is True
+    assert readiness.ready_for_dq3_promotion is False
+    assert readiness.status == DQ3ReadinessStatus.READY_FOR_PROMOTION_VALIDATOR
+    assert can_write_standard_daily_price_from_tushare_candidate_batch(readiness, explicit_standard_write_enabled=False) is False
+
+    blocked = can_mark_tushare_candidate_batch_ready_for_promotion_validator(
+        field_completeness_ok=False,
+        coverage_complete=False,
+        pause_statuses=[PauseStatus.TRUE_CANDIDATE, PauseStatus.UNKNOWN],
+        duplicate_check_ok=True,
+        schema_check_ok=True,
+        validator_precheck_passed=False,
+        dq_level=DataQualityLevel.DQ1,
+    )
+
+    assert blocked.ready_for_promotion_validator is False
+    assert blocked.ready_for_dq3_promotion is False
+    assert blocked.status == DQ3ReadinessStatus.BLOCKED_BY_UNRESOLVED_IS_PAUSED
+    assert "pause_status contains unresolved unknown rows" in blocked.reasons
+    assert "candidate batch field completeness is incomplete" in blocked.reasons
+    assert can_write_standard_daily_price_from_tushare_candidate_batch(blocked, explicit_standard_write_enabled=True) is False
 
 
 def test_daily_price_candidate_promotion_requires_candidate_source_audit_boolean_pause_validator_and_dq3():
