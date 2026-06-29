@@ -1,6 +1,8 @@
 # A股中长线多因子选股系统
 
-本仓库是一个本地 Docker 部署的 A股中长线多因子选股系统。当前已推进到 Goal 12A：真实数据标准层契约与数据质量等级冻结。
+本仓库是一个本地 Docker 部署的 A股中长线多因子选股系统。当前系统已完成 Docker 本地 mock/offline 端到端闭环验证。Python CLI、PostgreSQL、MinIO、Spring Boot API 已在容器环境中联通，mock 数据可以完成 provider、raw、复权、clean snapshot、universe、factor_daily、selection_result、validate-selection 和 run-backtest，并可通过 Spring API 查询选股摘要和回测摘要。
+
+真实数据方面，AKShare、Baostock、Tushare 仍停留在 smoke / capability / contract 层。Tushare 的 `daily`、`stk_limit`、`adj_factor`、`daily_basic`、`trade_cal`、`suspend_d` 等关键接口已完成 smoke 验证，但尚未进入标准 `daily_price`，也没有进入真实选股或真实回测主链路。
 
 系统定位：
 
