@@ -69,6 +69,28 @@ class SuspensionStatusCandidateContract:
     reason: str
 
 
+@dataclass(frozen=True)
+class DailyPriceCandidateContract:
+    provider_name: str
+    candidate_dataset: str
+    source_layer: str
+    dq_level: DataQualityLevel
+    required_inputs: tuple[str, ...]
+    standard_daily_price_ready: bool
+    standard_daily_price_written: bool
+    real_backtest_allowed: bool
+    required_future_gates: tuple[str, ...]
+    reason: str
+
+
+@dataclass(frozen=True)
+class DailyPriceCandidateReadiness:
+    ready_for_dq3_promotion: bool
+    status: str
+    reasons: tuple[str, ...]
+    required_future_gates: tuple[str, ...]
+
+
 REQUIRED_DAILY_PRICE_FIELDS = frozenset(
     {
         "stock_code",
@@ -90,6 +112,16 @@ REQUIRED_TUSHARE_TRADE_CAL_FIELDS = frozenset({"exchange", "cal_date", "is_open"
 REQUIRED_TUSHARE_SUSPEND_D_FIELDS = frozenset({"ts_code", "trade_date", "suspend_timing", "suspend_type"})
 PASS_SMOKE_STATUSES = frozenset({"PASS_WITH_ROWS", "PASS_EMPTY"})
 GOAL12B_FUTURE_GATES = ("staging", "join_dry_run", "coverage_audit", "validator_verification")
+DAILY_PRICE_CANDIDATE_REQUIRED_INPUTS = ("daily", "stk_limit", "adj_factor", "trade_cal", "suspend_d")
+DAILY_PRICE_CANDIDATE_FUTURE_GATES = (
+    "staging",
+    "coverage_audit",
+    "duplicate_check",
+    "missing_check",
+    "validator",
+    "small_range_promotion",
+    "mock_mainline_protection",
+)
 
 
 def classify_provider_dataset(provider_name: str, dataset: str) -> ProviderDatasetContract:
@@ -225,6 +257,90 @@ def classify_tushare_suspension_status_candidate(
             "A hit can mean is_paused=true candidate; a miss cannot mean is_paused=false until coverage "
             "and source completeness are audited."
         ),
+    )
+
+
+def classify_tushare_daily_price_candidate(source_layer: str) -> DailyPriceCandidateContract:
+    return DailyPriceCandidateContract(
+        provider_name="tushare",
+        candidate_dataset="daily_price_candidate",
+        source_layer=source_layer,
+        dq_level=DataQualityLevel.DQ1,
+        required_inputs=DAILY_PRICE_CANDIDATE_REQUIRED_INPUTS,
+        standard_daily_price_ready=False,
+        standard_daily_price_written=False,
+        real_backtest_allowed=False,
+        required_future_gates=DAILY_PRICE_CANDIDATE_FUTURE_GATES,
+        reason=(
+            "Tushare daily_price_candidate is a smoke/candidate dry-run composition only. It must not become "
+            "standard daily_price until staging, coverage audit, duplicate and missing checks, validator "
+            "verification, and an explicit boolean suspension_status source are complete."
+        ),
+    )
+
+
+def can_build_daily_price_candidate_dry_run(available_inputs: Iterable[str]) -> bool:
+    return set(DAILY_PRICE_CANDIDATE_REQUIRED_INPUTS).issubset(set(available_inputs))
+
+
+def can_promote_daily_price_candidate_to_standard(
+    *,
+    source_layer: str,
+    fields: Iterable[str],
+    stk_limit_fields_complete: bool,
+    trade_cal_valid: bool,
+    suspension_status_coverage_audited: bool,
+    is_paused_boolean: bool,
+    validator_passed: bool,
+    dq_level: DataQualityLevel | str,
+) -> DailyPriceCandidateReadiness:
+    normalized_level = _normalize_dq_level(dq_level)
+    field_set = set(fields)
+    reasons = []
+
+    if source_layer != "candidate":
+        reasons.append(f"source layer must be candidate, not {source_layer}")
+    missing_daily_fields = sorted(REQUIRED_DAILY_PRICE_FIELDS - field_set)
+    if missing_daily_fields:
+        reasons.append("daily_price fields are incomplete: " + ", ".join(missing_daily_fields))
+    if not stk_limit_fields_complete:
+        reasons.append("stk_limit fields are incomplete")
+    if not trade_cal_valid:
+        reasons.append("trade_cal must confirm an open trading day")
+    if not suspension_status_coverage_audited:
+        reasons.append("suspension_status coverage audit is required")
+    if not is_paused_boolean:
+        reasons.append("is_paused must be an explicit boolean field")
+    if not validator_passed:
+        reasons.append("daily_price validator must pass")
+    if normalized_level not in {DataQualityLevel.DQ3, DataQualityLevel.DQ4}:
+        reasons.append("dq_level must be DQ3 or DQ4")
+
+    if not reasons:
+        return DailyPriceCandidateReadiness(
+            ready_for_dq3_promotion=True,
+            status="READY_FOR_DQ3_PROMOTION",
+            reasons=(),
+            required_future_gates=(),
+        )
+
+    status = "BLOCKED_BY_UNRESOLVED_IS_PAUSED"
+    if reasons and reasons[0].startswith("source layer must be candidate"):
+        status = "BLOCKED_BY_SMOKE_SOURCE"
+    elif any("suspension_status" in reason or "is_paused" in reason for reason in reasons):
+        status = "BLOCKED_BY_UNRESOLVED_IS_PAUSED"
+    elif any("stk_limit" in reason for reason in reasons):
+        status = "BLOCKED_BY_INCOMPLETE_LIMIT_FIELDS"
+    elif any("trade_cal" in reason for reason in reasons):
+        status = "BLOCKED_BY_UNCONFIRMED_TRADING_DAY"
+    elif any("validator" in reason for reason in reasons):
+        status = "BLOCKED_BY_VALIDATOR"
+
+    return DailyPriceCandidateReadiness(
+        ready_for_dq3_promotion=False,
+        status=status,
+        reasons=tuple(reasons),
+        required_future_gates=DAILY_PRICE_CANDIDATE_FUTURE_GATES,
     )
 
 

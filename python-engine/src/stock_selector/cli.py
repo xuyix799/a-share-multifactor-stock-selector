@@ -14,6 +14,12 @@ from stock_selector.cleaning.snapshot_validator import validate_clean_daily_snap
 from stock_selector.config.config_loader import load_factor_weights_config, load_settings
 from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame, validate_stock_code
 from stock_selector.data.mock_data import generate_mock_dataset
+from stock_selector.data.tushare_daily_price_candidate import (
+    SmokeInput,
+    build_dry_run_output_keys,
+    candidate_frame_from_report,
+    dry_run_tushare_daily_price_candidate,
+)
 from stock_selector.data.update_pipeline import update_provider_data
 from stock_selector.data.update_log import create_update_log_repository
 from stock_selector.factors.factor_pipeline import build_factor_daily_for_date
@@ -299,6 +305,26 @@ def _cmd_probe_tushare_goal12b(args: argparse.Namespace) -> int:
     )
     print(json.dumps(result, ensure_ascii=False, default=str))
     return 0
+
+
+def _cmd_dry_run_tushare_daily_price_candidate(args: argparse.Namespace) -> int:
+    try:
+        trade_date = validate_trade_date(args.trade_date)
+    except DateValidationError as exc:
+        print(f"invalid trade_date: {exc}", file=sys.stderr)
+        return 2
+    if args.sample_limit <= 0:
+        print("invalid input: sample_limit must be positive", file=sys.stderr)
+        return 2
+
+    report = dry_run_tushare_daily_price_candidate(
+        trade_date,
+        sample_limit=args.sample_limit,
+        load_smoke_input_fn=_load_tushare_smoke_input,
+    )
+    output = _write_tushare_daily_price_candidate_dry_run(report)
+    print(json.dumps(output, ensure_ascii=False, default=str))
+    return 0 if report["status"] == "DRY_RUN_COMPLETED" else 1
 
 
 def _cmd_validate_provider_data(args: argparse.Namespace) -> int:
@@ -622,6 +648,64 @@ def _write_provider_smoke_dataset(provider_name: str, dataset: str, trade_date: 
     return result.final_key
 
 
+def _load_tushare_smoke_input(dataset: str, trade_date: str) -> SmokeInput:
+    settings = load_settings()
+    partition = build_provider_smoke_partition("tushare", dataset, trade_date, local_root=_local_root(settings))
+    with tempfile.TemporaryDirectory(prefix="stock-tushare-smoke-read-") as tmp:
+        path = _try_materialize_provider_smoke_dataset("tushare", dataset, trade_date, Path(tmp))
+        frame = pd.read_parquet(path) if path else None
+    return SmokeInput(dataset=dataset, object_key=partition.object_key, frame=frame)
+
+
+def _write_tushare_daily_price_candidate_dry_run(report: dict) -> dict:
+    settings = load_settings()
+    keys = build_dry_run_output_keys(report["trade_date"])
+    report["output_object_keys"] = keys
+    candidate = candidate_frame_from_report(report)
+
+    backend = _storage_backend(settings)
+    if backend == "local":
+        root = _local_root(settings)
+        report_path = root / keys["report"]
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_report = report_path.with_name(report_path.name + ".tmp")
+        tmp_report.write_text(json.dumps(report, ensure_ascii=False, default=str, indent=2), encoding="utf-8")
+        tmp_report.replace(report_path)
+        candidate_path = root / keys["candidate"]
+        write_parquet_local_atomic(candidate, candidate_path)
+    else:
+        minio_client = create_minio_client(settings)
+        bucket = settings["storage"]["minio_bucket_raw"]
+        ensure_buckets(minio_client, [bucket])
+        with tempfile.TemporaryDirectory(prefix="stock-tushare-dry-run-write-") as tmp:
+            tmp_root = Path(tmp)
+            report_file = tmp_root / "report.json"
+            candidate_file = tmp_root / "part.parquet"
+            report_file.write_text(json.dumps(report, ensure_ascii=False, default=str, indent=2), encoding="utf-8")
+            candidate.to_parquet(candidate_file, index=False)
+            writer = AtomicObjectWriter(client=minio_client, tmp_dir=tmp_root)
+            writer.write_file_atomic(bucket, keys["report"], report_file)
+            writer.write_file_atomic(bucket, keys["candidate"], candidate_file)
+
+    return {
+        "provider": "tushare",
+        "goal": "12C",
+        "trade_date": report["trade_date"],
+        "status": report["status"],
+        "report_key": keys["report"],
+        "candidate_key": keys["candidate"],
+        "join_row_count": report["join"]["candidate_row_count"],
+        "input_row_counts": {dataset: info["row_count"] for dataset, info in report["inputs"].items()},
+        "missing_inputs": report["missing_inputs"],
+        "coverage": report["coverage"],
+        "missing_field_stats": report["missing_field_stats"],
+        "pause_status_counts": report["pause_status_counts"],
+        "readiness_status": report["readiness"]["status"],
+        "ready_for_dq3_promotion": report["readiness"]["ready_for_dq3_promotion"],
+        "safety": report["safety"],
+    }
+
+
 def _read_dataset(dataset: str, trade_date: str) -> pd.DataFrame:
     with tempfile.TemporaryDirectory(prefix="stock-read-") as tmp:
         path = _materialize_dataset(dataset, trade_date, Path(tmp))
@@ -751,6 +835,11 @@ def build_parser() -> argparse.ArgumentParser:
     probe_tushare_goal12b_parser.add_argument("--sample-limit", type=int, default=5)
     probe_tushare_goal12b_parser.add_argument("--sleep-seconds", type=float, default=12.0)
     probe_tushare_goal12b_parser.set_defaults(func=_cmd_probe_tushare_goal12b)
+
+    dry_run_tushare_daily_price_candidate = subparsers.add_parser("dry-run-tushare-daily-price-candidate")
+    dry_run_tushare_daily_price_candidate.add_argument("--trade-date", required=True)
+    dry_run_tushare_daily_price_candidate.add_argument("--sample-limit", type=int, default=5)
+    dry_run_tushare_daily_price_candidate.set_defaults(func=_cmd_dry_run_tushare_daily_price_candidate)
 
     validate_provider_data = subparsers.add_parser("validate-provider-data")
     validate_provider_data.add_argument("--trade-date", required=True)

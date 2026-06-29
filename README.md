@@ -31,6 +31,7 @@
 - Goal 9：Spring Boot 最小结果查询 API，已实现 PostgreSQL 摘要查询，不读取 MinIO / Parquet，不执行 Python 计算或回测。
 - Goal 10 / 10R：Tushare 真实数据 smoke，当前以 2000 积分账号重新探测 `stock_basic`、`daily`、`stk_limit`、`adj_factor`、`daily_basic`、`index_daily`、`fina_indicator`；真实数据只写 `smoke/tushare/...`，不伪造 `limit_up` / `limit_down` / `is_paused`。
 - Goal 12B：Tushare `trade_cal` / `suspend_d` smoke 与 `suspension_status_candidate` 契约验证；只写 `smoke/tushare/trade_cal/...` 和 `smoke/tushare/suspend_d/...`，不写标准 `daily_price`。
+- Goal 12C：Tushare `daily_price_candidate` join dry-run；只读已有 `daily` / `stk_limit` / `adj_factor` / `trade_cal` / `suspend_d` smoke，输出诊断报告，不写标准 `daily_price`，详见 `docs/goal12C_tushare_daily_price_candidate_dry_run.md`。
 - Goal 10B：AKShare / Baostock 最小真实数据 smoke，已验证 AKShare `benchmark_price` 可标准化写入 `smoke/akshare/...` 并通过 DuckDB 查询；字段不足的数据集不会绕过 validator 写入标准层。
 - Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke，新增 smoke-only `daily_price_raw_smoke`，只允许写入 `smoke/<provider>/daily_price_raw_smoke/...`，不进入标准 `raw/daily_price/...`。
 - Goal 12A：真实数据标准层契约与数据质量等级冻结，详见 `docs/goal12A_real_data_contract.md`；本阶段只新增契约、守门规则和测试，不接入真实 provider 主链路，不做真实回测。

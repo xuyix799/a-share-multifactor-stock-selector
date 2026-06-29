@@ -4,10 +4,14 @@ import pytest
 from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame
 from stock_selector.data.quality_contract import (
     BacktestMode,
+    DAILY_PRICE_CANDIDATE_REQUIRED_INPUTS,
     DataQualityLevel,
     can_promote_to_daily_price,
+    can_promote_daily_price_candidate_to_standard,
     can_use_in_price_only_diagnostic,
     can_use_in_strict_tradable_required,
+    can_build_daily_price_candidate_dry_run,
+    classify_tushare_daily_price_candidate,
     classify_provider_dataset,
     get_backtest_mode_contract,
 )
@@ -108,6 +112,74 @@ def test_tushare_requires_current_goal10r_matrix_and_pause_source_before_dq3():
     assert "adj_factor" in contract.reason
     assert "daily_basic" in contract.reason
     assert "is_paused" in contract.reason
+
+
+def test_tushare_daily_price_candidate_dry_run_contract_is_smoke_only_and_non_promotable():
+    contract = classify_tushare_daily_price_candidate(source_layer="smoke")
+
+    assert contract.provider_name == "tushare"
+    assert contract.candidate_dataset == "daily_price_candidate"
+    assert contract.source_layer == "smoke"
+    assert contract.dq_level == DataQualityLevel.DQ1
+    assert contract.required_inputs == DAILY_PRICE_CANDIDATE_REQUIRED_INPUTS
+    assert contract.standard_daily_price_ready is False
+    assert contract.standard_daily_price_written is False
+    assert contract.real_backtest_allowed is False
+    assert "coverage_audit" in contract.required_future_gates
+    assert "validator" in contract.required_future_gates
+
+
+def test_daily_price_candidate_dry_run_requires_all_tushare_smoke_inputs():
+    assert can_build_daily_price_candidate_dry_run({"daily", "stk_limit", "adj_factor", "trade_cal", "suspend_d"}) is True
+    assert can_build_daily_price_candidate_dry_run({"daily", "adj_factor", "trade_cal", "suspend_d"}) is False
+
+
+def test_daily_price_candidate_promotion_requires_candidate_source_audit_boolean_pause_validator_and_dq3():
+    readiness = can_promote_daily_price_candidate_to_standard(
+        source_layer="smoke",
+        fields=DAILY_PRICE_FIELDS,
+        stk_limit_fields_complete=True,
+        trade_cal_valid=True,
+        suspension_status_coverage_audited=True,
+        is_paused_boolean=True,
+        validator_passed=True,
+        dq_level=DataQualityLevel.DQ3,
+    )
+
+    assert readiness.ready_for_dq3_promotion is False
+    assert readiness.status == "BLOCKED_BY_SMOKE_SOURCE"
+    assert "source layer must be candidate, not smoke" in readiness.reasons
+
+    readiness = can_promote_daily_price_candidate_to_standard(
+        source_layer="candidate",
+        fields=DAILY_PRICE_FIELDS - {"is_paused"},
+        stk_limit_fields_complete=True,
+        trade_cal_valid=True,
+        suspension_status_coverage_audited=False,
+        is_paused_boolean=False,
+        validator_passed=False,
+        dq_level=DataQualityLevel.DQ2,
+    )
+
+    assert readiness.ready_for_dq3_promotion is False
+    assert readiness.status == "BLOCKED_BY_UNRESOLVED_IS_PAUSED"
+    assert "suspension_status coverage audit is required" in readiness.reasons
+    assert "is_paused must be an explicit boolean field" in readiness.reasons
+    assert "dq_level must be DQ3 or DQ4" in readiness.reasons
+
+    readiness = can_promote_daily_price_candidate_to_standard(
+        source_layer="candidate",
+        fields=DAILY_PRICE_FIELDS,
+        stk_limit_fields_complete=True,
+        trade_cal_valid=True,
+        suspension_status_coverage_audited=True,
+        is_paused_boolean=True,
+        validator_passed=True,
+        dq_level=DataQualityLevel.DQ3,
+    )
+
+    assert readiness.ready_for_dq3_promotion is True
+    assert readiness.status == "READY_FOR_DQ3_PROMOTION"
 
 
 def test_daily_price_schema_contract_keeps_trade_constraint_fields():
