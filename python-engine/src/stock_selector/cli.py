@@ -18,6 +18,9 @@ from stock_selector.data.tushare_candidate_staging_batch import (
     build_tushare_candidate_staging_batch,
     build_tushare_candidate_staging_batch_blocked_report,
 )
+from stock_selector.data.tushare_daily_price_promotion_validator import (
+    build_tushare_daily_price_promotion_validator,
+)
 from stock_selector.data.tushare_daily_price_candidate import (
     SmokeInput,
     build_dry_run_output_keys,
@@ -432,6 +435,63 @@ def _cmd_build_tushare_candidate_staging_batch(args: argparse.Namespace) -> int:
     if args.fail_on_incomplete_critical_coverage and _has_incomplete_critical_coverage(result):
         return 1
     return 0
+
+
+def _cmd_build_tushare_daily_price_promotion_validator(args: argparse.Namespace) -> int:
+    if args.goal14_max_codes <= 0:
+        print("invalid input: goal14_max_codes must be positive", file=sys.stderr)
+        return 2
+    if args.goal14_max_trade_days <= 0:
+        print("invalid input: goal14_max_trade_days must be positive", file=sys.stderr)
+        return 2
+    if args.goal14_max_rows <= 0:
+        print("invalid input: goal14_max_rows must be positive", file=sys.stderr)
+        return 2
+
+    batch_id = args.batch_id
+    source_object_keys = {
+        "promotion_preflight_report": f"candidate/tushare/promotion_preflight_report/batch_id={batch_id}/report.json",
+        "daily_price_candidate_batch": f"candidate/tushare/daily_price_candidate_batch/batch_id={batch_id}/part.parquet",
+        "suspension_status_candidate_batch": f"candidate/tushare/suspension_status_candidate_batch/batch_id={batch_id}/part.parquet",
+    }
+    try:
+        promotion_preflight_report = _load_tushare_candidate_batch_json(source_object_keys["promotion_preflight_report"])
+        daily_price_candidate_batch = _load_tushare_candidate_batch_parquet(source_object_keys["daily_price_candidate_batch"])
+        suspension_status_candidate_batch = _load_tushare_candidate_batch_parquet(source_object_keys["suspension_status_candidate_batch"])
+    except FileNotFoundError as exc:
+        print(json.dumps({"goal": "14", "provider": "tushare", "status": "BLOCKED", "batch_id": batch_id, "blocked_reasons": [str(exc)]}, ensure_ascii=False))
+        return 1
+
+    result = build_tushare_daily_price_promotion_validator(
+        batch_id=batch_id,
+        promotion_preflight_report=promotion_preflight_report,
+        daily_price_candidate_batch=daily_price_candidate_batch,
+        suspension_status_candidate_batch=suspension_status_candidate_batch,
+        max_codes=args.goal14_max_codes,
+        max_trade_days=args.goal14_max_trade_days,
+        max_rows=args.goal14_max_rows,
+        request_standard_write=args.goal14_execute_standard_write,
+        execute_standard_write=args.goal14_execute_standard_write,
+        standard_daily_price_write_fn=_write_dataset,
+        source_object_keys=source_object_keys,
+    )
+    output_keys = result["output_object_keys"]
+    _write_tushare_candidate_batch_json(
+        output_keys["daily_price_promotion_validator_report"],
+        result["daily_price_promotion_validator_report"],
+    )
+    _write_tushare_candidate_batch_json(
+        output_keys["standard_daily_price_promotion_dry_run_report"],
+        result["standard_daily_price_promotion_dry_run_report"],
+    )
+    if result.get("standard_daily_price_promotion_execution_report") is not None:
+        _write_tushare_candidate_batch_json(
+            output_keys["standard_daily_price_promotion_execution_report"],
+            result["standard_daily_price_promotion_execution_report"],
+        )
+    output = _tushare_daily_price_promotion_validator_cli_output(result)
+    print(json.dumps(output, ensure_ascii=False, default=str))
+    return 0 if result["status"] == "VALIDATOR_PASS" else 1
 
 
 def _cmd_validate_provider_data(args: argparse.Namespace) -> int:
@@ -935,6 +995,14 @@ def _load_tushare_candidate_batch_parquet(object_key: str) -> pd.DataFrame:
         return pd.read_parquet(path)
 
 
+def _load_tushare_candidate_batch_json(object_key: str) -> dict:
+    with tempfile.TemporaryDirectory(prefix="stock-tushare-candidate-batch-json-read-") as tmp:
+        path = _try_materialize_object_key(object_key, Path(tmp))
+        if not path:
+            raise FileNotFoundError(f"missing candidate staging json: {object_key}")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _tushare_candidate_staging_batch_cli_output(result: dict) -> dict:
     keys = result.get("output_object_keys", {})
     dq3_audit = result.get("dq3_readiness_audit", {})
@@ -972,6 +1040,31 @@ def _tushare_candidate_staging_batch_cli_output(result: dict) -> dict:
         "reused_existing_staging": result.get("reused_existing_staging", False),
         "safety": result.get("safety", {}),
         "inference_guards": result.get("inference_guards", {}),
+    }
+
+
+def _tushare_daily_price_promotion_validator_cli_output(result: dict) -> dict:
+    keys = result.get("output_object_keys", {})
+    dry_run = result.get("standard_daily_price_promotion_dry_run_report", {})
+    return {
+        "provider": "tushare",
+        "goal": "14",
+        "status": result["status"],
+        "batch_id": result["batch_id"],
+        "mode": dry_run.get("mode", "DRY_RUN"),
+        "daily_price_promotion_validator_report_key": keys.get("daily_price_promotion_validator_report"),
+        "standard_daily_price_promotion_dry_run_report_key": keys.get("standard_daily_price_promotion_dry_run_report"),
+        "standard_daily_price_promotion_execution_report_key": keys.get("standard_daily_price_promotion_execution_report"),
+        "output_object_keys": keys,
+        "candidate_row_count": result.get("candidate_row_count", 0),
+        "would_insert_rows": dry_run.get("would_insert_rows", 0),
+        "would_update_rows": dry_run.get("would_update_rows", 0),
+        "would_skip_rows": dry_run.get("would_skip_rows", 0),
+        "standard_daily_price_write_performed": result.get("standard_daily_price_write_performed", False),
+        "standard_suspension_status_write_performed": result.get("standard_suspension_status_write_performed", False),
+        "real_backtest_performed": result.get("real_backtest_performed", False),
+        "clean_factor_selection_backtest_entered": result.get("clean_factor_selection_backtest_entered", False),
+        "blocked_reasons": result.get("blocked_reasons", []),
     }
 
 
@@ -1185,6 +1278,14 @@ def build_parser() -> argparse.ArgumentParser:
     build_tushare_candidate_staging_batch.add_argument("--fail-on-incomplete-critical-coverage", action="store_true")
     build_tushare_candidate_staging_batch.add_argument("--write-candidate", action="store_true", default=True)
     build_tushare_candidate_staging_batch.set_defaults(func=_cmd_build_tushare_candidate_staging_batch)
+
+    build_tushare_daily_price_promotion_validator = subparsers.add_parser("build-tushare-daily-price-promotion-validator")
+    build_tushare_daily_price_promotion_validator.add_argument("--batch-id", required=True)
+    build_tushare_daily_price_promotion_validator.add_argument("--goal14-max-codes", type=int, default=5)
+    build_tushare_daily_price_promotion_validator.add_argument("--goal14-max-trade-days", type=int, default=10)
+    build_tushare_daily_price_promotion_validator.add_argument("--goal14-max-rows", type=int, default=50)
+    build_tushare_daily_price_promotion_validator.add_argument("--goal14-execute-standard-write", action="store_true")
+    build_tushare_daily_price_promotion_validator.set_defaults(func=_cmd_build_tushare_daily_price_promotion_validator)
 
     validate_provider_data = subparsers.add_parser("validate-provider-data")
     validate_provider_data.add_argument("--trade-date", required=True)
