@@ -28,6 +28,9 @@ PER_CODE_FETCH_INTERFACES = ("daily", "stk_limit", "adj_factor", "daily_basic")
 RANGE_FETCH_INTERFACES = ("suspend_d",)
 CRITICAL_PRICE_INTERFACES = ("daily", "stk_limit", "adj_factor", "daily_basic")
 FETCH_SEMANTICS_INTERFACES = ("daily", "stk_limit", "adj_factor", "daily_basic", "trade_cal", "suspend_d")
+EMPTY_RESULT_RETRY_INTERFACES = ("daily", "stk_limit", "adj_factor", "daily_basic", "trade_cal")
+EMPTY_RESULT_MAX_ATTEMPTS = 3
+PROVIDER_EMPTY_AFTER_RETRIES = "PROVIDER_EMPTY_AFTER_RETRIES"
 
 INTERFACE_FIELDS = {
     "daily": "ts_code,trade_date,open,high,low,close,pre_close,vol,amount",
@@ -332,7 +335,8 @@ def build_tushare_candidate_staging_batch(
         generated_at=generated_at,
     )
 
-    if provider_errors:
+    fatal_provider_errors = [error for error in provider_errors if error.get("fatal", True)]
+    if fatal_provider_errors:
         return _blocked_provider_error_report(
             batch_id=batch_id,
             start_date=start_date,
@@ -465,29 +469,56 @@ def _fetch_provider_frames(
 
     def fetch(interface: str, kwargs: dict[str, str], strategy: str) -> pd.DataFrame:
         nonlocal call_index
-        if call_index > 0 and sleep_seconds:
-            sleeper(sleep_seconds)
-        call_index += 1
-        try:
-            frame = provider.fetch_raw_endpoint_allow_empty(interface, **kwargs)
-            if frame is None:
-                frame = pd.DataFrame()
-            frame = frame.copy()
-            frame_parts[interface].append(frame)
-            _record_sample_truncation(sample_truncation, interface, frame)
-            call_records.append(_fetch_call_record(interface, kwargs, strategy, frame=frame))
-            return frame
-        except Exception as exc:
-            provider_errors.append(
-                {
-                    "interface": interface,
-                    "error_class": exc.__class__.__name__,
-                    "error": str(exc),
-                    "kwargs": _safe_kwargs(kwargs),
-                }
-            )
-            call_records.append(_fetch_call_record(interface, kwargs, strategy, error=exc))
-            return pd.DataFrame()
+        max_empty_attempts = EMPTY_RESULT_MAX_ATTEMPTS if interface in EMPTY_RESULT_RETRY_INTERFACES else 1
+        for attempt in range(1, max_empty_attempts + 1):
+            if call_index > 0 and sleep_seconds:
+                sleeper(sleep_seconds)
+            call_index += 1
+            try:
+                frame = provider.fetch_raw_endpoint_allow_empty(interface, **kwargs)
+                if frame is None:
+                    frame = pd.DataFrame()
+                frame = frame.copy()
+                should_retry_empty = frame.empty and attempt < max_empty_attempts
+                call_records.append(
+                    _fetch_call_record(
+                        interface,
+                        kwargs,
+                        strategy,
+                        frame=frame,
+                        attempt=attempt,
+                        max_attempts=max_empty_attempts,
+                        empty_result_retry=should_retry_empty,
+                    )
+                )
+                if should_retry_empty:
+                    continue
+                if frame.empty and interface in EMPTY_RESULT_RETRY_INTERFACES:
+                    provider_errors.append(_empty_after_retries_error(interface, kwargs, strategy, max_empty_attempts))
+                frame_parts[interface].append(frame)
+                _record_sample_truncation(sample_truncation, interface, frame)
+                return frame
+            except Exception as exc:
+                provider_errors.append(
+                    {
+                        "interface": interface,
+                        "error_class": exc.__class__.__name__,
+                        "error": str(exc),
+                        "kwargs": _safe_kwargs(kwargs),
+                    }
+                )
+                call_records.append(
+                    _fetch_call_record(
+                        interface,
+                        kwargs,
+                        strategy,
+                        error=exc,
+                        attempt=attempt,
+                        max_attempts=max_empty_attempts,
+                    )
+                )
+                return pd.DataFrame()
+        return pd.DataFrame()
 
     trade_cal_frame = fetch("trade_cal", _provider_kwargs("trade_cal", start_date, end_date), "by_date_range")
     if coverage_expansion:
@@ -515,6 +546,7 @@ def _fetch_provider_frames(
                     "error_class": "ProviderEmptyResult",
                     "error": "provider returned empty result",
                     "kwargs": {},
+                    "fatal": True,
                 }
             )
     return {
@@ -827,6 +859,7 @@ def _build_coverage_report(
             duplicate_checks=duplicate_checks,
             schema_checks=schema_checks,
             sample_truncation=sample_truncation,
+            provider_errors=provider_errors,
         )
         for dataset in CRITICAL_PRICE_INTERFACES
     }
@@ -1116,6 +1149,8 @@ def _readiness_blocked_reason_codes(coverage_report: dict[str, Any], pause_statu
         reasons.append("DUPLICATE_KEYS_FOUND")
     if any(check["missing_required_fields"] for check in coverage_report["schema_checks"].values()):
         reasons.append("SCHEMA_MISMATCH")
+    if any(error.get("reason_code") == PROVIDER_EMPTY_AFTER_RETRIES for error in coverage_report.get("provider_errors", [])):
+        reasons.append(PROVIDER_EMPTY_AFTER_RETRIES)
     if coverage_report.get("provider_errors"):
         reasons.append("PROVIDER_FETCH_INCOMPLETE")
     if pause_status_counts.get(PauseStatus.UNKNOWN.value, 0) > 0:
@@ -1291,9 +1326,10 @@ def _blocked_provider_error_report(
     provider_errors: list[dict[str, Any]],
     generated_at: str,
 ) -> dict[str, Any]:
-    failed = [error["interface"] for error in provider_errors]
+    fatal_errors = [error for error in provider_errors if error.get("fatal", True)]
+    failed = [error["interface"] for error in fatal_errors]
     succeeded = [interface for interface in TUSHARE_CANDIDATE_BATCH_REQUIRED_INTERFACES if interface not in set(failed)]
-    status = "BLOCKED_BY_PROVIDER_EMPTY_RESULT" if all(error.get("error_class") == "ProviderEmptyResult" for error in provider_errors) else "BLOCKED_BY_PROVIDER_ERROR"
+    status = "BLOCKED_BY_PROVIDER_EMPTY_RESULT" if all(error.get("error_class") == "ProviderEmptyResult" for error in fatal_errors) else "BLOCKED_BY_PROVIDER_ERROR"
     return {
         "status": status,
         "provider": "tushare",
@@ -1313,7 +1349,7 @@ def _blocked_provider_error_report(
         "suspension_status_candidate_row_count": 0,
         "coverage_summary": _summary_coverage(coverage_report),
         "provider_errors": provider_errors,
-        "blocked_reasons": [_provider_blocked_reason(error) for error in provider_errors],
+        "blocked_reasons": [_provider_blocked_reason(error) for error in fatal_errors],
         "ready_for_promotion_validator": False,
         "ready_for_dq3_promotion": False,
         "safety": SAFETY_FLAGS,
@@ -1449,6 +1485,7 @@ def _coverage_alias(
     duplicate_checks: dict[str, dict[str, Any]],
     schema_checks: dict[str, dict[str, Any]],
     sample_truncation: dict[str, dict[str, Any]],
+    provider_errors: list[dict[str, Any]],
 ) -> dict[str, Any]:
     sample = sample_truncation.get(dataset, _sample_truncation_item())
     schema_valid = not schema_checks.get(dataset, {}).get("missing_required_fields", [])
@@ -1463,7 +1500,7 @@ def _coverage_alias(
         "missing_keys": coverage["missing_keys"],
         "duplicate_keys": duplicate_keys,
         "schema_status": "VALID" if schema_valid else "SCHEMA_MISMATCH",
-        "blocked_reason": _interface_blocked_reason(coverage, schema_valid, duplicate_keys, sample),
+        "blocked_reason": _interface_blocked_reason(coverage, schema_valid, duplicate_keys, sample, provider_errors, dataset),
     }
 
 
@@ -1500,6 +1537,20 @@ def _record_sample_truncation(sample_truncation: dict[str, dict[str, Any]], inte
     }
 
 
+def _empty_after_retries_error(interface: str, kwargs: dict[str, str], strategy: str, attempts: int) -> dict[str, Any]:
+    return {
+        "interface": interface,
+        "error_class": "ProviderEmptyAfterRetries",
+        "error": f"provider returned empty result after {attempts} attempts",
+        "kwargs": _safe_kwargs(kwargs),
+        "parameters": _safe_kwargs(kwargs),
+        "fetch_strategy": strategy,
+        "attempts": attempts,
+        "reason_code": PROVIDER_EMPTY_AFTER_RETRIES,
+        "fatal": False,
+    }
+
+
 def _fetch_call_record(
     interface: str,
     kwargs: dict[str, str],
@@ -1507,6 +1558,9 @@ def _fetch_call_record(
     *,
     frame: pd.DataFrame | None = None,
     error: Exception | None = None,
+    attempt: int = 1,
+    max_attempts: int = 1,
+    empty_result_retry: bool = False,
 ) -> dict[str, Any]:
     record = {
         "interface": interface,
@@ -1515,6 +1569,10 @@ def _fetch_call_record(
         "row_count": int(len(frame)) if frame is not None else 0,
         "sample_truncated": bool(frame.attrs.get("sample_truncated", False)) if frame is not None else False,
         "source": "provider",
+        "attempt": attempt,
+        "max_empty_result_attempts": max_attempts,
+        "empty_result": bool(frame.empty) if frame is not None else False,
+        "empty_result_retry": empty_result_retry,
     }
     if frame is not None and frame.attrs.get("sample_limit") is not None:
         record["sample_limit"] = frame.attrs.get("sample_limit")
@@ -1596,6 +1654,8 @@ def _gap_reason_codes(
         return ["DUPLICATE_KEYS_FOUND"]
     if coverage["missing_rows"] == 0:
         return []
+    if _has_provider_empty_after_retries(coverage_report.get("provider_errors", []), dataset):
+        return [PROVIDER_EMPTY_AFTER_RETRIES]
 
     missing_dates = {trade_date for _, trade_date in coverage["missing_keys"]}
     missing_codes = {ts_code for ts_code, _ in coverage["missing_keys"]}
@@ -1607,6 +1667,8 @@ def _gap_reason_codes(
 
 
 def _fetch_strategy_suspicions(dataset: str, reason_codes: list[str]) -> list[str]:
+    if PROVIDER_EMPTY_AFTER_RETRIES in reason_codes:
+        return [f"{dataset} provider returned empty result after retry attempts"]
     if "SAMPLE_TRUNCATED" in reason_codes:
         return ["sample_limit may have truncated critical staging data"]
     if "DATE_ALIGNMENT_GAP" in reason_codes:
@@ -1624,6 +1686,8 @@ def _recommended_next_actions(interface_gap_summary: dict[str, Any], coverage_re
         reason_codes = summary["reason_codes"]
         if "SAMPLE_TRUNCATED" in reason_codes:
             actions.append(f"rerun {dataset} without sample truncation; limit universe with max_codes/max_trade_days instead")
+        elif PROVIDER_EMPTY_AFTER_RETRIES in reason_codes:
+            actions.append(f"rerun {dataset} after provider empty-result exhaustion or switch to a more stable fetch strategy")
         elif "DATE_ALIGNMENT_GAP" in reason_codes:
             actions.append(f"verify {dataset} fetch covers every selected trade_date")
         elif "CODE_ALIGNMENT_GAP" in reason_codes:
@@ -1649,6 +1713,8 @@ def _interface_blocked_reason(
     schema_valid: bool,
     duplicate_keys: list[dict[str, Any]],
     sample: dict[str, Any],
+    provider_errors: list[dict[str, Any]],
+    dataset: str,
 ) -> str | None:
     if sample["sample_truncated"]:
         return "SAMPLE_TRUNCATED"
@@ -1656,9 +1722,18 @@ def _interface_blocked_reason(
         return "SCHEMA_MISMATCH"
     if duplicate_keys:
         return "DUPLICATE_KEYS_FOUND"
+    if coverage["missing_rows"] > 0 and _has_provider_empty_after_retries(provider_errors, dataset):
+        return PROVIDER_EMPTY_AFTER_RETRIES
     if coverage["missing_rows"] > 0:
         return "MISSING_PROVIDER_ROW"
     return None
+
+
+def _has_provider_empty_after_retries(provider_errors: list[dict[str, Any]], dataset: str) -> bool:
+    return any(
+        error.get("interface") == dataset and error.get("reason_code") == PROVIDER_EMPTY_AFTER_RETRIES
+        for error in provider_errors
+    )
 
 
 def _critical_price_coverage_complete(coverage_report: dict[str, Any], expected_count: int) -> bool:

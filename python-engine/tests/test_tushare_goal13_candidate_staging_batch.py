@@ -247,6 +247,91 @@ def test_goal13b_coverage_gap_report_lists_missing_keys_and_reason_codes():
     ]
 
 
+def test_goal13b_retries_transient_empty_critical_provider_calls_before_marking_gap():
+    from stock_selector.data.tushare_candidate_staging_batch import build_tushare_candidate_staging_batch
+
+    writer = _MemoryWriter()
+    provider = _FakeTushareBatchProvider(
+        complete_limit_coverage=True,
+        transient_empty_calls={
+            ("daily", "ts_code", "600519.SH"): 1,
+            ("stk_limit", "trade_date", "20240604"): 1,
+        },
+    )
+    result = build_tushare_candidate_staging_batch(
+        start_date=START_DATE,
+        end_date=END_DATE,
+        codes=CODES,
+        provider=provider,
+        batch_id=BATCH_ID,
+        sleep_seconds=0,
+        coverage_expansion=True,
+        fetch_semantics_audit=True,
+        write_parquet_fn=writer.write_parquet,
+        write_json_fn=writer.write_json,
+        generated_at_fn=lambda: "2026-06-29T00:00:00Z",
+    )
+
+    fetch_report = writer.json_payloads[result["output_object_keys"]["fetch_semantics_report"]]
+    matrix = {item["interface"]: item for item in fetch_report["fetch_semantics_matrix"]}
+
+    assert result["provider_coverage_report"]["daily_coverage"]["ratio"] == 1.0
+    assert result["provider_coverage_report"]["stk_limit_coverage"]["ratio"] == 1.0
+    assert result["provider_coverage_report"]["provider_errors"] == []
+    assert [call["row_count"] for call in matrix["daily"]["calls"] if call["parameters"].get("ts_code") == "600519.SH"] == [0, 2]
+    assert [call["row_count"] for call in matrix["stk_limit"]["calls"] if call["parameters"].get("trade_date") == "20240604"] == [0, 3]
+    assert any(call.get("empty_result_retry") is True for call in matrix["daily"]["calls"])
+    assert any(call.get("empty_result_retry") is True for call in matrix["stk_limit"]["calls"])
+
+
+def test_goal13b_empty_result_after_retries_is_reported_as_provider_gap_not_plain_missing_row():
+    from stock_selector.data.tushare_candidate_staging_batch import build_tushare_candidate_staging_batch
+
+    writer = _MemoryWriter()
+    provider = _FakeTushareBatchProvider(
+        complete_limit_coverage=True,
+        transient_empty_calls={
+            ("daily", "ts_code", "600519.SH"): 3,
+            ("stk_limit", "trade_date", "20240604"): 3,
+        },
+    )
+    result = build_tushare_candidate_staging_batch(
+        start_date=START_DATE,
+        end_date=END_DATE,
+        codes=CODES,
+        provider=provider,
+        batch_id=BATCH_ID,
+        sleep_seconds=0,
+        coverage_expansion=True,
+        fetch_semantics_audit=True,
+        write_parquet_fn=writer.write_parquet,
+        write_json_fn=writer.write_json,
+        generated_at_fn=lambda: "2026-06-29T00:00:00Z",
+    )
+
+    coverage = writer.json_payloads[result["output_object_keys"]["provider_coverage_report"]]
+    gap = writer.json_payloads[result["output_object_keys"]["coverage_gap_report"]]
+    dq3 = writer.json_payloads[result["output_object_keys"]["dq3_readiness_audit"]]
+    provider_errors = coverage["provider_errors"]
+
+    assert result["status"] == "CANDIDATE_BATCH_COMPLETED_NOT_PROMOTABLE"
+    assert coverage["daily_coverage"]["blocked_reason"] == "PROVIDER_EMPTY_AFTER_RETRIES"
+    assert coverage["stk_limit_coverage"]["blocked_reason"] == "PROVIDER_EMPTY_AFTER_RETRIES"
+    assert {
+        (error["interface"], error["reason_code"])
+        for error in provider_errors
+        if error["error_class"] == "ProviderEmptyAfterRetries"
+    } == {
+        ("daily", "PROVIDER_EMPTY_AFTER_RETRIES"),
+        ("stk_limit", "PROVIDER_EMPTY_AFTER_RETRIES"),
+    }
+    assert gap["interface_gap_summary"]["daily"]["reason_codes"] == ["PROVIDER_EMPTY_AFTER_RETRIES"]
+    assert gap["interface_gap_summary"]["stk_limit"]["reason_codes"] == ["PROVIDER_EMPTY_AFTER_RETRIES"]
+    assert any(item["reason_code"] == "PROVIDER_EMPTY_AFTER_RETRIES" for item in gap["missing_key_examples"])
+    assert "PROVIDER_EMPTY_AFTER_RETRIES" in dq3["blocked_reasons"]
+    assert "PROVIDER_FETCH_INCOMPLETE" in dq3["blocked_reasons"]
+
+
 def test_goal13b_full_price_coverage_but_unresolved_pause_blocks_only_pause_and_suspend():
     from stock_selector.data.tushare_candidate_staging_batch import build_tushare_candidate_staging_batch
 
@@ -654,6 +739,7 @@ class _FakeTushareBatchProvider:
         half_limit_coverage=False,
         half_adj_factor_coverage=False,
         sample_truncated_interfaces=None,
+        transient_empty_calls=None,
     ):
         self.fail_interfaces = fail_interfaces or {}
         self.include_pathological_rows = include_pathological_rows
@@ -663,6 +749,7 @@ class _FakeTushareBatchProvider:
         self.half_limit_coverage = half_limit_coverage
         self.half_adj_factor_coverage = half_adj_factor_coverage
         self.sample_truncated_interfaces = set(sample_truncated_interfaces or ())
+        self.transient_empty_calls = dict(transient_empty_calls or {})
         self.calls = []
 
     def fetch_raw_endpoint_allow_empty(self, interface, **kwargs):
@@ -671,6 +758,11 @@ class _FakeTushareBatchProvider:
             raise self.fail_interfaces[interface]
         if interface in self.empty_interfaces:
             return pd.DataFrame()
+        for key, remaining in list(self.transient_empty_calls.items()):
+            empty_interface, field, value = key
+            if interface == empty_interface and kwargs.get(field) == value and remaining > 0:
+                self.transient_empty_calls[key] = remaining - 1
+                return pd.DataFrame()
         frames = _provider_frames(
             include_pathological_rows=self.include_pathological_rows,
             complete_limit_coverage=self.complete_limit_coverage,
