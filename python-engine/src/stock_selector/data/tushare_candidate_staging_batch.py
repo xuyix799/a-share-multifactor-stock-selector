@@ -31,6 +31,27 @@ FETCH_SEMANTICS_INTERFACES = ("daily", "stk_limit", "adj_factor", "daily_basic",
 EMPTY_RESULT_RETRY_INTERFACES = ("daily", "stk_limit", "adj_factor", "daily_basic", "trade_cal")
 EMPTY_RESULT_MAX_ATTEMPTS = 3
 PROVIDER_EMPTY_AFTER_RETRIES = "PROVIDER_EMPTY_AFTER_RETRIES"
+PROVIDER_FETCH_INCOMPLETE = "PROVIDER_FETCH_INCOMPLETE"
+
+SUSPEND_D_DATE_FULL_MARKET_EVENT_SET = "DATE_FULL_MARKET_EVENT_SET"
+SUSPEND_D_CODE_DATE_EXPLICIT_FULL_UNIVERSE = "CODE_DATE_EXPLICIT_FULL_UNIVERSE"
+SUSPEND_D_PARTIAL = "PARTIAL"
+SUSPEND_D_UNKNOWN = "UNKNOWN"
+
+SUSPEND_D_QUERY_SCOPE_UNKNOWN = "SUSPEND_D_QUERY_SCOPE_UNKNOWN"
+SUSPEND_D_DATE_MISSING = "SUSPEND_D_DATE_MISSING"
+SUSPEND_D_PROVIDER_FETCH_FAILED = "SUSPEND_D_PROVIDER_FETCH_FAILED"
+SUSPEND_D_PROVIDER_EMPTY_AFTER_RETRIES = "SUSPEND_D_PROVIDER_EMPTY_AFTER_RETRIES"
+SUSPEND_D_PROVIDER_FETCH_INCOMPLETE = "SUSPEND_D_PROVIDER_FETCH_INCOMPLETE"
+SUSPEND_D_SCHEMA_INCOMPLETE = "SUSPEND_D_SCHEMA_INCOMPLETE"
+SUSPEND_D_FULL_COVERAGE_NOT_CONFIRMED = "SUSPEND_D_FULL_COVERAGE_NOT_CONFIRMED"
+SUSPEND_D_PAGINATION_OR_TRUNCATION_UNKNOWN = "SUSPEND_D_PAGINATION_OR_TRUNCATION_UNKNOWN"
+SUSPEND_D_NON_OPEN_TRADE_DATE = "SUSPEND_D_NON_OPEN_TRADE_DATE"
+SUSPEND_D_PARTIAL_UNIVERSE_COVERAGE = "SUSPEND_D_PARTIAL_UNIVERSE_COVERAGE"
+
+RESOLUTION_SOURCE_EVENT_ROW = "SUSPEND_D_EVENT_ROW"
+RESOLUTION_SOURCE_FULL_COVERAGE_MISS = "SUSPEND_D_FULL_COVERAGE_MISS_AS_FALSE_CANDIDATE"
+RESOLUTION_SOURCE_UNRESOLVED = "UNRESOLVED"
 
 INTERFACE_FIELDS = {
     "daily": "ts_code,trade_date,open,high,low,close,pre_close,vol,amount",
@@ -139,7 +160,12 @@ FIELD_SOURCES = {
 }
 
 
-def build_tushare_candidate_staging_batch_output_keys(batch_id: str, trade_dates: list[str]) -> dict[str, Any]:
+def build_tushare_candidate_staging_batch_output_keys(
+    batch_id: str,
+    trade_dates: list[str],
+    *,
+    goal13c_preflight: bool = False,
+) -> dict[str, Any]:
     batch_id = _validate_batch_id(batch_id)
     keys: dict[str, Any] = {
         "manifest": f"candidate/tushare/batch_manifest/batch_id={batch_id}/manifest.json",
@@ -156,6 +182,11 @@ def build_tushare_candidate_staging_batch_output_keys(batch_id: str, trade_dates
         "coverage_gap_report": f"candidate/tushare/coverage_gap_report/batch_id={batch_id}/report.json",
         "dq3_readiness_audit": f"candidate/tushare/dq3_readiness_audit/batch_id={batch_id}/report.json",
     }
+    if goal13c_preflight:
+        keys["suspend_d_full_coverage_report"] = (
+            f"candidate/tushare/suspend_d_full_coverage_report/batch_id={batch_id}/report.json"
+        )
+        keys["promotion_preflight_report"] = f"candidate/tushare/promotion_preflight_report/batch_id={batch_id}/report.json"
     for trade_date in trade_dates:
         for dataset in ("daily", "stk_limit", "adj_factor", "daily_basic"):
             keys[f"{dataset}_staging"][trade_date] = (
@@ -228,6 +259,7 @@ def build_tushare_candidate_staging_batch(
     fetch_semantics_audit: bool = False,
     load_parquet_fn: LoadParquetFn | None = None,
     suspend_d_full_event_coverage_proven: bool = False,
+    goal13c_preflight: bool = False,
     generated_at_fn: GeneratedAtFn | None = None,
     cli_command: str | None = None,
 ) -> dict[str, Any]:
@@ -277,6 +309,7 @@ def build_tushare_candidate_staging_batch(
             sleeper=sleeper,
             max_trade_days=max_trade_days,
             coverage_expansion=coverage_expansion,
+            goal13c_preflight=goal13c_preflight,
         )
     raw_frames = fetch_result["frames"]
     provider_errors = fetch_result["provider_errors"]
@@ -287,7 +320,11 @@ def build_tushare_candidate_staging_batch(
     if max_trade_days is not None:
         trade_dates = trade_dates[:max_trade_days]
     expected_keys = _expected_keys(codes, trade_dates)
-    output_keys = build_tushare_candidate_staging_batch_output_keys(batch_id, trade_dates)
+    output_keys = build_tushare_candidate_staging_batch_output_keys(
+        batch_id,
+        trade_dates,
+        goal13c_preflight=goal13c_preflight,
+    )
 
     normalized = _normalize_all(raw_frames, codes, trade_dates)
     schema_checks = _schema_checks(raw_frames)
@@ -350,7 +387,7 @@ def build_tushare_candidate_staging_batch(
             generated_at=generated_at,
         )
 
-    if _schema_blocked(schema_checks):
+    if _schema_blocked(schema_checks, ignore_suspend_d=goal13c_preflight):
         blocked_reasons = [f"{dataset} missing fields: {', '.join(check['missing_required_fields'])}" for dataset, check in schema_checks.items() if check["missing_required_fields"]]
         return _blocked_schema_report(
             batch_id=batch_id,
@@ -365,11 +402,30 @@ def build_tushare_candidate_staging_batch(
             generated_at=generated_at,
         )
 
+    suspend_d_full_coverage_report = None
+    if goal13c_preflight:
+        suspend_d_full_coverage_report = _build_suspend_d_full_coverage_report(
+            batch_id=batch_id,
+            codes=codes,
+            trade_dates=trade_dates,
+            expected_keys=expected_keys,
+            normalized=normalized,
+            schema_checks=schema_checks,
+            provider_errors=provider_errors,
+            fetch_metadata=fetch_metadata,
+            generated_at=generated_at,
+        )
+        suspend_d_full_event_coverage_proven = (
+            suspend_d_full_coverage_report["full_coverage_status"] == "CONFIRMED"
+            and suspend_d_full_coverage_report["safe_false_candidate_allowed"]
+        )
+
     daily_candidate = _build_daily_price_candidate_batch(
         normalized=normalized,
         output_keys=output_keys,
         batch_id=batch_id,
         suspend_d_full_event_coverage_proven=suspend_d_full_event_coverage_proven,
+        suspend_d_full_coverage_report=suspend_d_full_coverage_report,
         generated_at=generated_at,
     )
     suspension_candidate = _build_suspension_status_candidate_batch(
@@ -378,6 +434,7 @@ def build_tushare_candidate_staging_batch(
         output_keys=output_keys,
         batch_id=batch_id,
         suspend_d_full_event_coverage_proven=suspend_d_full_event_coverage_proven,
+        suspend_d_full_coverage_report=suspend_d_full_coverage_report,
         generated_at=generated_at,
     )
     coverage_report["candidate_row_counts"] = {
@@ -398,6 +455,19 @@ def build_tushare_candidate_staging_batch(
         suspend_d_full_event_coverage_proven=suspend_d_full_event_coverage_proven,
         generated_at=generated_at,
     )
+    promotion_preflight_report = None
+    if goal13c_preflight:
+        promotion_preflight_report = _build_promotion_preflight_report(
+            batch_id=batch_id,
+            start_date=start_date,
+            end_date=end_date,
+            codes=codes,
+            trade_dates=trade_dates,
+            coverage_report=coverage_report,
+            suspend_d_full_coverage_report=suspend_d_full_coverage_report,
+            daily_candidate=daily_candidate,
+            generated_at=generated_at,
+        )
     manifest = _build_manifest(
         batch_id=batch_id,
         start_date=start_date,
@@ -410,6 +480,8 @@ def build_tushare_candidate_staging_batch(
         suspension_candidate=suspension_candidate,
         coverage_report=coverage_report,
         dq3_audit=dq3_audit,
+        suspend_d_full_coverage_report=suspend_d_full_coverage_report,
+        promotion_preflight_report=promotion_preflight_report,
         generated_at=generated_at,
         cli_command=cli_command,
     )
@@ -423,6 +495,8 @@ def build_tushare_candidate_staging_batch(
         fetch_semantics_report=fetch_semantics_report,
         coverage_gap_report=coverage_gap_report,
         dq3_audit=dq3_audit,
+        suspend_d_full_coverage_report=suspend_d_full_coverage_report,
+        promotion_preflight_report=promotion_preflight_report,
         manifest=manifest,
         write_parquet_fn=write_parquet_fn,
         write_json_fn=write_json_fn,
@@ -440,12 +514,15 @@ def build_tushare_candidate_staging_batch(
         fetch_semantics_report=fetch_semantics_report,
         coverage_gap_report=coverage_gap_report,
         dq3_audit=dq3_audit,
+        suspend_d_full_coverage_report=suspend_d_full_coverage_report,
+        promotion_preflight_report=promotion_preflight_report,
         manifest=manifest,
         daily_candidate=daily_candidate,
         suspension_candidate=suspension_candidate,
         coverage_expansion=coverage_expansion,
         fetch_semantics_audit=fetch_semantics_audit,
         reused_existing_staging=no_provider_call and reuse_existing_staging,
+        goal13c_preflight=goal13c_preflight,
         generated_at=generated_at,
     )
 
@@ -460,6 +537,7 @@ def _fetch_provider_frames(
     sleeper: SleepFn,
     max_trade_days: int | None,
     coverage_expansion: bool,
+    goal13c_preflight: bool,
 ) -> dict[str, Any]:
     frame_parts: dict[str, list[pd.DataFrame]] = {interface: [] for interface in TUSHARE_CANDIDATE_BATCH_REQUIRED_INTERFACES}
     provider_errors = []
@@ -495,16 +573,23 @@ def _fetch_provider_frames(
                     continue
                 if frame.empty and interface in EMPTY_RESULT_RETRY_INTERFACES:
                     provider_errors.append(_empty_after_retries_error(interface, kwargs, strategy, max_empty_attempts))
+                if bool(frame.attrs.get("empty_after_retries", False)):
+                    provider_errors.append(_empty_after_retries_error(interface, kwargs, strategy, max_empty_attempts))
                 frame_parts[interface].append(frame)
                 _record_sample_truncation(sample_truncation, interface, frame)
                 return frame
             except Exception as exc:
+                fatal = not (goal13c_preflight and interface == "suspend_d")
                 provider_errors.append(
                     {
                         "interface": interface,
                         "error_class": exc.__class__.__name__,
                         "error": str(exc),
                         "kwargs": _safe_kwargs(kwargs),
+                        "parameters": _safe_kwargs(kwargs),
+                        "fetch_strategy": strategy,
+                        "reason_code": PROVIDER_FETCH_INCOMPLETE,
+                        "fatal": fatal,
                     }
                 )
                 call_records.append(
@@ -534,8 +619,16 @@ def _fetch_provider_frames(
         for interface in PER_CODE_FETCH_INTERFACES:
             for code in codes:
                 fetch(interface, _provider_kwargs(interface, start_date, end_date, ts_code=code), "by_code_range")
-    for interface in RANGE_FETCH_INTERFACES:
-        fetch(interface, _provider_kwargs(interface, start_date, end_date), "by_date_range")
+    if goal13c_preflight:
+        for trade_date in trade_dates:
+            fetch(
+                "suspend_d",
+                _provider_kwargs("suspend_d", start_date, end_date, trade_date=trade_date),
+                "by_trade_date_full_market_event_set",
+            )
+    else:
+        for interface in RANGE_FETCH_INTERFACES:
+            fetch(interface, _provider_kwargs(interface, start_date, end_date), "by_date_range")
 
     frames = {interface: _concat_frames(parts) for interface, parts in frame_parts.items()}
     for interface, frame in frames.items():
@@ -712,6 +805,7 @@ def _build_daily_price_candidate_batch(
     output_keys: dict[str, Any],
     batch_id: str,
     suspend_d_full_event_coverage_proven: bool,
+    suspend_d_full_coverage_report: dict[str, Any] | None,
     generated_at: str,
 ) -> pd.DataFrame:
     daily = _drop_duplicate_keys(normalized["daily"])
@@ -736,28 +830,51 @@ def _build_daily_price_candidate_batch(
     candidate = candidate.merge(suspend_d, on=JOIN_KEYS, how="left")
 
     event_matches = [bool(value) if pd.notna(value) else False for value in candidate["_event_match"]]
+    false_allowed_dates = _false_candidate_allowed_dates(
+        suspend_d_full_coverage_report=suspend_d_full_coverage_report,
+        legacy_full_event_coverage=suspend_d_full_event_coverage_proven,
+        trade_dates=sorted(candidate["trade_date"].dropna().astype(str).unique().tolist()),
+    )
+    unresolved_reasons_by_date = _suspend_d_unresolved_reasons_by_date(suspend_d_full_coverage_report)
     candidate["provider"] = "tushare"
     candidate["batch_id"] = batch_id
     candidate["trading_day_confirmed"] = True
     statuses = []
     paused_values = []
     evidence_values = []
-    for event_match in event_matches:
+    resolution_sources = []
+    resolution_reasons = []
+    ready_for_join = []
+    for event_match, trade_date in zip(event_matches, candidate["trade_date"], strict=True):
         if event_match:
             statuses.append(PauseStatus.TRUE_CANDIDATE.value)
             paused_values.append(True)
             evidence_values.append(PauseEvidence.SUSPEND_D_MATCH.value)
-        elif suspend_d_full_event_coverage_proven:
+            resolution_sources.append(RESOLUTION_SOURCE_EVENT_ROW)
+            resolution_reasons.append("suspend_d event row matched this ts_code and trade_date")
+            ready_for_join.append(True)
+        elif str(trade_date) in false_allowed_dates:
             statuses.append(PauseStatus.FALSE_CANDIDATE.value)
             paused_values.append(False)
             evidence_values.append(PauseEvidence.FULL_EVENT_COVERAGE_NO_MATCH.value)
+            resolution_sources.append(RESOLUTION_SOURCE_FULL_COVERAGE_MISS)
+            resolution_reasons.append("suspend_d full coverage confirmed and no event row matched")
+            ready_for_join.append(True)
         else:
             statuses.append(PauseStatus.UNKNOWN.value)
             paused_values.append(None)
             evidence_values.append(PauseEvidence.UNRESOLVED_NO_EVENT_MATCH.value)
+            resolution_sources.append(RESOLUTION_SOURCE_UNRESOLVED)
+            reasons = unresolved_reasons_by_date.get(str(trade_date), [SUSPEND_D_FULL_COVERAGE_NOT_CONFIRMED])
+            resolution_reasons.append(",".join(reasons))
+            ready_for_join.append(False)
     candidate["pause_status"] = statuses
+    candidate["pause_candidate_status"] = statuses
     candidate["is_paused_candidate"] = paused_values
     candidate["pause_evidence"] = evidence_values
+    candidate["resolution_source"] = resolution_sources
+    candidate["resolution_reason"] = resolution_reasons
+    candidate["ready_for_daily_price_candidate_join"] = ready_for_join
     candidate["daily_source_object_key"] = _source_key_for_date(output_keys["daily_staging"], candidate["trade_date"])
     candidate["limit_source_object_key"] = _source_key_for_date(output_keys["stk_limit_staging"], candidate["trade_date"])
     candidate["adj_factor_source_object_key"] = _source_key_for_date(output_keys["adj_factor_staging"], candidate["trade_date"])
@@ -778,11 +895,21 @@ def _build_suspension_status_candidate_batch(
     output_keys: dict[str, Any],
     batch_id: str,
     suspend_d_full_event_coverage_proven: bool,
+    suspend_d_full_coverage_report: dict[str, Any] | None,
     generated_at: str,
 ) -> pd.DataFrame:
     _ = normalized
-    coverage_status = "FULL_EVENT_COVERAGE" if suspend_d_full_event_coverage_proven else "COVERAGE_UNKNOWN"
-    coverage_block_reason = "" if suspend_d_full_event_coverage_proven else "suspend_d event source full coverage is not proven"
+    coverage_status = (
+        "FULL_EVENT_COVERAGE"
+        if suspend_d_full_event_coverage_proven
+        else (suspend_d_full_coverage_report or {}).get("full_coverage_status", "COVERAGE_UNKNOWN")
+    )
+    coverage_block_reason = (
+        ""
+        if suspend_d_full_event_coverage_proven
+        else ",".join((suspend_d_full_coverage_report or {}).get("unresolved_reason_counts", {}).keys())
+        or "suspend_d event source full coverage is not proven"
+    )
     return pd.DataFrame(
         {
             "ts_code": daily_candidate["ts_code"],
@@ -790,8 +917,12 @@ def _build_suspension_status_candidate_batch(
             "provider": "tushare",
             "batch_id": batch_id,
             "pause_status": daily_candidate["pause_status"],
+            "pause_candidate_status": daily_candidate["pause_candidate_status"],
             "is_paused_candidate": daily_candidate["is_paused_candidate"],
             "pause_evidence": daily_candidate["pause_evidence"],
+            "resolution_source": daily_candidate["resolution_source"],
+            "resolution_reason": daily_candidate["resolution_reason"],
+            "ready_for_daily_price_candidate_join": daily_candidate["ready_for_daily_price_candidate_join"],
             "event_match": daily_candidate["pause_status"] == PauseStatus.TRUE_CANDIDATE.value,
             "event_source_object_key": output_keys["suspend_d_staging"],
             "calendar_source_object_key": output_keys["trade_cal_staging"],
@@ -1048,6 +1179,214 @@ def _build_coverage_gap_report(
     }
 
 
+def _build_suspend_d_full_coverage_report(
+    *,
+    batch_id: str,
+    codes: list[str],
+    trade_dates: list[str],
+    expected_keys: set[tuple[str, str]],
+    normalized: dict[str, pd.DataFrame],
+    schema_checks: dict[str, dict[str, Any]],
+    provider_errors: list[dict[str, Any]],
+    fetch_metadata: dict[str, Any],
+    generated_at: str,
+) -> dict[str, Any]:
+    suspend_d = normalized.get("suspend_d", pd.DataFrame())
+    event_keys = (
+        set(map(tuple, suspend_d[JOIN_KEYS].drop_duplicates().itertuples(index=False, name=None)))
+        if set(JOIN_KEYS).issubset(suspend_d.columns)
+        else set()
+    )
+    matched_event_keys = event_keys & expected_keys
+    calls = [call for call in fetch_metadata.get("calls", []) if call.get("interface") == "suspend_d"]
+    sample = fetch_metadata.get("sample_truncation", {}).get("suspend_d", _sample_truncation_item())
+    schema_missing = schema_checks.get("suspend_d", {}).get("missing_required_fields", [])
+
+    date_level_audit = []
+    false_allowed_dates = set()
+    unresolved_reason_counts: dict[str, int] = {}
+    provider_error_counts: dict[str, int] = {}
+    for error in provider_errors:
+        if error.get("interface") != "suspend_d":
+            continue
+        key = error.get("reason_code") or error.get("error_class") or "UNKNOWN"
+        provider_error_counts[key] = provider_error_counts.get(key, 0) + 1
+
+    for trade_date in trade_dates:
+        date_calls = _suspend_d_calls_for_date(calls, trade_date)
+        date_errors = _suspend_d_errors_for_date(provider_errors, trade_date)
+        query_scope_mode = _suspend_d_query_scope_mode(date_calls, codes)
+        row_count = _suspend_d_row_count_for_date(suspend_d, trade_date)
+        blocked_reasons = []
+
+        if not date_calls:
+            blocked_reasons.append(SUSPEND_D_QUERY_SCOPE_UNKNOWN)
+        if query_scope_mode == SUSPEND_D_UNKNOWN:
+            blocked_reasons.append(SUSPEND_D_QUERY_SCOPE_UNKNOWN)
+        if query_scope_mode == SUSPEND_D_PARTIAL:
+            blocked_reasons.append(SUSPEND_D_PARTIAL_UNIVERSE_COVERAGE)
+        if any(error.get("reason_code") == PROVIDER_EMPTY_AFTER_RETRIES for error in date_errors):
+            blocked_reasons.append(SUSPEND_D_PROVIDER_EMPTY_AFTER_RETRIES)
+        if any(error.get("reason_code") == PROVIDER_FETCH_INCOMPLETE for error in date_errors):
+            blocked_reasons.append(SUSPEND_D_PROVIDER_FETCH_INCOMPLETE)
+        if any(error.get("fatal", False) for error in date_errors):
+            blocked_reasons.append(SUSPEND_D_PROVIDER_FETCH_FAILED)
+        if schema_missing:
+            blocked_reasons.append(SUSPEND_D_SCHEMA_INCOMPLETE)
+        if sample.get("sample_truncated"):
+            blocked_reasons.append(SUSPEND_D_PAGINATION_OR_TRUNCATION_UNKNOWN)
+
+        blocked_reasons = list(dict.fromkeys(blocked_reasons))
+        full_coverage_for_target_universe = query_scope_mode in {
+            SUSPEND_D_DATE_FULL_MARKET_EVENT_SET,
+            SUSPEND_D_CODE_DATE_EXPLICIT_FULL_UNIVERSE,
+        } and not blocked_reasons
+        if full_coverage_for_target_universe:
+            false_allowed_dates.add(trade_date)
+        else:
+            for reason in blocked_reasons or [SUSPEND_D_FULL_COVERAGE_NOT_CONFIRMED]:
+                unresolved_reason_counts[reason] = unresolved_reason_counts.get(reason, 0) + len(codes)
+
+        provider_fetch_status = _suspend_d_provider_fetch_status(date_calls, date_errors)
+        empty_result_semantics = _suspend_d_empty_result_semantics(
+            row_count=row_count,
+            provider_fetch_status=provider_fetch_status,
+            full_coverage_for_target_universe=full_coverage_for_target_universe,
+            date_errors=date_errors,
+        )
+        date_level_audit.append(
+            {
+                "trade_date": trade_date,
+                "is_open_trade_date": True,
+                "query_scope_mode": query_scope_mode,
+                "provider_fetch_status": provider_fetch_status,
+                "row_count": row_count,
+                "empty_result_semantics": empty_result_semantics,
+                "full_coverage_for_target_universe": full_coverage_for_target_universe,
+                "false_candidate_allowed_for_miss": full_coverage_for_target_universe,
+                "blocked_reasons": blocked_reasons,
+            }
+        )
+
+    true_count = 0
+    false_count = 0
+    unknown_count = 0
+    for key in expected_keys:
+        ts_code, trade_date = key
+        _ = ts_code
+        if key in matched_event_keys:
+            true_count += 1
+        elif trade_date in false_allowed_dates:
+            false_count += 1
+        else:
+            unknown_count += 1
+
+    status = _suspend_d_full_coverage_status(date_level_audit)
+    return {
+        "schema_version": "goal13c.suspend_d_full_coverage_report.v1",
+        "goal": "13C",
+        "batch_id": batch_id,
+        "provider": "tushare",
+        "universe_size": len(codes),
+        "trade_date_count": len(trade_dates),
+        "expected_code_date_pairs": len(expected_keys),
+        "query_scope_mode": _suspend_d_overall_query_scope_mode(date_level_audit),
+        "full_coverage_status": status,
+        "safe_false_candidate_allowed": status == "CONFIRMED",
+        "summary": {
+            "suspend_true_candidate_count": true_count,
+            "suspend_false_candidate_count": false_count,
+            "suspend_unknown_count": unknown_count,
+            "resolved_pair_count": true_count + false_count,
+            "unresolved_pair_count": unknown_count,
+        },
+        "date_level_audit": date_level_audit,
+        "unresolved_reason_counts": unresolved_reason_counts,
+        "provider_error_counts": provider_error_counts,
+        "notes": [
+            "false_candidate is candidate evidence only, not standard suspension_status truth",
+            "volume, amount, missing daily rows, and unchanged prices are not used for pause inference",
+        ],
+    }
+
+
+def _build_promotion_preflight_report(
+    *,
+    batch_id: str,
+    start_date: str,
+    end_date: str,
+    codes: list[str],
+    trade_dates: list[str],
+    coverage_report: dict[str, Any],
+    suspend_d_full_coverage_report: dict[str, Any] | None,
+    daily_candidate: pd.DataFrame,
+    generated_at: str,
+) -> dict[str, Any]:
+    expected_count = coverage_report["expected_code_trade_date_count"]
+    price_coverage = {
+        "daily": coverage_report["daily_coverage"],
+        "stk_limit": coverage_report["stk_limit_coverage"],
+        "adj_factor": coverage_report["adj_factor_coverage"],
+        "daily_basic": coverage_report["daily_basic_coverage"],
+    }
+    pause_counts = _pause_status_counts(daily_candidate)
+    blocked_reasons = []
+    if coverage_report["interfaces"]["daily"]["coverage"]["matched_rows"] != expected_count:
+        blocked_reasons.append("INCOMPLETE_DAILY_COVERAGE")
+    if coverage_report["interfaces"]["stk_limit"]["coverage"]["matched_rows"] != expected_count:
+        blocked_reasons.append("INCOMPLETE_LIMIT_PRICE_COVERAGE")
+    if coverage_report["interfaces"]["adj_factor"]["coverage"]["matched_rows"] != expected_count:
+        blocked_reasons.append("INCOMPLETE_ADJ_FACTOR_COVERAGE")
+    if coverage_report["interfaces"]["daily_basic"]["coverage"]["matched_rows"] != expected_count:
+        blocked_reasons.append("INCOMPLETE_DAILY_BASIC_COVERAGE")
+    if any(error.get("reason_code") == PROVIDER_EMPTY_AFTER_RETRIES for error in coverage_report.get("provider_errors", [])):
+        blocked_reasons.append(PROVIDER_EMPTY_AFTER_RETRIES)
+    if coverage_report.get("provider_errors"):
+        blocked_reasons.append(PROVIDER_FETCH_INCOMPLETE)
+    if (suspend_d_full_coverage_report or {}).get("full_coverage_status") != "CONFIRMED":
+        blocked_reasons.append("SUSPEND_D_FULL_COVERAGE_NOT_CONFIRMED")
+    if pause_counts.get("unknown", 0) > 0:
+        blocked_reasons.append("UNRESOLVED_IS_PAUSED")
+    if any(check["missing_required_fields"] for check in coverage_report["schema_checks"].values()):
+        blocked_reasons.append("CANDIDATE_SCHEMA_INCOMPATIBLE_WITH_DAILY_PRICE_CONTRACT")
+
+    blocked_reasons = list(dict.fromkeys(blocked_reasons))
+    status = "READY_FOR_PROMOTION_VALIDATOR" if not blocked_reasons else "BLOCKED"
+    return {
+        "schema_version": "goal13c.promotion_preflight_report.v1",
+        "goal": "13C",
+        "batch_id": batch_id,
+        "provider": "tushare",
+        "generated_at": generated_at,
+        "start_date": start_date,
+        "end_date": end_date,
+        "codes": codes,
+        "trade_dates": trade_dates,
+        "status": status,
+        "price_coverage": price_coverage,
+        "suspension_resolution": {
+            "resolved": pause_counts.get("true_candidate", 0) + pause_counts.get("false_candidate", 0),
+            "unknown": pause_counts.get("unknown", 0),
+            "true_candidate": pause_counts.get("true_candidate", 0),
+            "false_candidate": pause_counts.get("false_candidate", 0),
+        },
+        "blocked_reasons": blocked_reasons,
+        "next_allowed_goal": "Goal 14: small-range standard daily_price promotion validator",
+        "standard_daily_price_write_performed": False,
+        "standard_suspension_status_write_performed": False,
+        "real_backtest_performed": False,
+        "ready_for_standard_write": False,
+        "ready_for_real_backtest": False,
+        "production_ready": False,
+        "safety": SAFETY_FLAGS,
+        "inference_guards": INFERENCE_GUARDS,
+        "not_allowed_actions": [
+            "STANDARD_WRITE_NOT_ALLOWED_IN_GOAL_13C",
+            "REAL_BACKTEST_NOT_ALLOWED_IN_GOAL_13C",
+        ],
+    }
+
+
 def _build_dq3_audit(
     *,
     batch_id: str,
@@ -1160,6 +1499,135 @@ def _readiness_blocked_reason_codes(coverage_report: dict[str, Any], pause_statu
     return reasons
 
 
+def _suspend_d_calls_for_date(calls: list[dict[str, Any]], trade_date: str) -> list[dict[str, Any]]:
+    compact = trade_date.replace("-", "")
+    matched = []
+    for call in calls:
+        params = call.get("parameters", {})
+        if params.get("trade_date") == compact or params.get("suspend_date") == compact:
+            matched.append(call)
+    return matched
+
+
+def _suspend_d_errors_for_date(provider_errors: list[dict[str, Any]], trade_date: str) -> list[dict[str, Any]]:
+    compact = trade_date.replace("-", "")
+    matched = []
+    for error in provider_errors:
+        if error.get("interface") != "suspend_d":
+            continue
+        params = error.get("parameters") or error.get("kwargs") or {}
+        error_date = params.get("trade_date") or params.get("suspend_date")
+        if error_date in {compact, None, ""}:
+            matched.append(error)
+    return matched
+
+
+def _suspend_d_query_scope_mode(date_calls: list[dict[str, Any]], codes: list[str]) -> str:
+    if not date_calls:
+        return SUSPEND_D_UNKNOWN
+    provider_calls = [call for call in date_calls if call.get("source") == "provider"]
+    if not provider_calls:
+        return SUSPEND_D_UNKNOWN
+    if any(
+        call.get("fetch_strategy") == "by_trade_date_full_market_event_set"
+        and not call.get("parameters", {}).get("ts_code")
+        for call in provider_calls
+    ):
+        return SUSPEND_D_DATE_FULL_MARKET_EVENT_SET
+    code_date_calls = [call for call in provider_calls if call.get("parameters", {}).get("ts_code")]
+    if code_date_calls:
+        fetched_codes = {str(call.get("parameters", {}).get("ts_code")).upper() for call in code_date_calls}
+        return SUSPEND_D_CODE_DATE_EXPLICIT_FULL_UNIVERSE if fetched_codes == set(codes) else SUSPEND_D_PARTIAL
+    return SUSPEND_D_UNKNOWN
+
+
+def _suspend_d_row_count_for_date(suspend_d: pd.DataFrame, trade_date: str) -> int:
+    if "trade_date" not in suspend_d.columns or suspend_d.empty:
+        return 0
+    return int((suspend_d["trade_date"].astype(str) == trade_date).sum())
+
+
+def _suspend_d_provider_fetch_status(date_calls: list[dict[str, Any]], date_errors: list[dict[str, Any]]) -> str:
+    if any(error.get("reason_code") == PROVIDER_EMPTY_AFTER_RETRIES for error in date_errors):
+        return "INCOMPLETE"
+    if any(error.get("reason_code") == PROVIDER_FETCH_INCOMPLETE for error in date_errors):
+        return "INCOMPLETE"
+    if date_errors:
+        return "FAILED"
+    if date_calls:
+        return "SUCCESS"
+    return "UNKNOWN"
+
+
+def _suspend_d_empty_result_semantics(
+    *,
+    row_count: int,
+    provider_fetch_status: str,
+    full_coverage_for_target_universe: bool,
+    date_errors: list[dict[str, Any]],
+) -> str:
+    if any(error.get("reason_code") == PROVIDER_EMPTY_AFTER_RETRIES for error in date_errors):
+        return "EMPTY_AFTER_RETRIES"
+    if row_count > 0:
+        return "NOT_EMPTY"
+    if provider_fetch_status == "SUCCESS" and full_coverage_for_target_universe:
+        return "VALID_EMPTY_EVENT_SET"
+    return "UNKNOWN"
+
+
+def _suspend_d_full_coverage_status(date_level_audit: list[dict[str, Any]]) -> str:
+    if not date_level_audit:
+        return "UNKNOWN"
+    allowed = [item["false_candidate_allowed_for_miss"] for item in date_level_audit]
+    if all(allowed):
+        return "CONFIRMED"
+    if any(item["provider_fetch_status"] in {"FAILED", "INCOMPLETE"} for item in date_level_audit):
+        return "FAILED"
+    if any(allowed):
+        return "PARTIAL"
+    if any(SUSPEND_D_PARTIAL_UNIVERSE_COVERAGE in item["blocked_reasons"] for item in date_level_audit):
+        return "PARTIAL"
+    return "UNKNOWN"
+
+
+def _suspend_d_overall_query_scope_mode(date_level_audit: list[dict[str, Any]]) -> str:
+    modes = {item["query_scope_mode"] for item in date_level_audit}
+    if len(modes) == 1:
+        return next(iter(modes))
+    if not modes:
+        return SUSPEND_D_UNKNOWN
+    if SUSPEND_D_PARTIAL in modes:
+        return SUSPEND_D_PARTIAL
+    if SUSPEND_D_UNKNOWN in modes:
+        return SUSPEND_D_UNKNOWN
+    return SUSPEND_D_PARTIAL
+
+
+def _false_candidate_allowed_dates(
+    *,
+    suspend_d_full_coverage_report: dict[str, Any] | None,
+    legacy_full_event_coverage: bool,
+    trade_dates: list[str],
+) -> set[str]:
+    if suspend_d_full_coverage_report is None:
+        return set(trade_dates) if legacy_full_event_coverage else set()
+    return {
+        item["trade_date"]
+        for item in suspend_d_full_coverage_report.get("date_level_audit", [])
+        if item.get("false_candidate_allowed_for_miss")
+    }
+
+
+def _suspend_d_unresolved_reasons_by_date(suspend_d_full_coverage_report: dict[str, Any] | None) -> dict[str, list[str]]:
+    if suspend_d_full_coverage_report is None:
+        return {}
+    return {
+        item["trade_date"]: item.get("blocked_reasons") or [SUSPEND_D_FULL_COVERAGE_NOT_CONFIRMED]
+        for item in suspend_d_full_coverage_report.get("date_level_audit", [])
+        if not item.get("false_candidate_allowed_for_miss")
+    }
+
+
 def _build_manifest(
     *,
     batch_id: str,
@@ -1173,13 +1641,33 @@ def _build_manifest(
     suspension_candidate: pd.DataFrame,
     coverage_report: dict[str, Any],
     dq3_audit: dict[str, Any],
+    suspend_d_full_coverage_report: dict[str, Any] | None,
+    promotion_preflight_report: dict[str, Any] | None,
     generated_at: str,
     cli_command: str | None,
 ) -> dict[str, Any]:
     contract = classify_tushare_candidate_batch(source_layer="candidate")
+    goal = "13C" if promotion_preflight_report is not None else "13B"
+    schema_versions = {
+        "daily_staging": "goal13.v1",
+        "stk_limit_staging": "goal13.v1",
+        "adj_factor_staging": "goal13.v1",
+        "daily_basic_staging": "goal13.v1",
+        "trade_cal_staging": "goal13.v1",
+        "suspend_d_staging": "goal13.v1",
+        "daily_price_candidate_batch": "goal13C.v1" if goal == "13C" else "goal13.v1",
+        "suspension_status_candidate_batch": "goal13C.v1" if goal == "13C" else "goal13.v1",
+        "provider_coverage_report": "goal13B.v1",
+        "fetch_semantics_report": "goal13B.v1",
+        "coverage_gap_report": "goal13B.v1",
+        "dq3_readiness_audit": "goal13B.v1",
+    }
+    if goal == "13C":
+        schema_versions["suspend_d_full_coverage_report"] = "goal13c.suspend_d_full_coverage_report.v1"
+        schema_versions["promotion_preflight_report"] = "goal13c.promotion_preflight_report.v1"
     return {
         "provider": "tushare",
-        "goal": "13B",
+        "goal": goal,
         "batch_id": batch_id,
         "generated_at": generated_at,
         "start_date": start_date,
@@ -1196,24 +1684,12 @@ def _build_manifest(
             "daily_price_candidate_batch": int(len(daily_candidate)),
             "suspension_status_candidate_batch": int(len(suspension_candidate)),
         },
-        "schema_versions": {
-            "daily_staging": "goal13.v1",
-            "stk_limit_staging": "goal13.v1",
-            "adj_factor_staging": "goal13.v1",
-            "daily_basic_staging": "goal13.v1",
-            "trade_cal_staging": "goal13.v1",
-            "suspend_d_staging": "goal13.v1",
-            "daily_price_candidate_batch": "goal13.v1",
-            "suspension_status_candidate_batch": "goal13.v1",
-            "provider_coverage_report": "goal13B.v1",
-            "fetch_semantics_report": "goal13B.v1",
-            "coverage_gap_report": "goal13B.v1",
-            "dq3_readiness_audit": "goal13B.v1",
-        },
+        "schema_versions": schema_versions,
         "dq_level": DataQualityLevel.DQ1.value,
         "is_standard": False,
         "is_promotable": False,
         "ready_for_promotion_validator": dq3_audit["ready_for_promotion_validator"],
+        "promotion_preflight_status": (promotion_preflight_report or {}).get("status"),
         "ready_for_dq3_promotion": dq3_audit["ready_for_dq3_promotion"],
         "coverage_status": dq3_audit["status"],
         "blocked_reasons": dq3_audit["blocked_reasons"],
@@ -1224,6 +1700,7 @@ def _build_manifest(
             "expected_code_date_count": coverage_report["expected_code_date_count"],
             "pause_status_counts": dq3_audit["pause_status_summary"],
         },
+        "suspend_d_full_coverage_status": (suspend_d_full_coverage_report or {}).get("full_coverage_status"),
     }
 
 
@@ -1237,6 +1714,8 @@ def _write_success_artifacts(
     fetch_semantics_report: dict[str, Any],
     coverage_gap_report: dict[str, Any],
     dq3_audit: dict[str, Any],
+    suspend_d_full_coverage_report: dict[str, Any] | None,
+    promotion_preflight_report: dict[str, Any] | None,
     manifest: dict[str, Any],
     write_parquet_fn: WriteParquetFn,
     write_json_fn: WriteJsonFn,
@@ -1254,6 +1733,10 @@ def _write_success_artifacts(
     write_json_fn(output_keys["fetch_semantics_report"], fetch_semantics_report)
     write_json_fn(output_keys["coverage_gap_report"], coverage_gap_report)
     write_json_fn(output_keys["dq3_readiness_audit"], dq3_audit)
+    if suspend_d_full_coverage_report is not None:
+        write_json_fn(output_keys["suspend_d_full_coverage_report"], suspend_d_full_coverage_report)
+    if promotion_preflight_report is not None:
+        write_json_fn(output_keys["promotion_preflight_report"], promotion_preflight_report)
     write_json_fn(output_keys["manifest"], manifest)
 
 
@@ -1270,18 +1753,22 @@ def _success_result(
     fetch_semantics_report: dict[str, Any],
     coverage_gap_report: dict[str, Any],
     dq3_audit: dict[str, Any],
+    suspend_d_full_coverage_report: dict[str, Any] | None,
+    promotion_preflight_report: dict[str, Any] | None,
     manifest: dict[str, Any],
     daily_candidate: pd.DataFrame,
     suspension_candidate: pd.DataFrame,
     coverage_expansion: bool,
     fetch_semantics_audit: bool,
     reused_existing_staging: bool,
+    goal13c_preflight: bool,
     generated_at: str,
 ) -> dict[str, Any]:
+    goal = "13C" if goal13c_preflight else "13B"
     return {
         "status": "CANDIDATE_BATCH_COMPLETED_NOT_PROMOTABLE",
         "provider": "tushare",
-        "goal": "13B",
+        "goal": goal,
         "batch_id": batch_id,
         "generated_at": generated_at,
         "start_date": start_date,
@@ -1294,6 +1781,8 @@ def _success_result(
         "fetch_semantics_report": fetch_semantics_report,
         "coverage_gap_report": coverage_gap_report,
         "dq3_readiness_audit": dq3_audit,
+        "suspend_d_full_coverage_report": suspend_d_full_coverage_report,
+        "promotion_preflight_report": promotion_preflight_report,
         "interfaces_requested": list(TUSHARE_CANDIDATE_BATCH_REQUIRED_INTERFACES),
         "interfaces_succeeded": list(TUSHARE_CANDIDATE_BATCH_REQUIRED_INTERFACES),
         "interfaces_failed": [],
@@ -1302,12 +1791,18 @@ def _success_result(
         "suspension_status_candidate_row_count": int(len(suspension_candidate)),
         "coverage_summary": _summary_coverage(coverage_report),
         "pause_status_counts": _pause_status_counts(daily_candidate),
-        "ready_for_promotion_validator": dq3_audit["ready_for_promotion_validator"],
+        "ready_for_promotion_validator": (
+            (promotion_preflight_report or {}).get("status") == "READY_FOR_PROMOTION_VALIDATOR"
+            if goal13c_preflight
+            else dq3_audit["ready_for_promotion_validator"]
+        ),
         "ready_for_dq3_promotion": dq3_audit["ready_for_dq3_promotion"],
-        "blocked_reasons": dq3_audit["blocked_reasons"],
+        "blocked_reasons": (promotion_preflight_report or {}).get("blocked_reasons", dq3_audit["blocked_reasons"]),
+        "promotion_preflight_status": (promotion_preflight_report or {}).get("status"),
         "coverage_expansion": coverage_expansion,
         "fetch_semantics_audit": fetch_semantics_audit,
         "reused_existing_staging": reused_existing_staging,
+        "goal13c_preflight": goal13c_preflight,
         "safety": SAFETY_FLAGS,
         "inference_guards": INFERENCE_GUARDS,
     }
@@ -1439,8 +1934,12 @@ def _schema_check(frame: pd.DataFrame, dataset: str) -> dict[str, Any]:
     }
 
 
-def _schema_blocked(schema_checks: dict[str, dict[str, Any]]) -> bool:
-    return any(check["missing_required_fields"] for check in schema_checks.values())
+def _schema_blocked(schema_checks: dict[str, dict[str, Any]], *, ignore_suspend_d: bool = False) -> bool:
+    return any(
+        check["missing_required_fields"]
+        for dataset, check in schema_checks.items()
+        if not (ignore_suspend_d and dataset == "suspend_d")
+    )
 
 
 def _duplicate_key_checks(normalized: dict[str, pd.DataFrame]) -> dict[str, dict[str, Any]]:

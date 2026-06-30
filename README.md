@@ -34,7 +34,8 @@
 - Goal 12C：Tushare `daily_price_candidate` join dry-run；只读已有 `daily` / `stk_limit` / `adj_factor` / `trade_cal` / `suspend_d` smoke，输出诊断报告，不写标准 `daily_price`，详见 `docs/goal12C_tushare_daily_price_candidate_dry_run.md`。
 - Goal 12D：Tushare `suspension_status_candidate` staging 与 coverage audit；输出 candidate-only 停牌状态和覆盖审计报告，当前 sample-truncated `suspend_d` 不能生成 `false_candidate`，仍未写 standard `daily_price` 或 standard `suspension_status`，真实数据仍未进入正式选股/回测主链路，详见 `docs/goal12D_suspension_status_candidate_coverage_audit.md`。
 - Goal 13：Tushare 小范围 real-provider candidate/staging batch 与 DQ3 readiness audit；只写 `candidate/tushare/...` manifest、staging、candidate batch、coverage report 和 DQ3 audit，不写 standard `daily_price` / `suspension_status`，不进入真实选股或真实回测，详见 `docs/goal13_tushare_candidate_staging_batch_dq3_readiness.md`。
-- Goal 13B：新增 Tushare candidate batch coverage expansion 与 fetch semantics audit；真实数据仍未进入 standard `daily_price` 或真实回测主链路，详见 `docs/goal13B_tushare_candidate_batch_coverage_expansion.md`。
+- Goal 13B：新增 Tushare candidate batch coverage expansion 与 fetch semantics audit；真实数据仍未进入 standard `daily_price` 或真实回测主链路，详见 `docs/goal13B_tushare_candidate_batch_coverage_expansion.md`。Goal 13B 已在 `main` 形成稳定基线，基线提交为 `fadf8be` / `goal-13B-tushare-coverage-expansion-verified`。
+- Goal 13C：新增 `suspend_d` full coverage audit 与 promotion preflight；只有 date-level full event coverage 被确认时，`suspend_d` miss 才能生成 `false_candidate`，并且最多只能进入 `READY_FOR_PROMOTION_VALIDATOR`，不写 standard `daily_price` / standard `suspension_status`，不进入真实选股或真实回测，详见 `docs/goal13C_suspend_d_full_coverage_preflight.md`。
 - Goal 10B：AKShare / Baostock 最小真实数据 smoke，已验证 AKShare `benchmark_price` 可标准化写入 `smoke/akshare/...` 并通过 DuckDB 查询；字段不足的数据集不会绕过 validator 写入标准层。
 - Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke，新增 smoke-only `daily_price_raw_smoke`，只允许写入 `smoke/<provider>/daily_price_raw_smoke/...`，不进入标准 `raw/daily_price/...`。
 - Goal 12A：真实数据标准层契约与数据质量等级冻结，详见 `docs/goal12A_real_data_contract.md`；本阶段只新增契约、守门规则和测试，不接入真实 provider 主链路，不做真实回测。
@@ -371,9 +372,9 @@ docker compose run --rm stock-python python -m stock_selector.cli query-parquet 
 
 `trade_cal` 只是 `trading_calendar_candidate` 证据；`suspend_d` 只是 `suspension_status_candidate` 事件来源候选。`suspend_d` 命中可以成立为 `is_paused=true` candidate；`suspend_d` 未命中不能推断为 `is_paused=false`，必须等后续标准层 staging、join dry-run、覆盖范围审计和 validator 验证完成。
 
-### Tushare Goal 13 / 13B Candidate Batch
+### Tushare Goal 13 / 13B / 13C Candidate Batch
 
-Goal 13 可以显式调用 Tushare，构建小范围 candidate/staging batch。Goal 13B 在同一 candidate/staging 边界内增加 coverage expansion、fetch semantics audit 和 coverage gap report：
+Goal 13 可以显式调用 Tushare，构建小范围 candidate/staging batch。Goal 13B 在同一 candidate/staging 边界内增加 coverage expansion、fetch semantics audit 和 coverage gap report。Goal 13C 继续停留在 candidate/staging 边界内，只增加 `suspend_d_full_coverage_report` 和 `promotion_preflight_report`：
 
 ```powershell
 docker compose run --rm stock-python python -m stock_selector.cli build-tushare-candidate-staging-batch `
@@ -383,7 +384,8 @@ docker compose run --rm stock-python python -m stock_selector.cli build-tushare-
   --max-trade-days 20 `
   --sleep-seconds 12 `
   --coverage-expansion `
-  --fetch-semantics-audit
+  --fetch-semantics-audit `
+  --goal13c-preflight
 ```
 
 该命令只允许写入：
@@ -397,11 +399,17 @@ candidate/tushare/provider_coverage_report/batch_id=<batch_id>/report.json
 candidate/tushare/fetch_semantics_report/batch_id=<batch_id>/report.json
 candidate/tushare/coverage_gap_report/batch_id=<batch_id>/report.json
 candidate/tushare/dq3_readiness_audit/batch_id=<batch_id>/report.json
+candidate/tushare/suspend_d_full_coverage_report/batch_id=<batch_id>/report.json
+candidate/tushare/promotion_preflight_report/batch_id=<batch_id>/report.json
 ```
 
 Goal 13B 中 `stk_limit` coverage expansion 按目标交易日拉取后过滤目标股票，`adj_factor`、`daily`、`daily_basic` 保持按股票区间拉取。`--no-provider-call --reuse-existing-staging` 可以只复用已有 candidate/staging 重建审计报告；`--fail-on-incomplete-critical-coverage` 只在关键 price coverage 不完整时让 CLI 非零退出。
 
-这些对象不是 `raw/daily_price` 或标准 `suspension_status`，不会被 `clean_daily_snapshot`、`factor_daily`、`selection_result` 或 `run-backtest` 读取。`suspend_d` 未命中仍不能推断为 `is_paused=false`；缺少完整事件覆盖审计时，DQ3 readiness 必须保持 blocked。
+Goal 13C 中 `suspend_d` 按目标 open trade date 审计 full market event set。只有 `DATE_FULL_MARKET_EVENT_SET` 或 `CODE_DATE_EXPLICIT_FULL_UNIVERSE` 被确认、provider fetch 成功、无 empty retry exhaustion、无 schema/truncation/scope 风险时，`suspend_d` miss 才能生成 `false_candidate`，且会记录 `SUSPEND_D_FULL_COVERAGE_MISS_AS_FALSE_CANDIDATE`。如果 query scope unknown、partial universe、provider incomplete、`PROVIDER_EMPTY_AFTER_RETRIES`、schema incomplete 或 truncation 风险存在，miss 必须保持 `unknown`。
+
+`promotion_preflight_report.status=READY_FOR_PROMOTION_VALIDATOR` 只表示可以进入下一 Goal 的 promotion validator，不表示允许写 standard 表。`standard_daily_price_write_performed`、`standard_suspension_status_write_performed`、`real_backtest_performed`、`ready_for_standard_write`、`ready_for_real_backtest` 和 `production_ready` 必须保持 `false`。
+
+这些对象不是 `raw/daily_price` 或标准 `suspension_status`，不会被 `clean_daily_snapshot`、`factor_input_table`、`factor_daily`、`selection_result` 或 `run-backtest` 读取。`suspend_d` 未命中仍不能直接推断为 `is_paused=false`；缺少完整事件覆盖审计时，promotion preflight 必须保持 blocked。
 
 ## 幂等与重跑
 
@@ -438,7 +446,7 @@ $env:PYTHONPATH='src;tests'
 python -m pytest
 ```
 
-当前 Docker 基线：Python `218 passed, 5 skipped`；Spring Maven `Tests run: 15, Failures: 0, Errors: 0`。
+当前测试基线：Python `237 passed, 5 skipped`；Spring Maven `mvn test -q` exit 0。
 
 ## 开发约束
 

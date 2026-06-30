@@ -570,6 +570,227 @@ def test_goal13_full_event_coverage_allows_false_candidate_but_not_standard_writ
     assert result["dq3_readiness_audit"]["ready_for_dq3_promotion"] is False
 
 
+def test_goal13c_full_market_empty_event_set_allows_false_candidates_and_preflight_ready():
+    result, writer = _build_goal13c_result(_FakeTushareBatchProvider(complete_limit_coverage=True, empty_suspend_d=True))
+    keys = result["output_object_keys"]
+
+    suspend_report = writer.json_payloads[keys["suspend_d_full_coverage_report"]]
+    promotion_report = writer.json_payloads[keys["promotion_preflight_report"]]
+    daily_candidate = writer.parquet_payloads[keys["daily_price_candidate_batch"]]
+    suspension_candidate = writer.parquet_payloads[keys["suspension_status_candidate_batch"]]
+
+    assert result["goal"] == "13C"
+    assert suspend_report["schema_version"] == "goal13c.suspend_d_full_coverage_report.v1"
+    assert suspend_report["query_scope_mode"] == "DATE_FULL_MARKET_EVENT_SET"
+    assert suspend_report["full_coverage_status"] == "CONFIRMED"
+    assert suspend_report["safe_false_candidate_allowed"] is True
+    assert suspend_report["summary"] == {
+        "suspend_true_candidate_count": 0,
+        "suspend_false_candidate_count": 4,
+        "suspend_unknown_count": 0,
+        "resolved_pair_count": 4,
+        "unresolved_pair_count": 0,
+    }
+    assert {
+        (item["trade_date"], item["empty_result_semantics"], item["false_candidate_allowed_for_miss"])
+        for item in suspend_report["date_level_audit"]
+    } == {
+        ("2024-06-03", "VALID_EMPTY_EVENT_SET", True),
+        ("2024-06-04", "VALID_EMPTY_EVENT_SET", True),
+    }
+    assert set(daily_candidate["pause_status"]) == {"false_candidate"}
+    assert set(daily_candidate["resolution_source"]) == {"SUSPEND_D_FULL_COVERAGE_MISS_AS_FALSE_CANDIDATE"}
+    assert set(suspension_candidate["pause_candidate_status"]) == {"false_candidate"}
+    assert "is_paused" not in daily_candidate.columns
+    assert promotion_report["schema_version"] == "goal13c.promotion_preflight_report.v1"
+    assert promotion_report["status"] == "READY_FOR_PROMOTION_VALIDATOR"
+    assert promotion_report["standard_daily_price_write_performed"] is False
+    assert promotion_report["standard_suspension_status_write_performed"] is False
+    assert promotion_report["real_backtest_performed"] is False
+    assert promotion_report["ready_for_standard_write"] is False
+    assert promotion_report["ready_for_real_backtest"] is False
+    assert promotion_report["production_ready"] is False
+
+
+def test_goal13c_full_market_event_row_resolves_true_and_false_candidates():
+    result, writer = _build_goal13c_result(_FakeTushareBatchProvider(complete_limit_coverage=True))
+    keys = result["output_object_keys"]
+
+    suspend_report = writer.json_payloads[keys["suspend_d_full_coverage_report"]]
+    promotion_report = writer.json_payloads[keys["promotion_preflight_report"]]
+    daily_candidate = writer.parquet_payloads[keys["daily_price_candidate_batch"]]
+    rows = {(row.ts_code, row.trade_date): row for row in daily_candidate.itertuples(index=False)}
+
+    assert rows[("000001.SZ", "2024-06-03")].pause_status == "true_candidate"
+    assert rows[("000001.SZ", "2024-06-03")].resolution_source == "SUSPEND_D_EVENT_ROW"
+    assert rows[("600519.SH", "2024-06-03")].pause_status == "false_candidate"
+    assert rows[("600519.SH", "2024-06-04")].pause_status == "false_candidate"
+    assert suspend_report["summary"]["suspend_true_candidate_count"] == 1
+    assert suspend_report["summary"]["suspend_false_candidate_count"] == 3
+    assert suspend_report["summary"]["suspend_unknown_count"] == 0
+    assert promotion_report["status"] == "READY_FOR_PROMOTION_VALIDATOR"
+
+
+def test_goal13c_query_scope_unknown_keeps_suspend_misses_unknown():
+    result, writer = _build_goal13c_from_reused_staging(_provider_frames(complete_limit_coverage=True, empty_suspend_d=True))
+    keys = result["output_object_keys"]
+
+    suspend_report = writer.json_payloads[keys["suspend_d_full_coverage_report"]]
+    promotion_report = writer.json_payloads[keys["promotion_preflight_report"]]
+    daily_candidate = writer.parquet_payloads[keys["daily_price_candidate_batch"]]
+
+    assert suspend_report["query_scope_mode"] == "UNKNOWN"
+    assert suspend_report["full_coverage_status"] == "UNKNOWN"
+    assert suspend_report["safe_false_candidate_allowed"] is False
+    assert set(daily_candidate["pause_status"]) == {"unknown"}
+    assert set(daily_candidate["resolution_source"]) == {"UNRESOLVED"}
+    assert "SUSPEND_D_QUERY_SCOPE_UNKNOWN" in suspend_report["unresolved_reason_counts"]
+    assert promotion_report["status"] == "BLOCKED"
+    assert "SUSPEND_D_FULL_COVERAGE_NOT_CONFIRMED" in promotion_report["blocked_reasons"]
+    assert "UNRESOLVED_IS_PAUSED" in promotion_report["blocked_reasons"]
+
+
+def test_goal13c_suspend_d_empty_after_retries_blocks_false_candidate_for_that_date():
+    result, writer = _build_goal13c_result(
+        _FakeTushareBatchProvider(complete_limit_coverage=True, suspend_d_empty_after_retries_dates={"20240604"})
+    )
+    keys = result["output_object_keys"]
+
+    suspend_report = writer.json_payloads[keys["suspend_d_full_coverage_report"]]
+    promotion_report = writer.json_payloads[keys["promotion_preflight_report"]]
+    daily_candidate = writer.parquet_payloads[keys["daily_price_candidate_batch"]]
+    rows = {(row.ts_code, row.trade_date): row for row in daily_candidate.itertuples(index=False)}
+    date_audit = {item["trade_date"]: item for item in suspend_report["date_level_audit"]}
+
+    assert date_audit["2024-06-04"]["empty_result_semantics"] == "EMPTY_AFTER_RETRIES"
+    assert "SUSPEND_D_PROVIDER_EMPTY_AFTER_RETRIES" in date_audit["2024-06-04"]["blocked_reasons"]
+    assert rows[("600519.SH", "2024-06-03")].pause_status == "false_candidate"
+    assert rows[("000001.SZ", "2024-06-04")].pause_status == "unknown"
+    assert rows[("600519.SH", "2024-06-04")].pause_status == "unknown"
+    assert promotion_report["status"] == "BLOCKED"
+    assert "PROVIDER_EMPTY_AFTER_RETRIES" in promotion_report["blocked_reasons"]
+    assert "UNRESOLVED_IS_PAUSED" in promotion_report["blocked_reasons"]
+
+
+def test_goal13c_suspend_d_fetch_incomplete_blocks_false_candidate_without_blocking_price_candidate():
+    result, writer = _build_goal13c_result(
+        _FakeTushareBatchProvider(complete_limit_coverage=True, fail_interfaces={"suspend_d": RuntimeError("suspend unavailable")})
+    )
+    keys = result["output_object_keys"]
+
+    suspend_report = writer.json_payloads[keys["suspend_d_full_coverage_report"]]
+    promotion_report = writer.json_payloads[keys["promotion_preflight_report"]]
+    daily_candidate = writer.parquet_payloads[keys["daily_price_candidate_batch"]]
+
+    assert result["status"] == "CANDIDATE_BATCH_COMPLETED_NOT_PROMOTABLE"
+    assert result["daily_price_candidate_row_count"] == 4
+    assert set(daily_candidate["pause_status"]) == {"unknown"}
+    assert "SUSPEND_D_PROVIDER_FETCH_INCOMPLETE" in suspend_report["unresolved_reason_counts"]
+    assert promotion_report["status"] == "BLOCKED"
+    assert "PROVIDER_FETCH_INCOMPLETE" in promotion_report["blocked_reasons"]
+    assert "UNRESOLVED_IS_PAUSED" in promotion_report["blocked_reasons"]
+
+
+def test_goal13c_partial_universe_scope_blocks_false_candidate():
+    from stock_selector.data.tushare_candidate_staging_batch import _build_suspend_d_full_coverage_report
+
+    normalized = {
+        "suspend_d": pd.DataFrame(columns=["ts_code", "trade_date", "suspend_type", "suspend_timing"]),
+        "trade_cal": _normalize_fixture_frame(_provider_frames(complete_limit_coverage=True)["trade_cal"], "trade_cal"),
+    }
+    report = _build_suspend_d_full_coverage_report(
+        batch_id=BATCH_ID,
+        codes=CODES,
+        trade_dates=TRADE_DATES,
+        expected_keys={(code, trade_date) for code in CODES for trade_date in TRADE_DATES},
+        normalized=normalized,
+        schema_checks={"suspend_d": {"missing_required_fields": []}},
+        provider_errors=[],
+        fetch_metadata={
+            "calls": [
+                {
+                    "interface": "suspend_d",
+                    "parameters": {"trade_date": "20240603", "ts_code": "000001.SZ"},
+                    "fetch_strategy": "by_code_date_explicit",
+                    "row_count": 0,
+                    "empty_result": True,
+                    "source": "provider",
+                }
+            ],
+            "sample_truncation": {"suspend_d": {"sample_truncated": False}},
+        },
+        generated_at="2026-06-29T00:00:00Z",
+    )
+
+    assert report["query_scope_mode"] == "PARTIAL"
+    assert report["full_coverage_status"] == "PARTIAL"
+    assert report["safe_false_candidate_allowed"] is False
+    assert "SUSPEND_D_PARTIAL_UNIVERSE_COVERAGE" in report["unresolved_reason_counts"]
+
+
+def test_goal13c_price_coverage_blocked_even_when_pause_resolved():
+    result, writer = _build_goal13c_result(_FakeTushareBatchProvider(half_limit_coverage=True))
+    promotion_report = writer.json_payloads[result["output_object_keys"]["promotion_preflight_report"]]
+
+    assert promotion_report["status"] == "BLOCKED"
+    assert "INCOMPLETE_LIMIT_PRICE_COVERAGE" in promotion_report["blocked_reasons"]
+    assert promotion_report["standard_daily_price_write_performed"] is False
+    assert promotion_report["real_backtest_performed"] is False
+
+
+def test_goal13c_non_open_trade_dates_are_excluded_from_candidates():
+    result, writer = _build_goal13c_result(_FakeTushareBatchProvider(complete_limit_coverage=True, include_non_open_daily=True))
+    daily_candidate = writer.parquet_payloads[result["output_object_keys"]["daily_price_candidate_batch"]]
+    suspend_report = writer.json_payloads[result["output_object_keys"]["suspend_d_full_coverage_report"]]
+
+    assert result["trade_dates"] == TRADE_DATES
+    assert "2024-06-01" not in set(daily_candidate["trade_date"])
+    assert "2024-06-01" not in {item["trade_date"] for item in suspend_report["date_level_audit"]}
+
+
+def test_goal13c_cli_writes_preflight_reports_only_under_candidate_paths(monkeypatch, tmp_path, capsys):
+    import stock_selector.cli as cli_module
+
+    monkeypatch.setenv("STOCK_PARQUET_BACKEND", "local")
+    monkeypatch.setenv("STOCK_LOCAL_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("STOCK_TUSHARE_ENABLED", "true")
+    monkeypatch.setenv("TUSHARE_TOKEN", "fake-token")
+    monkeypatch.setattr(cli_module, "TushareProvider", lambda settings=None: _FakeTushareBatchProvider(complete_limit_coverage=True, empty_suspend_d=True))
+
+    exit_code = main(
+        [
+            "build-tushare-candidate-staging-batch",
+            "--start-date",
+            START_DATE,
+            "--end-date",
+            END_DATE,
+            "--codes",
+            "000001.SZ,600519.SH",
+            "--batch-id",
+            BATCH_ID,
+            "--sleep-seconds",
+            "0",
+            "--coverage-expansion",
+            "--fetch-semantics-audit",
+            "--goal13c-preflight",
+        ]
+    )
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["goal"] == "13C"
+    assert output["promotion_preflight_status"] == "READY_FOR_PROMOTION_VALIDATOR"
+    assert (tmp_path / output["suspend_d_full_coverage_report_key"]).exists()
+    assert (tmp_path / output["promotion_preflight_report_key"]).exists()
+    for object_key in _flatten_object_keys(output["output_object_keys"]):
+        assert object_key.startswith("candidate/tushare/")
+        assert not object_key.startswith("raw/")
+        assert "clean_daily_snapshot" not in object_key
+        assert "factor_daily" not in object_key
+        assert "selection_result" not in object_key
+        assert "backtest" not in object_key
+
+
 def test_goal13_cli_blocks_when_provider_disabled_or_token_missing(monkeypatch, capsys):
     monkeypatch.delenv("STOCK_TUSHARE_ENABLED", raising=False)
     monkeypatch.delenv("TUSHARE_TOKEN", raising=False)
@@ -727,6 +948,71 @@ class _MemoryWriter:
         return object_key
 
 
+def _build_goal13c_result(provider):
+    from stock_selector.data.tushare_candidate_staging_batch import build_tushare_candidate_staging_batch
+
+    writer = _MemoryWriter()
+    result = build_tushare_candidate_staging_batch(
+        start_date=START_DATE,
+        end_date=END_DATE,
+        codes=CODES,
+        provider=provider,
+        batch_id=BATCH_ID,
+        sleep_seconds=0,
+        coverage_expansion=True,
+        fetch_semantics_audit=True,
+        goal13c_preflight=True,
+        write_parquet_fn=writer.write_parquet,
+        write_json_fn=writer.write_json,
+        generated_at_fn=lambda: "2026-06-29T00:00:00Z",
+    )
+    return result, writer
+
+
+def _build_goal13c_from_reused_staging(frames):
+    from stock_selector.data.tushare_candidate_staging_batch import build_tushare_candidate_staging_batch
+
+    writer = _MemoryWriter()
+
+    def load_parquet(object_key):
+        if "trade_cal_staging" in object_key:
+            return frames["trade_cal"]
+        if "suspend_d_staging" in object_key:
+            return frames["suspend_d"]
+        for dataset in ("daily", "stk_limit", "adj_factor", "daily_basic"):
+            if f"{dataset}_staging" in object_key:
+                if "trade_date=2024-06-03" in object_key:
+                    return frames[dataset][frames[dataset]["trade_date"] == "20240603"].copy()
+                if "trade_date=2024-06-04" in object_key:
+                    return frames[dataset][frames[dataset]["trade_date"] == "20240604"].copy()
+        raise FileNotFoundError(object_key)
+
+    result = build_tushare_candidate_staging_batch(
+        start_date=START_DATE,
+        end_date=END_DATE,
+        codes=CODES,
+        provider=None,
+        batch_id=BATCH_ID,
+        sleep_seconds=0,
+        no_provider_call=True,
+        reuse_existing_staging=True,
+        coverage_expansion=True,
+        fetch_semantics_audit=True,
+        goal13c_preflight=True,
+        load_parquet_fn=load_parquet,
+        write_parquet_fn=writer.write_parquet,
+        write_json_fn=writer.write_json,
+        generated_at_fn=lambda: "2026-06-29T00:00:00Z",
+    )
+    return result, writer
+
+
+def _normalize_fixture_frame(frame, dataset):
+    from stock_selector.data.tushare_candidate_staging_batch import _normalize_dataset
+
+    return _normalize_dataset(frame, dataset)
+
+
 class _FakeTushareBatchProvider:
     def __init__(
         self,
@@ -740,6 +1026,8 @@ class _FakeTushareBatchProvider:
         half_adj_factor_coverage=False,
         sample_truncated_interfaces=None,
         transient_empty_calls=None,
+        suspend_d_empty_after_retries_dates=None,
+        include_non_open_daily=False,
     ):
         self.fail_interfaces = fail_interfaces or {}
         self.include_pathological_rows = include_pathological_rows
@@ -750,6 +1038,8 @@ class _FakeTushareBatchProvider:
         self.half_adj_factor_coverage = half_adj_factor_coverage
         self.sample_truncated_interfaces = set(sample_truncated_interfaces or ())
         self.transient_empty_calls = dict(transient_empty_calls or {})
+        self.suspend_d_empty_after_retries_dates = set(suspend_d_empty_after_retries_dates or ())
+        self.include_non_open_daily = include_non_open_daily
         self.calls = []
 
     def fetch_raw_endpoint_allow_empty(self, interface, **kwargs):
@@ -758,6 +1048,11 @@ class _FakeTushareBatchProvider:
             raise self.fail_interfaces[interface]
         if interface in self.empty_interfaces:
             return pd.DataFrame()
+        if interface == "suspend_d" and kwargs.get("trade_date") in self.suspend_d_empty_after_retries_dates:
+            frame = pd.DataFrame()
+            frame.attrs["empty_after_retries"] = True
+            frame.attrs["empty_after_retries_reason_code"] = "PROVIDER_EMPTY_AFTER_RETRIES"
+            return frame
         for key, remaining in list(self.transient_empty_calls.items()):
             empty_interface, field, value = key
             if interface == empty_interface and kwargs.get(field) == value and remaining > 0:
@@ -768,6 +1063,8 @@ class _FakeTushareBatchProvider:
             complete_limit_coverage=self.complete_limit_coverage,
             half_limit_coverage=self.half_limit_coverage,
             half_adj_factor_coverage=self.half_adj_factor_coverage,
+            empty_suspend_d=self.empty_suspend_d,
+            include_non_open_daily=self.include_non_open_daily,
         )
         if interface == "suspend_d" and self.empty_suspend_d:
             return pd.DataFrame()
@@ -788,8 +1085,23 @@ class _ProviderShouldNotBeConstructed:
         raise AssertionError("TushareProvider should not be constructed when --no-provider-call reuses staging")
 
 
-def _provider_frames(*, include_pathological_rows=False, complete_limit_coverage=False, half_limit_coverage=False, half_adj_factor_coverage=False):
+def _provider_frames(
+    *,
+    include_pathological_rows=False,
+    complete_limit_coverage=False,
+    half_limit_coverage=False,
+    half_adj_factor_coverage=False,
+    empty_suspend_d=False,
+    include_non_open_daily=False,
+):
     rows = []
+    if include_non_open_daily:
+        rows.extend(
+            [
+                _daily_row("000001.SZ", "20240601", 9.0, volume=1000.0, amount=9000.0),
+                _daily_row("600519.SH", "20240601", 1690.0, volume=2000.0, amount=19000.0),
+            ]
+        )
     for trade_date in ("20240603", "20240604"):
         rows.extend(
             [
@@ -862,7 +1174,9 @@ def _provider_frames(*, include_pathological_rows=False, complete_limit_coverage
                 for code in ("000001.SZ", "600519.SH", "000333.SZ")
             ]
         ),
-        "suspend_d": pd.DataFrame(
+        "suspend_d": pd.DataFrame()
+        if empty_suspend_d
+        else pd.DataFrame(
             [
                 {"ts_code": "000001.SZ", "trade_date": "20240603", "suspend_timing": "09:30:00", "suspend_type": "S"},
                 {"ts_code": "999999.SZ", "trade_date": "20240603", "suspend_timing": "09:30:00", "suspend_type": "S"},

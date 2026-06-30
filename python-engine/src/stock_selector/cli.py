@@ -419,6 +419,7 @@ def _cmd_build_tushare_candidate_staging_batch(args: argparse.Namespace) -> int:
         reuse_existing_staging=args.reuse_existing_staging,
         coverage_expansion=args.coverage_expansion,
         fetch_semantics_audit=args.fetch_semantics_audit,
+        goal13c_preflight=args.goal13c_preflight,
         load_parquet_fn=_load_tushare_candidate_batch_parquet,
         write_parquet_fn=_write_tushare_candidate_batch_parquet,
         write_json_fn=_write_tushare_candidate_batch_json,
@@ -939,7 +940,7 @@ def _tushare_candidate_staging_batch_cli_output(result: dict) -> dict:
     dq3_audit = result.get("dq3_readiness_audit", {})
     return {
         "provider": "tushare",
-        "goal": "13B",
+        "goal": result.get("goal", "13B"),
         "status": result["status"],
         "batch_id": result["batch_id"],
         "start_date": result["start_date"],
@@ -951,6 +952,8 @@ def _tushare_candidate_staging_batch_cli_output(result: dict) -> dict:
         "fetch_semantics_report_key": keys.get("fetch_semantics_report"),
         "coverage_gap_report_key": keys.get("coverage_gap_report"),
         "dq3_readiness_audit_key": keys.get("dq3_readiness_audit"),
+        "suspend_d_full_coverage_report_key": keys.get("suspend_d_full_coverage_report"),
+        "promotion_preflight_report_key": keys.get("promotion_preflight_report"),
         "daily_price_candidate_batch_key": keys.get("daily_price_candidate_batch"),
         "suspension_status_candidate_batch_key": keys.get("suspension_status_candidate_batch"),
         "output_object_keys": keys,
@@ -960,6 +963,7 @@ def _tushare_candidate_staging_batch_cli_output(result: dict) -> dict:
         "coverage_summary": result.get("coverage_summary", {}),
         "pause_status_counts": result.get("pause_status_counts", {}),
         "readiness_status": dq3_audit.get("status") or result["status"],
+        "promotion_preflight_status": result.get("promotion_preflight_status"),
         "ready_for_promotion_validator": result.get("ready_for_promotion_validator", False),
         "ready_for_dq3_promotion": result.get("ready_for_dq3_promotion", False),
         "blocked_reasons": result.get("blocked_reasons", []),
@@ -1177,6 +1181,7 @@ def build_parser() -> argparse.ArgumentParser:
     build_tushare_candidate_staging_batch.add_argument("--reuse-existing-staging", action="store_true")
     build_tushare_candidate_staging_batch.add_argument("--coverage-expansion", action="store_true")
     build_tushare_candidate_staging_batch.add_argument("--fetch-semantics-audit", action="store_true")
+    build_tushare_candidate_staging_batch.add_argument("--goal13c-preflight", action="store_true")
     build_tushare_candidate_staging_batch.add_argument("--fail-on-incomplete-critical-coverage", action="store_true")
     build_tushare_candidate_staging_batch.add_argument("--write-candidate", action="store_true", default=True)
     build_tushare_candidate_staging_batch.set_defaults(func=_cmd_build_tushare_candidate_staging_batch)
