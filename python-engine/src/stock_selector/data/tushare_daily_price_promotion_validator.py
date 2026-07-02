@@ -5,9 +5,11 @@ from typing import Any
 
 import pandas as pd
 
-from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame
+from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame, validate_stock_code
+from stock_selector.utils.date_validator import validate_date_range
 
 
+StandardDailyPriceReadFn = Callable[[str, str], pd.DataFrame | None]
 StandardDailyPriceWriteFn = Callable[[str, str, pd.DataFrame], str]
 GeneratedAtFn = Callable[[], str]
 
@@ -61,6 +63,16 @@ BLOCKED_REASON_CATALOG = (
     "IS_PAUSED_SOURCE_NOT_AUDITABLE",
     "BATCH_TOO_LARGE_FOR_GOAL14_SMALL_RANGE_VALIDATOR",
     "STANDARD_WRITE_REQUIRES_EXPLICIT_EXECUTE_FLAG",
+    "STANDARD_WRITE_REQUIRES_EXPLICIT_APPLY_FLAG",
+    "CANONICAL_DAILY_PRICE_READ_REQUIRED_FOR_APPLY",
+    "CANONICAL_DAILY_PRICE_DUPLICATE_KEYS_BEFORE_APPLY",
+    "CANONICAL_DAILY_PRICE_INVALID_BEFORE_APPLY",
+    "READ_BACK_ROW_COUNT_MISMATCH",
+    "READ_BACK_PROMOTED_ROW_COUNT_MISMATCH",
+    "READ_BACK_DUPLICATE_CANONICAL_KEYS",
+    "READ_BACK_TRADE_DATE_RANGE_MISMATCH",
+    "READ_BACK_SCHEMA_INVALID",
+    "READ_BACK_CANONICAL_SEMANTICS_INVALID",
     "STANDARD_SUSPENSION_STATUS_WRITE_NOT_ALLOWED_IN_GOAL14",
     "CLEAN_FACTOR_SELECTION_BACKTEST_NOT_ALLOWED_IN_GOAL14",
 )
@@ -89,6 +101,21 @@ ALLOWED_PAUSE_RESOLUTION_SOURCES = {
     "SUSPEND_D_EVENT_ROW",
     "SUSPEND_D_FULL_COVERAGE_MISS_AS_FALSE_CANDIDATE",
 }
+STANDARD_DAILY_PRICE_COLUMNS = (
+    "stock_code",
+    "trade_date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "pre_close",
+    "volume",
+    "amount",
+    "pct_chg",
+    "is_paused",
+    "limit_up",
+    "limit_down",
+)
 
 
 def build_tushare_daily_price_promotion_validator_output_keys(batch_id: str) -> dict[str, str]:
@@ -114,6 +141,11 @@ def build_tushare_daily_price_promotion_validator(
     max_rows: int = DEFAULT_MAX_ROWS,
     request_standard_write: bool = False,
     execute_standard_write: bool = False,
+    apply_standard_write: bool = False,
+    apply_codes: list[str] | None = None,
+    apply_start_date: str | None = None,
+    apply_end_date: str | None = None,
+    standard_daily_price_read_fn: StandardDailyPriceReadFn | None = None,
     standard_daily_price_write_fn: StandardDailyPriceWriteFn | None = None,
     generated_at_fn: GeneratedAtFn | None = None,
     source_object_keys: dict[str, str] | None = None,
@@ -122,9 +154,10 @@ def build_tushare_daily_price_promotion_validator(
     generated_at = generated_at_fn()
     batch_id = _validate_batch_id(batch_id)
     output_keys = build_tushare_daily_price_promotion_validator_output_keys(batch_id)
-    if execute_standard_write:
-        output_keys["standard_daily_price_promotion_execution_report"] = (
-            f"candidate/tushare/standard_daily_price_promotion_execution_report/batch_id={batch_id}/report.json"
+    apply_requested = bool(apply_standard_write or execute_standard_write)
+    if apply_requested:
+        output_keys["standard_daily_price_promotion_apply_report"] = (
+            f"candidate/tushare/standard_daily_price_promotion_apply_report/batch_id={batch_id}/report.json"
         )
     source_object_keys = dict(source_object_keys or _default_source_object_keys(batch_id))
 
@@ -138,6 +171,11 @@ def build_tushare_daily_price_promotion_validator(
     preflight_codes = list((promotion_preflight_report or {}).get("codes") or [])
     preflight_trade_dates = list((promotion_preflight_report or {}).get("trade_dates") or [])
     preflight_blocked_reasons = list((promotion_preflight_report or {}).get("blocked_reasons") or [])
+    apply_scope = _normalize_apply_scope(apply_codes, apply_start_date, apply_end_date)
+    preflight_codes = _filter_codes_for_scope(preflight_codes, apply_scope)
+    preflight_trade_dates = _filter_trade_dates_for_scope(preflight_trade_dates, apply_scope)
+    candidate = _filter_candidate_for_scope(candidate, apply_scope)
+    suspension_candidate = _filter_candidate_for_scope(suspension_candidate, apply_scope)
 
     if promotion_preflight_report is None:
         blocked_reasons.append("GOAL13C_PREFLIGHT_REPORT_MISSING")
@@ -190,10 +228,14 @@ def build_tushare_daily_price_promotion_validator(
     schema_contract_check = candidate_checks["schema_contract_check"]
     standard_daily_price_frames = candidate_checks["standard_daily_price_frames"]
 
-    if request_standard_write and not execute_standard_write:
+    if request_standard_write and not apply_requested:
         blocked_reasons.append("STANDARD_WRITE_REQUIRES_EXPLICIT_EXECUTE_FLAG")
-    if execute_standard_write and standard_daily_price_write_fn is None:
+        blocked_reasons.append("STANDARD_WRITE_REQUIRES_EXPLICIT_APPLY_FLAG")
+    if apply_requested and standard_daily_price_write_fn is None:
         blocked_reasons.append("STANDARD_WRITE_REQUIRES_EXPLICIT_EXECUTE_FLAG")
+        blocked_reasons.append("STANDARD_WRITE_REQUIRES_EXPLICIT_APPLY_FLAG")
+    if apply_requested and standard_daily_price_read_fn is None:
+        blocked_reasons.append("CANONICAL_DAILY_PRICE_READ_REQUIRED_FOR_APPLY")
 
     blocked_reasons = _dedupe(blocked_reasons)
     status = VALIDATOR_PASS if not blocked_reasons else BLOCKED
@@ -201,14 +243,36 @@ def build_tushare_daily_price_promotion_validator(
 
     standard_write_performed = False
     standard_write_results: list[dict[str, Any]] = []
-    if execute_standard_write and validation_passed_before_write and standard_daily_price_write_fn is not None:
-        for trade_date in sorted(standard_daily_price_frames):
-            frame = standard_daily_price_frames[trade_date]
-            object_key = standard_daily_price_write_fn("daily_price", trade_date, frame)
-            standard_write_results.append(
-                {"dataset": "daily_price", "trade_date": trade_date, "row_count": int(len(frame)), "object_key": object_key}
-            )
-        standard_write_performed = bool(standard_write_results)
+    apply_report = None
+    read_back_verification = None
+    upsert_summary = {"inserted_rows": 0, "updated_rows": 0, "unchanged_rows": 0}
+    if apply_requested:
+        apply_result = _apply_standard_daily_price(
+            validator_status_before_apply=status,
+            blocked_reasons_before_apply=blocked_reasons,
+            standard_daily_price_frames=standard_daily_price_frames,
+            standard_daily_price_read_fn=standard_daily_price_read_fn,
+            standard_daily_price_write_fn=standard_daily_price_write_fn,
+        )
+        standard_write_performed = apply_result["standard_write_performed"]
+        standard_write_results = apply_result["write_results"]
+        upsert_summary = apply_result["upsert_summary"]
+        read_back_verification = apply_result["read_back_verification"]
+        apply_blocked_reasons = apply_result["blocked_reasons"]
+        if apply_blocked_reasons:
+            blocked_reasons = _dedupe(blocked_reasons + apply_blocked_reasons)
+            status = BLOCKED
+        apply_report = _build_apply_report(
+            batch_id=batch_id,
+            generated_at=generated_at,
+            validator_status=status,
+            blocked_reasons=blocked_reasons,
+            standard_write_performed=standard_write_performed,
+            standard_write_results=standard_write_results,
+            idempotency_key=_idempotency_key(batch_id, candidate),
+            upsert_summary=upsert_summary,
+            read_back_verification=read_back_verification,
+        )
 
     dry_run_report = _build_dry_run_report(
         batch_id=batch_id,
@@ -218,20 +282,9 @@ def build_tushare_daily_price_promotion_validator(
         blocked_reasons=blocked_reasons,
         idempotency_key=_idempotency_key(batch_id, candidate),
     )
-    execution_report = None
-    if execute_standard_write:
-        execution_report = _build_execution_report(
-            batch_id=batch_id,
-            generated_at=generated_at,
-            validator_status=status,
-            blocked_reasons=blocked_reasons,
-            standard_write_performed=standard_write_performed,
-            standard_write_results=standard_write_results,
-            idempotency_key=dry_run_report["idempotency_key"],
-        )
     validator_report = {
         "schema_version": "goal14.daily_price_promotion_validator_report.v1",
-        "goal": "14",
+        "goal": "15" if apply_requested else "14",
         "provider": "tushare",
         "batch_id": batch_id,
         "generated_at": generated_at,
@@ -241,6 +294,7 @@ def build_tushare_daily_price_promotion_validator(
             "daily_price_candidate_batch": source_object_keys.get("daily_price_candidate_batch"),
             "suspension_status_candidate_batch": source_object_keys.get("suspension_status_candidate_batch"),
         },
+        "apply_scope": apply_scope,
         "small_range_guard": small_range_guard,
         "coverage_check": coverage_check,
         "pause_resolution_check": pause_resolution_check,
@@ -250,6 +304,9 @@ def build_tushare_daily_price_promotion_validator(
         "standard_daily_price_write_allowed_with_explicit_flag": validation_passed_before_write,
         "standard_daily_price_write_performed": standard_write_performed,
         "standard_daily_price_write_results": standard_write_results,
+        "standard_daily_price_apply_requested": apply_requested,
+        "read_back_verification": read_back_verification,
+        "upsert_summary": upsert_summary,
         "standard_suspension_status_write_performed": False,
         "clean_performed": False,
         "factor_performed": False,
@@ -264,21 +321,24 @@ def build_tushare_daily_price_promotion_validator(
         ],
     }
     return {
-        "goal": "14",
+        "goal": "15" if apply_requested else "14",
         "provider": "tushare",
         "batch_id": batch_id,
         "status": status,
         "output_object_keys": output_keys,
         "daily_price_promotion_validator_report": validator_report,
         "standard_daily_price_promotion_dry_run_report": dry_run_report,
-        "standard_daily_price_promotion_execution_report": execution_report,
+        "standard_daily_price_promotion_apply_report": apply_report,
         "blocked_reasons": blocked_reasons,
         "standard_daily_price_write_performed": standard_write_performed,
         "standard_suspension_status_write_performed": False,
         "real_backtest_performed": False,
         "clean_factor_selection_backtest_entered": False,
         "candidate_row_count": row_count,
+        "apply_scope": apply_scope,
         "standard_write_results": standard_write_results,
+        "upsert_summary": upsert_summary,
+        "read_back_verification": read_back_verification,
     }
 
 
@@ -303,6 +363,52 @@ def _build_coverage_check(promotion_preflight_report: dict[str, Any] | None) -> 
         "interfaces": details,
         "blocked_reasons": blocked,
     }
+
+
+def _normalize_apply_scope(codes: list[str] | None, start_date: str | None, end_date: str | None) -> dict[str, Any]:
+    normalized_codes = None
+    if codes is not None:
+        normalized_codes = [validate_stock_code(str(code).strip().upper()) for code in codes if str(code).strip()]
+    normalized_start = None
+    normalized_end = None
+    if start_date is not None or end_date is not None:
+        if start_date is None or end_date is None:
+            raise ValueError("apply_start_date and apply_end_date must be provided together")
+        normalized_start, normalized_end = validate_date_range(start_date, end_date)
+    return {
+        "codes": normalized_codes,
+        "start_date": normalized_start,
+        "end_date": normalized_end,
+    }
+
+
+def _filter_codes_for_scope(codes: list[str], scope: dict[str, Any]) -> list[str]:
+    if not scope.get("codes"):
+        return list(codes)
+    allowed = set(scope["codes"])
+    return [code for code in codes if code in allowed]
+
+
+def _filter_trade_dates_for_scope(trade_dates: list[str], scope: dict[str, Any]) -> list[str]:
+    start_date = scope.get("start_date")
+    end_date = scope.get("end_date")
+    if not start_date and not end_date:
+        return list(trade_dates)
+    return [trade_date for trade_date in trade_dates if start_date <= str(trade_date) <= end_date]
+
+
+def _filter_candidate_for_scope(candidate: pd.DataFrame | None, scope: dict[str, Any]) -> pd.DataFrame | None:
+    if candidate is None:
+        return None
+    filtered = candidate.copy()
+    if scope.get("codes") and "ts_code" in filtered.columns:
+        filtered = filtered[filtered["ts_code"].astype(str).isin(set(scope["codes"]))]
+    start_date = scope.get("start_date")
+    end_date = scope.get("end_date")
+    if start_date and end_date and "trade_date" in filtered.columns:
+        trade_dates = filtered["trade_date"].astype(str)
+        filtered = filtered[(trade_dates >= start_date) & (trade_dates <= end_date)]
+    return filtered.reset_index(drop=True)
 
 
 def _coverage_complete(coverage: dict[str, Any]) -> bool:
@@ -586,7 +692,99 @@ def _build_dry_run_report(
     }
 
 
-def _build_execution_report(
+def _apply_standard_daily_price(
+    *,
+    validator_status_before_apply: str,
+    blocked_reasons_before_apply: list[str],
+    standard_daily_price_frames: dict[str, pd.DataFrame],
+    standard_daily_price_read_fn: StandardDailyPriceReadFn | None,
+    standard_daily_price_write_fn: StandardDailyPriceWriteFn | None,
+) -> dict[str, Any]:
+    if validator_status_before_apply != VALIDATOR_PASS:
+        return {
+            "standard_write_performed": False,
+            "write_results": [],
+            "upsert_summary": {"inserted_rows": 0, "updated_rows": 0, "unchanged_rows": 0},
+            "read_back_verification": _empty_read_back_verification(False, blocked_reasons_before_apply),
+            "blocked_reasons": [],
+        }
+    if standard_daily_price_read_fn is None or standard_daily_price_write_fn is None:
+        blocked = []
+        if standard_daily_price_read_fn is None:
+            blocked.append("CANONICAL_DAILY_PRICE_READ_REQUIRED_FOR_APPLY")
+        if standard_daily_price_write_fn is None:
+            blocked.append("STANDARD_WRITE_REQUIRES_EXPLICIT_APPLY_FLAG")
+        return {
+            "standard_write_performed": False,
+            "write_results": [],
+            "upsert_summary": {"inserted_rows": 0, "updated_rows": 0, "unchanged_rows": 0},
+            "read_back_verification": _empty_read_back_verification(False, blocked),
+            "blocked_reasons": blocked,
+        }
+
+    blocked: list[str] = []
+    merged_frames: dict[str, pd.DataFrame] = {}
+    promoted_frames: dict[str, pd.DataFrame] = {}
+    upsert_summary = {"inserted_rows": 0, "updated_rows": 0, "unchanged_rows": 0}
+    for trade_date, promoted in sorted(standard_daily_price_frames.items()):
+        promoted = _normalize_canonical_daily_price_frame(promoted, trade_date)
+        promoted_frames[trade_date] = promoted
+        existing = standard_daily_price_read_fn("daily_price", trade_date)
+        existing = _normalize_canonical_daily_price_frame(existing, trade_date)
+        if not existing.empty and existing.duplicated(["stock_code", "trade_date"]).any():
+            blocked.append("CANONICAL_DAILY_PRICE_DUPLICATE_KEYS_BEFORE_APPLY")
+        if not existing.empty and _canonical_daily_price_validation_errors(existing, trade_date):
+            blocked.append("CANONICAL_DAILY_PRICE_INVALID_BEFORE_APPLY")
+        merged, summary = _merge_canonical_daily_price(existing, promoted)
+        if _canonical_daily_price_validation_errors(merged, trade_date):
+            blocked.append("CANONICAL_DAILY_PRICE_INVALID_BEFORE_APPLY")
+        merged_frames[trade_date] = merged
+        for key in upsert_summary:
+            upsert_summary[key] += summary[key]
+
+    blocked = _dedupe(blocked)
+    if blocked:
+        return {
+            "standard_write_performed": False,
+            "write_results": [],
+            "upsert_summary": upsert_summary,
+            "read_back_verification": _empty_read_back_verification(False, blocked),
+            "blocked_reasons": blocked,
+        }
+
+    write_results: list[dict[str, Any]] = []
+    for trade_date, merged in sorted(merged_frames.items()):
+        object_key = standard_daily_price_write_fn("daily_price", trade_date, merged)
+        write_results.append(
+            {
+                "dataset": "daily_price",
+                "trade_date": trade_date,
+                "promoted_row_count": int(len(promoted_frames[trade_date])),
+                "canonical_row_count": int(len(merged)),
+                "object_key": object_key,
+                "conflict_policy": "upsert_candidate_wins_by_stock_code_trade_date",
+            }
+        )
+
+    read_back_frames: dict[str, pd.DataFrame] = {}
+    for trade_date in sorted(merged_frames):
+        read_back = standard_daily_price_read_fn("daily_price", trade_date)
+        read_back_frames[trade_date] = _normalize_canonical_daily_price_frame(read_back, trade_date)
+    verification = _verify_standard_daily_price_read_back(
+        promoted_frames=promoted_frames,
+        expected_canonical_frames=merged_frames,
+        read_back_frames=read_back_frames,
+    )
+    return {
+        "standard_write_performed": bool(write_results),
+        "write_results": write_results,
+        "upsert_summary": upsert_summary,
+        "read_back_verification": verification,
+        "blocked_reasons": verification["blocked_reasons"],
+    }
+
+
+def _build_apply_report(
     *,
     batch_id: str,
     generated_at: str,
@@ -595,20 +793,26 @@ def _build_execution_report(
     standard_write_performed: bool,
     standard_write_results: list[dict[str, Any]],
     idempotency_key: str,
+    upsert_summary: dict[str, int],
+    read_back_verification: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    written_rows = sum(int(item.get("row_count", 0)) for item in standard_write_results)
+    read_back_verification = read_back_verification or _empty_read_back_verification(False, blocked_reasons)
     return {
-        "schema_version": "goal14.standard_daily_price_promotion_execution_report.v1",
-        "goal": "14",
+        "schema_version": "goal15.standard_daily_price_promotion_apply_report.v1",
+        "goal": "15",
         "provider": "tushare",
         "batch_id": batch_id,
         "generated_at": generated_at,
-        "mode": "EXECUTE",
+        "mode": "APPLY",
         "validator_status": validator_status,
         "target_table": "daily_price",
         "standard_write_performed": standard_write_performed,
-        "written_rows": written_rows,
+        "expected_promoted_rows": read_back_verification["expected_promoted_rows"],
+        "actual_promoted_rows": read_back_verification["actual_promoted_rows"],
+        "written_rows": sum(int(item.get("canonical_row_count", 0)) for item in standard_write_results),
+        "upsert_summary": upsert_summary,
         "write_results": standard_write_results,
+        "read_back_verification": read_back_verification,
         "idempotency_key": idempotency_key,
         "standard_suspension_status_write_performed": False,
         "clean_performed": False,
@@ -616,6 +820,181 @@ def _build_execution_report(
         "selection_performed": False,
         "real_backtest_performed": False,
         "blocked_reasons": blocked_reasons,
+    }
+
+
+def _normalize_canonical_daily_price_frame(frame: pd.DataFrame | None, trade_date: str) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=list(STANDARD_DAILY_PRICE_COLUMNS))
+    normalized = frame.copy()
+    if "trade_date" in normalized.columns:
+        normalized["trade_date"] = normalized["trade_date"].map(_normalize_date_value)
+    if "stock_code" in normalized.columns:
+        normalized["stock_code"] = normalized["stock_code"].astype(str)
+    return normalized.reset_index(drop=True)
+
+
+def _normalize_date_value(value) -> str:
+    if isinstance(value, pd.Timestamp):
+        return value.date().isoformat()
+    text = str(value)
+    if len(text) >= 10:
+        return text[:10]
+    return text
+
+
+def _merge_canonical_daily_price(existing: pd.DataFrame, promoted: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
+    existing = existing.copy().reset_index(drop=True)
+    promoted = promoted.copy().reset_index(drop=True)
+    promoted_keys = set(_canonical_key_records(promoted))
+    existing_key_to_row = {
+        key: existing.loc[index, list(STANDARD_DAILY_PRICE_COLUMNS)]
+        for index, key in enumerate(_canonical_key_records(existing))
+    }
+    summary = {"inserted_rows": 0, "updated_rows": 0, "unchanged_rows": 0}
+    for index, key in enumerate(_canonical_key_records(promoted)):
+        if key not in existing_key_to_row:
+            summary["inserted_rows"] += 1
+        elif _canonical_row_equal(existing_key_to_row[key], promoted.loc[index, list(STANDARD_DAILY_PRICE_COLUMNS)]):
+            summary["unchanged_rows"] += 1
+        else:
+            summary["updated_rows"] += 1
+
+    if existing.empty:
+        retained_existing = existing
+    else:
+        retained_existing = existing[~pd.Series(_canonical_key_records(existing)).isin(promoted_keys).to_numpy()]
+    if retained_existing.empty:
+        merged = promoted[list(STANDARD_DAILY_PRICE_COLUMNS)].copy()
+    else:
+        merged = pd.concat([retained_existing[list(STANDARD_DAILY_PRICE_COLUMNS)], promoted[list(STANDARD_DAILY_PRICE_COLUMNS)]], ignore_index=True)
+    if not merged.empty:
+        merged = merged.sort_values(["trade_date", "stock_code"]).reset_index(drop=True)
+    return merged, summary
+
+
+def _canonical_key_records(frame: pd.DataFrame) -> list[tuple[str, str]]:
+    if frame is None or frame.empty or not {"stock_code", "trade_date"}.issubset(frame.columns):
+        return []
+    return list(zip(frame["stock_code"].astype(str), frame["trade_date"].map(_normalize_date_value)))
+
+
+def _canonical_row_equal(left: pd.Series, right: pd.Series) -> bool:
+    for column in STANDARD_DAILY_PRICE_COLUMNS:
+        left_value = left[column]
+        right_value = right[column]
+        if pd.isna(left_value) and pd.isna(right_value):
+            continue
+        if isinstance(left_value, (int, float)) or isinstance(right_value, (int, float)):
+            try:
+                if float(left_value) == float(right_value):
+                    continue
+            except (TypeError, ValueError):
+                pass
+        if left_value != right_value:
+            return False
+    return True
+
+
+def _verify_standard_daily_price_read_back(
+    *,
+    promoted_frames: dict[str, pd.DataFrame],
+    expected_canonical_frames: dict[str, pd.DataFrame],
+    read_back_frames: dict[str, pd.DataFrame],
+) -> dict[str, Any]:
+    blocked: list[str] = []
+    expected_promoted_keys = set()
+    for promoted in promoted_frames.values():
+        expected_promoted_keys.update(_canonical_key_records(promoted))
+
+    actual_promoted_keys = set()
+    actual_promoted_dates = set()
+    expected_total_rows = 0
+    actual_total_rows = 0
+    for trade_date, expected in sorted(expected_canonical_frames.items()):
+        read_back = read_back_frames.get(trade_date, pd.DataFrame(columns=list(STANDARD_DAILY_PRICE_COLUMNS)))
+        expected_total_rows += int(len(expected))
+        actual_total_rows += int(len(read_back))
+        if len(expected) != len(read_back):
+            blocked.append("READ_BACK_ROW_COUNT_MISMATCH")
+        if {"stock_code", "trade_date"}.issubset(read_back.columns) and read_back.duplicated(["stock_code", "trade_date"]).any():
+            blocked.append("READ_BACK_DUPLICATE_CANONICAL_KEYS")
+        validation_errors = _canonical_daily_price_validation_errors(read_back, trade_date)
+        if "schema" in validation_errors:
+            blocked.append("READ_BACK_SCHEMA_INVALID")
+        if "semantics" in validation_errors:
+            blocked.append("READ_BACK_CANONICAL_SEMANTICS_INVALID")
+        for key in _canonical_key_records(read_back):
+            if key in expected_promoted_keys:
+                actual_promoted_keys.add(key)
+                actual_promoted_dates.add(key[1])
+
+    expected_trade_dates = sorted(promoted_frames)
+    if sorted(actual_promoted_dates) != expected_trade_dates:
+        blocked.append("READ_BACK_TRADE_DATE_RANGE_MISMATCH")
+    if len(actual_promoted_keys) != len(expected_promoted_keys):
+        blocked.append("READ_BACK_PROMOTED_ROW_COUNT_MISMATCH")
+    blocked = _dedupe(blocked)
+    return {
+        "passed": not blocked,
+        "expected_promoted_rows": int(len(expected_promoted_keys)),
+        "actual_promoted_rows": int(len(actual_promoted_keys)),
+        "expected_total_rows": int(expected_total_rows),
+        "actual_total_rows": int(actual_total_rows),
+        "expected_trade_dates": expected_trade_dates,
+        "actual_promoted_trade_dates": sorted(actual_promoted_dates),
+        "blocked_reasons": blocked,
+    }
+
+
+def _canonical_daily_price_validation_errors(frame: pd.DataFrame, trade_date: str) -> set[str]:
+    errors: set[str] = set()
+    if frame is None or frame.empty:
+        errors.add("schema")
+        return errors
+    missing = [column for column in STANDARD_DAILY_PRICE_COLUMNS if column not in frame.columns]
+    if missing:
+        errors.add("schema")
+        return errors
+    required = frame[list(STANDARD_DAILY_PRICE_COLUMNS)]
+    if required.isna().any().any():
+        errors.add("schema")
+    try:
+        validate_dataset_frame("daily_price", required, trade_date)
+    except (DataValidationError, ValueError, TypeError):
+        errors.add("schema")
+    numeric = required[["open", "high", "low", "close", "pre_close", "limit_up", "limit_down"]].apply(pd.to_numeric, errors="coerce")
+    if numeric.isna().any().any():
+        errors.add("schema")
+    elif bool(
+        (numeric[["open", "high", "low", "close", "pre_close"]] <= 0).any().any()
+        or (numeric["high"] < numeric["open"]).any()
+        or (numeric["high"] < numeric["close"]).any()
+        or (numeric["low"] > numeric["open"]).any()
+        or (numeric["low"] > numeric["close"]).any()
+        or (numeric["limit_up"] < numeric["close"]).any()
+        or (numeric["limit_down"] > numeric["close"]).any()
+    ):
+        errors.add("semantics")
+    if not required["is_paused"].map(_is_canonical_bool).all():
+        errors.add("semantics")
+    return errors
+
+
+def _is_canonical_bool(value) -> bool:
+    return isinstance(value, bool) or type(value).__name__ == "bool_"
+
+
+def _empty_read_back_verification(passed: bool, blocked_reasons: list[str]) -> dict[str, Any]:
+    return {
+        "passed": passed,
+        "expected_promoted_rows": 0,
+        "actual_promoted_rows": 0,
+        "expected_total_rows": 0,
+        "actual_total_rows": 0,
+        "expected_trade_dates": [],
+        "actual_promoted_trade_dates": [],
+        "blocked_reasons": _dedupe(blocked_reasons),
     }
 
 

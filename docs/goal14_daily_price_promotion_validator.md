@@ -42,15 +42,16 @@ python -m stock_selector.cli build-tushare-daily-price-promotion-validator `
   --goal14-max-rows 50
 ```
 
-Actual standard write is off by default. It requires:
+Actual standard write is off by default. Goal 15 requires:
 
 ```powershell
 python -m stock_selector.cli build-tushare-daily-price-promotion-validator `
   --batch-id <batch_id> `
-  --goal14-execute-standard-write
+  --apply
 ```
 
-The execute flag is intentionally explicit. Without it, Goal 14 writes only reports.
+The apply flag is intentionally explicit. Without it, the command writes only
+validator and dry-run reports.
 
 ## Outputs
 
@@ -70,19 +71,26 @@ goal14.standard_daily_price_promotion_dry_run_report.v1
 
 The dry-run report records `would_insert_rows`, `would_update_rows`, `would_skip_rows`, an idempotency key, `target_table=daily_price`, and `standard_write_performed=false`.
 
-When `--goal14-execute-standard-write` is explicitly provided and the validator passes, Goal 14 also writes:
+Goal 15 replaces the old write path with explicit `--apply` semantics. The
+apply contract, upsert behavior, and read-back verification are documented in
+`docs/goal15_tushare_daily_price_apply.md`.
+
+When `--apply` is explicitly provided and the validator passes, the command also writes:
 
 ```text
-candidate/tushare/standard_daily_price_promotion_execution_report/batch_id=<batch_id>/report.json
+candidate/tushare/standard_daily_price_promotion_apply_report/batch_id=<batch_id>/report.json
 ```
 
 with schema:
 
 ```text
-goal14.standard_daily_price_promotion_execution_report.v1
+goal15.standard_daily_price_promotion_apply_report.v1
 ```
 
-The execution report records target table, written rows, per-date write object keys, idempotency key, and the same downstream firewalls. The default validation path does not generate this execution report because no standard write is attempted.
+The apply report records target table, upsert counts, per-date write object
+keys, idempotency key, read-back verification, and the same downstream
+firewalls. The default validation path does not generate this apply report
+because no standard write is attempted.
 
 ## Validator Gates
 
@@ -145,8 +153,8 @@ After Goal 14, the accurate system status is:
 - Real Tushare candidate/staging coverage expansion is complete.
 - `suspend_d` full coverage audit and promotion preflight are complete.
 - Small-range standard `daily_price` promotion validator and default dry-run report are available.
-- Real standard `daily_price` write is possible only with the explicit execute flag and only after validator pass.
-- Explicit standard `daily_price` write emits a separate execution report.
+- Real standard `daily_price` write is possible only with the Goal 15 `--apply` flag and only after validator pass.
+- Explicit standard `daily_price` apply emits a separate apply report and read-back verification.
 - Real standard `suspension_status` write has not started.
 - Real clean/factor/selection/backtest has not started.
 

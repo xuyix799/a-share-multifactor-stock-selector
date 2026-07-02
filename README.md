@@ -2,7 +2,7 @@
 
 本仓库是一个本地 Docker 部署的 A股中长线多因子选股系统。当前系统已完成 Docker 本地 mock/offline 端到端闭环验证。Python CLI、PostgreSQL、MinIO、Spring Boot API 已在容器环境中联通，mock 数据可以完成 provider、raw、复权、clean snapshot、universe、factor_daily、selection_result、validate-selection 和 run-backtest，并可通过 Spring API 查询选股摘要和回测摘要。
 
-真实数据方面，AKShare、Baostock、Tushare 仍未进入真实选股或真实回测主链路。Tushare 的 `daily`、`stk_limit`、`adj_factor`、`daily_basic`、`trade_cal`、`suspend_d` 等关键接口已完成 smoke、candidate/staging、coverage expansion、`suspend_d` full coverage audit、promotion preflight 和 Goal 14 小范围 `daily_price` promotion validator；默认仍只生成 dry-run 报告，不写标准 `daily_price`。
+真实数据方面，AKShare、Baostock、Tushare 仍未进入真实选股或真实回测主链路。Tushare 的 `daily`、`stk_limit`、`adj_factor`、`daily_basic`、`trade_cal`、`suspend_d` 等关键接口已完成 smoke、candidate/staging、coverage expansion、`suspend_d` full coverage audit、promotion preflight、Goal 14 小范围 `daily_price` promotion validator 和 Goal 15 显式 `--apply` 小范围标准写入路径；默认仍只生成 dry-run 报告，不写标准 `daily_price`。
 
 系统定位：
 
@@ -36,7 +36,8 @@
 - Goal 13：Tushare 小范围 real-provider candidate/staging batch 与 DQ3 readiness audit；只写 `candidate/tushare/...` manifest、staging、candidate batch、coverage report 和 DQ3 audit，不写 standard `daily_price` / `suspension_status`，不进入真实选股或真实回测，详见 `docs/goal13_tushare_candidate_staging_batch_dq3_readiness.md`。
 - Goal 13B：新增 Tushare candidate batch coverage expansion 与 fetch semantics audit；真实数据仍未进入 standard `daily_price` 或真实回测主链路，详见 `docs/goal13B_tushare_candidate_batch_coverage_expansion.md`。Goal 13B 已在 `main` 形成稳定基线，基线提交为 `fadf8be` / `goal-13B-tushare-coverage-expansion-verified`。
 - Goal 13C：新增 `suspend_d` full coverage audit 与 promotion preflight；只有 date-level full event coverage 被确认时，`suspend_d` miss 才能生成 `false_candidate`，并且最多只能进入 `READY_FOR_PROMOTION_VALIDATOR`，不写 standard `daily_price` / standard `suspension_status`，不进入真实选股或真实回测，详见 `docs/goal13C_suspend_d_full_coverage_preflight.md`。
-- Goal 14：新增小范围 standard `daily_price` promotion validator；只读取 Goal 13C 产物，验证 `daily_price_candidate_batch` 是否满足标准 `daily_price` 契约并默认输出 dry-run 报告。标准写入必须显式传 `--goal14-execute-standard-write`，不写 standard `suspension_status`，不进入真实 clean/factor/selection/backtest，详见 `docs/goal14_daily_price_promotion_validator.md`。
+- Goal 14：新增小范围 standard `daily_price` promotion validator；只读取 Goal 13C 产物，验证 `daily_price_candidate_batch` 是否满足标准 `daily_price` 契约并默认输出 dry-run 报告。标准写入必须进入 Goal 15 并显式传 `--apply`，不写 standard `suspension_status`，不进入真实 clean/factor/selection/backtest，详见 `docs/goal14_daily_price_promotion_validator.md`。
+- Goal 15：新增安全 apply 模式；默认仍 dry-run，只有显式传 `--apply` 才会把已验证的 Tushare candidate 行按 code/date 小范围 upsert 到 canonical `raw/daily_price/...`，并执行 read-back verification。Goal 15 不自动启动 clean/factor/selection/backtest，详见 `docs/goal15_tushare_daily_price_apply.md`。
 - Goal 10B：AKShare / Baostock 最小真实数据 smoke，已验证 AKShare `benchmark_price` 可标准化写入 `smoke/akshare/...` 并通过 DuckDB 查询；字段不足的数据集不会绕过 validator 写入标准层。
 - Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke，新增 smoke-only `daily_price_raw_smoke`，只允许写入 `smoke/<provider>/daily_price_raw_smoke/...`，不进入标准 `raw/daily_price/...`。
 - Goal 12A：真实数据标准层契约与数据质量等级冻结，详见 `docs/goal12A_real_data_contract.md`；本阶段只新增契约、守门规则和测试，不接入真实 provider 主链路，不做真实回测。
@@ -431,21 +432,32 @@ candidate/tushare/standard_daily_price_promotion_dry_run_report/batch_id=<batch_
 
 小范围 guard 默认限制为 `max_codes=5`、`max_trade_days=10`、`max_rows=50`。validator 会阻断 preflight 未 ready、price coverage 不完整、`is_paused` 未解析、候选行缺字段、重复 code-date、非 open trade date、OHLC/成交量异常、`limit_up` / `limit_down` / `pre_close` / `is_paused` 来源不可审计等情况。
 
-标准 `daily_price` 写入必须显式传入：
+Goal 15 起，标准 `daily_price` 写入使用显式 `--apply`：
 
 ```powershell
 docker compose run --rm stock-python python -m stock_selector.cli build-tushare-daily-price-promotion-validator `
   --batch-id <batch_id> `
-  --goal14-execute-standard-write
+  --apply
 ```
 
-显式执行时会额外写入：
+可以进一步限制 apply 范围：
+
+```powershell
+docker compose run --rm stock-python python -m stock_selector.cli build-tushare-daily-price-promotion-validator `
+  --batch-id <batch_id> `
+  --apply `
+  --codes 000001.SZ,600519.SH `
+  --start-date 2024-06-03 `
+  --end-date 2024-06-04
+```
+
+显式 apply 时会额外写入：
 
 ```text
-candidate/tushare/standard_daily_price_promotion_execution_report/batch_id=<batch_id>/report.json
+candidate/tushare/standard_daily_price_promotion_apply_report/batch_id=<batch_id>/report.json
 ```
 
-即便显式执行，Goal 14 也只允许小范围、幂等、可审计地写 standard `daily_price`；不写 standard `suspension_status`，不启动 `clean_daily_snapshot`、`factor_input_table`、`factor_daily`、`selection_result` 或真实回测。
+即便显式 apply，Goal 15 也只允许小范围、幂等、可审计地 upsert standard `daily_price`；不写 standard `suspension_status`，不启动 `clean_daily_snapshot`、`factor_input_table`、`factor_daily`、`selection_result` 或真实回测。apply 后会 read-back verification：校验 promoted row count、canonical key 去重、trade_date 范围、必需字段、OHLC/pre_close、`is_paused` 和涨跌停语义。
 
 ## 幂等与重跑
 

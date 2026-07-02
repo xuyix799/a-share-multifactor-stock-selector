@@ -262,38 +262,170 @@ def test_goal14_requested_standard_write_requires_explicit_execute_flag():
     assert writer.calls == []
 
 
-def test_goal14_explicit_execute_writes_only_standard_daily_price_and_never_suspension_status_or_downstream():
+def test_goal15_apply_writes_validated_rows_with_readback_verification_and_preserves_existing_rows():
     from stock_selector.data.tushare_daily_price_promotion_validator import (
         build_tushare_daily_price_promotion_validator,
     )
 
-    writer = _StandardWriter()
+    store = _CanonicalDailyPriceStore()
+    existing = _standard_row("000002.SZ", "2024-06-03", 8.0)
+    store.seed("2024-06-03", pd.DataFrame([existing]))
+
     result = build_tushare_daily_price_promotion_validator(
         batch_id=BATCH_ID,
         promotion_preflight_report=_ready_preflight(),
         daily_price_candidate_batch=_candidate_frame(),
         suspension_status_candidate_batch=_suspension_candidate_frame(),
         request_standard_write=True,
-        execute_standard_write=True,
-        standard_daily_price_write_fn=writer.write,
+        apply_standard_write=True,
+        standard_daily_price_read_fn=store.read,
+        standard_daily_price_write_fn=store.write,
     )
 
     assert result["status"] == "VALIDATOR_PASS"
     assert result["standard_daily_price_write_performed"] is True
-    assert sorted(call["dataset"] for call in writer.calls) == ["daily_price", "daily_price"]
-    assert {call["trade_date"] for call in writer.calls} == set(TRADE_DATES)
-    assert all(call["frame"]["is_paused"].notna().all() for call in writer.calls)
-    execution_report = result["standard_daily_price_promotion_execution_report"]
-    assert execution_report["schema_version"] == "goal14.standard_daily_price_promotion_execution_report.v1"
-    assert execution_report["mode"] == "EXECUTE"
-    assert execution_report["target_table"] == "daily_price"
-    assert execution_report["standard_write_performed"] is True
-    assert execution_report["written_rows"] == 4
-    assert sorted(item["trade_date"] for item in execution_report["write_results"]) == TRADE_DATES
+    assert sorted(call["dataset"] for call in store.calls) == ["daily_price", "daily_price"]
+    assert {call["trade_date"] for call in store.calls} == set(TRADE_DATES)
+    apply_report = result["standard_daily_price_promotion_apply_report"]
+    assert apply_report["schema_version"] == "goal15.standard_daily_price_promotion_apply_report.v1"
+    assert apply_report["mode"] == "APPLY"
+    assert apply_report["target_table"] == "daily_price"
+    assert apply_report["standard_write_performed"] is True
+    assert apply_report["expected_promoted_rows"] == 4
+    assert apply_report["actual_promoted_rows"] == 4
+    assert apply_report["read_back_verification"]["passed"] is True
+    assert apply_report["upsert_summary"]["inserted_rows"] == 4
+    assert apply_report["upsert_summary"]["updated_rows"] == 0
+    assert apply_report["upsert_summary"]["unchanged_rows"] == 0
+    assert len(store.frames["2024-06-03"]) == 3
+    assert set(store.frames["2024-06-03"]["stock_code"]) == {"000001.SZ", "000002.SZ", "600519.SH"}
+    assert all(frame["is_paused"].notna().all() for frame in store.frames.values())
     assert result["standard_suspension_status_write_performed"] is False
     assert result["clean_factor_selection_backtest_entered"] is False
     assert "STANDARD_SUSPENSION_STATUS_WRITE_NOT_ALLOWED_IN_GOAL14" not in result["blocked_reasons"]
     assert "CLEAN_FACTOR_SELECTION_BACKTEST_NOT_ALLOWED_IN_GOAL14" not in result["blocked_reasons"]
+
+
+def test_goal15_apply_is_idempotent_when_replayed_against_existing_canonical_rows():
+    from stock_selector.data.tushare_daily_price_promotion_validator import (
+        build_tushare_daily_price_promotion_validator,
+    )
+
+    store = _CanonicalDailyPriceStore()
+    first = build_tushare_daily_price_promotion_validator(
+        batch_id=BATCH_ID,
+        promotion_preflight_report=_ready_preflight(),
+        daily_price_candidate_batch=_candidate_frame(),
+        suspension_status_candidate_batch=_suspension_candidate_frame(),
+        request_standard_write=True,
+        apply_standard_write=True,
+        standard_daily_price_read_fn=store.read,
+        standard_daily_price_write_fn=store.write,
+    )
+    second = build_tushare_daily_price_promotion_validator(
+        batch_id=BATCH_ID,
+        promotion_preflight_report=_ready_preflight(),
+        daily_price_candidate_batch=_candidate_frame(),
+        suspension_status_candidate_batch=_suspension_candidate_frame(),
+        request_standard_write=True,
+        apply_standard_write=True,
+        standard_daily_price_read_fn=store.read,
+        standard_daily_price_write_fn=store.write,
+    )
+
+    assert first["standard_daily_price_promotion_apply_report"]["read_back_verification"]["passed"] is True
+    assert second["standard_daily_price_promotion_apply_report"]["read_back_verification"]["passed"] is True
+    assert second["standard_daily_price_promotion_apply_report"]["upsert_summary"] == {
+        "inserted_rows": 0,
+        "updated_rows": 0,
+        "unchanged_rows": 4,
+    }
+    for frame in store.frames.values():
+        assert len(frame) == len(frame.drop_duplicates(["stock_code", "trade_date"]))
+
+
+def test_goal15_apply_can_limit_small_scope_by_code_list_and_trade_date_range():
+    from stock_selector.data.tushare_daily_price_promotion_validator import (
+        build_tushare_daily_price_promotion_validator,
+    )
+
+    store = _CanonicalDailyPriceStore()
+
+    result = build_tushare_daily_price_promotion_validator(
+        batch_id=BATCH_ID,
+        promotion_preflight_report=_ready_preflight(),
+        daily_price_candidate_batch=_candidate_frame(),
+        suspension_status_candidate_batch=_suspension_candidate_frame(),
+        request_standard_write=True,
+        apply_standard_write=True,
+        apply_codes=["000001.SZ"],
+        apply_start_date="2024-06-04",
+        apply_end_date="2024-06-04",
+        standard_daily_price_read_fn=store.read,
+        standard_daily_price_write_fn=store.write,
+    )
+
+    assert result["status"] == "VALIDATOR_PASS"
+    apply_report = result["standard_daily_price_promotion_apply_report"]
+    assert apply_report["expected_promoted_rows"] == 1
+    assert apply_report["actual_promoted_rows"] == 1
+    assert apply_report["upsert_summary"]["inserted_rows"] == 1
+    assert set(store.frames) == {"2024-06-04"}
+    assert store.frames["2024-06-04"]["stock_code"].tolist() == ["000001.SZ"]
+
+
+def test_goal15_apply_rejects_invalid_rows_without_polluting_canonical_daily_price():
+    from stock_selector.data.tushare_daily_price_promotion_validator import (
+        build_tushare_daily_price_promotion_validator,
+    )
+
+    store = _CanonicalDailyPriceStore()
+    invalid = _candidate_frame()
+    invalid.loc[0, "close"] = None
+
+    result = build_tushare_daily_price_promotion_validator(
+        batch_id=BATCH_ID,
+        promotion_preflight_report=_ready_preflight(),
+        daily_price_candidate_batch=invalid,
+        suspension_status_candidate_batch=_suspension_candidate_frame(),
+        request_standard_write=True,
+        apply_standard_write=True,
+        standard_daily_price_read_fn=store.read,
+        standard_daily_price_write_fn=store.write,
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert "MISSING_REQUIRED_DAILY_PRICE_FIELD" in result["blocked_reasons"]
+    assert result["standard_daily_price_write_performed"] is False
+    assert store.calls == []
+    assert store.frames == {}
+
+
+def test_goal15_apply_readback_verification_catches_mismatched_canonical_rows():
+    from stock_selector.data.tushare_daily_price_promotion_validator import (
+        build_tushare_daily_price_promotion_validator,
+    )
+
+    store = _CanonicalDailyPriceStore(drop_readback_code="600519.SH")
+
+    result = build_tushare_daily_price_promotion_validator(
+        batch_id=BATCH_ID,
+        promotion_preflight_report=_ready_preflight(),
+        daily_price_candidate_batch=_candidate_frame(),
+        suspension_status_candidate_batch=_suspension_candidate_frame(),
+        request_standard_write=True,
+        apply_standard_write=True,
+        standard_daily_price_read_fn=store.read,
+        standard_daily_price_write_fn=store.write,
+    )
+
+    assert result["status"] == "BLOCKED"
+    assert result["standard_daily_price_write_performed"] is True
+    assert "READ_BACK_PROMOTED_ROW_COUNT_MISMATCH" in result["blocked_reasons"]
+    verification = result["standard_daily_price_promotion_apply_report"]["read_back_verification"]
+    assert verification["passed"] is False
+    assert verification["expected_promoted_rows"] == 4
+    assert verification["actual_promoted_rows"] == 2
 
 
 def test_goal14_cli_writes_validator_and_dry_run_reports_under_candidate_paths(monkeypatch, tmp_path, capsys):
@@ -316,11 +448,39 @@ def test_goal14_cli_writes_validator_and_dry_run_reports_under_candidate_paths(m
     assert (tmp_path / validator_key).exists()
     assert (tmp_path / dry_run_key).exists()
     assert output["standard_daily_price_promotion_execution_report_key"] is None
+    assert output["standard_daily_price_promotion_apply_report_key"] is None
+    assert not (tmp_path / "raw" / "daily_price").exists()
     assert not validator_key.startswith("raw/")
     assert "suspension_status" not in dry_run_key
     assert "clean_daily_snapshot" not in json.dumps(output)
     assert "factor_daily" not in json.dumps(output)
     assert "selection_result" not in json.dumps(output)
+
+
+def test_goal15_cli_apply_upserts_canonical_daily_price_and_writes_apply_report(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("STOCK_PARQUET_BACKEND", "local")
+    monkeypatch.setenv("STOCK_LOCAL_DATA_DIR", str(tmp_path))
+    _write_goal13c_artifacts(tmp_path, BATCH_ID)
+
+    exit_code = main(["build-tushare-daily-price-promotion-validator", "--batch-id", BATCH_ID, "--apply"])
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["goal"] == "15"
+    assert output["status"] == "VALIDATOR_PASS"
+    assert output["mode"] == "APPLY"
+    assert output["standard_daily_price_write_performed"] is True
+    assert output["read_back_verification"]["passed"] is True
+    assert output["standard_daily_price_promotion_apply_report_key"] == (
+        f"candidate/tushare/standard_daily_price_promotion_apply_report/batch_id={BATCH_ID}/report.json"
+    )
+    for trade_date in TRADE_DATES:
+        canonical_path = tmp_path / "raw" / "daily_price" / f"trade_date={trade_date}" / "part.parquet"
+        assert canonical_path.exists()
+        frame = pd.read_parquet(canonical_path)
+        assert len(frame) == 2
+        assert len(frame.drop_duplicates(["stock_code", "trade_date"])) == 2
+    assert (tmp_path / output["standard_daily_price_promotion_apply_report_key"]).exists()
 
 
 def test_goal14_backward_compatibility_existing_goal13c_builder_still_emits_candidate_only_artifacts():
@@ -342,6 +502,47 @@ class _StandardWriter:
     def write(self, dataset, trade_date, frame):
         self.calls.append({"dataset": dataset, "trade_date": trade_date, "frame": frame.copy()})
         return f"raw/{dataset}/trade_date={trade_date}/part.parquet"
+
+
+class _CanonicalDailyPriceStore:
+    def __init__(self, *, drop_readback_code=None):
+        self.frames = {}
+        self.calls = []
+        self.drop_readback_code = drop_readback_code
+
+    def seed(self, trade_date, frame):
+        self.frames[trade_date] = frame.copy().reset_index(drop=True)
+
+    def read(self, dataset, trade_date):
+        assert dataset == "daily_price"
+        frame = self.frames.get(trade_date, pd.DataFrame())
+        if self.drop_readback_code and not frame.empty:
+            frame = frame[frame["stock_code"] != self.drop_readback_code]
+        return frame.copy().reset_index(drop=True)
+
+    def write(self, dataset, trade_date, frame):
+        assert dataset == "daily_price"
+        self.calls.append({"dataset": dataset, "trade_date": trade_date, "frame": frame.copy()})
+        self.frames[trade_date] = frame.copy().reset_index(drop=True)
+        return f"raw/{dataset}/trade_date={trade_date}/part.parquet"
+
+
+def _standard_row(code, trade_date, price):
+    return {
+        "stock_code": code,
+        "trade_date": trade_date,
+        "open": price,
+        "high": price + 1,
+        "low": price - 1,
+        "close": price + 0.5,
+        "pre_close": price - 0.5,
+        "volume": 1000.0,
+        "amount": 10000.0,
+        "pct_chg": round(((price + 0.5) - (price - 0.5)) / (price - 0.5) * 100, 6),
+        "is_paused": False,
+        "limit_up": price + 2,
+        "limit_down": price - 2,
+    }
 
 
 def _ready_preflight():

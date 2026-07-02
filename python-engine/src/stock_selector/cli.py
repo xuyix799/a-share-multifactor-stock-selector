@@ -447,6 +447,18 @@ def _cmd_build_tushare_daily_price_promotion_validator(args: argparse.Namespace)
     if args.goal14_max_rows <= 0:
         print("invalid input: goal14_max_rows must be positive", file=sys.stderr)
         return 2
+    if (args.start_date is None) ^ (args.end_date is None):
+        print("invalid input: start_date and end_date must be provided together", file=sys.stderr)
+        return 2
+    try:
+        apply_start_date = None
+        apply_end_date = None
+        if args.start_date is not None and args.end_date is not None:
+            apply_start_date, apply_end_date = validate_date_range(args.start_date, args.end_date)
+        apply_codes = _parse_codes_arg(args.codes) if args.codes else None
+    except (DateValidationError, DataValidationError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
 
     batch_id = args.batch_id
     source_object_keys = {
@@ -462,6 +474,7 @@ def _cmd_build_tushare_daily_price_promotion_validator(args: argparse.Namespace)
         print(json.dumps({"goal": "14", "provider": "tushare", "status": "BLOCKED", "batch_id": batch_id, "blocked_reasons": [str(exc)]}, ensure_ascii=False))
         return 1
 
+    apply_standard_write = bool(args.apply or args.goal14_execute_standard_write)
     result = build_tushare_daily_price_promotion_validator(
         batch_id=batch_id,
         promotion_preflight_report=promotion_preflight_report,
@@ -470,8 +483,13 @@ def _cmd_build_tushare_daily_price_promotion_validator(args: argparse.Namespace)
         max_codes=args.goal14_max_codes,
         max_trade_days=args.goal14_max_trade_days,
         max_rows=args.goal14_max_rows,
-        request_standard_write=args.goal14_execute_standard_write,
+        request_standard_write=apply_standard_write,
         execute_standard_write=args.goal14_execute_standard_write,
+        apply_standard_write=apply_standard_write,
+        apply_codes=apply_codes,
+        apply_start_date=apply_start_date,
+        apply_end_date=apply_end_date,
+        standard_daily_price_read_fn=_read_dataset_or_empty,
         standard_daily_price_write_fn=_write_dataset,
         source_object_keys=source_object_keys,
     )
@@ -484,10 +502,10 @@ def _cmd_build_tushare_daily_price_promotion_validator(args: argparse.Namespace)
         output_keys["standard_daily_price_promotion_dry_run_report"],
         result["standard_daily_price_promotion_dry_run_report"],
     )
-    if result.get("standard_daily_price_promotion_execution_report") is not None:
+    if result.get("standard_daily_price_promotion_apply_report") is not None:
         _write_tushare_candidate_batch_json(
-            output_keys["standard_daily_price_promotion_execution_report"],
-            result["standard_daily_price_promotion_execution_report"],
+            output_keys["standard_daily_price_promotion_apply_report"],
+            result["standard_daily_price_promotion_apply_report"],
         )
     output = _tushare_daily_price_promotion_validator_cli_output(result)
     print(json.dumps(output, ensure_ascii=False, default=str))
@@ -1046,20 +1064,25 @@ def _tushare_candidate_staging_batch_cli_output(result: dict) -> dict:
 def _tushare_daily_price_promotion_validator_cli_output(result: dict) -> dict:
     keys = result.get("output_object_keys", {})
     dry_run = result.get("standard_daily_price_promotion_dry_run_report", {})
+    apply_report = result.get("standard_daily_price_promotion_apply_report") or {}
+    read_back_verification = result.get("read_back_verification") or apply_report.get("read_back_verification")
     return {
         "provider": "tushare",
-        "goal": "14",
+        "goal": result.get("goal", "14"),
         "status": result["status"],
         "batch_id": result["batch_id"],
-        "mode": dry_run.get("mode", "DRY_RUN"),
+        "mode": apply_report.get("mode", dry_run.get("mode", "DRY_RUN")),
         "daily_price_promotion_validator_report_key": keys.get("daily_price_promotion_validator_report"),
         "standard_daily_price_promotion_dry_run_report_key": keys.get("standard_daily_price_promotion_dry_run_report"),
         "standard_daily_price_promotion_execution_report_key": keys.get("standard_daily_price_promotion_execution_report"),
+        "standard_daily_price_promotion_apply_report_key": keys.get("standard_daily_price_promotion_apply_report"),
         "output_object_keys": keys,
         "candidate_row_count": result.get("candidate_row_count", 0),
         "would_insert_rows": dry_run.get("would_insert_rows", 0),
         "would_update_rows": dry_run.get("would_update_rows", 0),
         "would_skip_rows": dry_run.get("would_skip_rows", 0),
+        "upsert_summary": result.get("upsert_summary", {}),
+        "read_back_verification": read_back_verification,
         "standard_daily_price_write_performed": result.get("standard_daily_price_write_performed", False),
         "standard_suspension_status_write_performed": result.get("standard_suspension_status_write_performed", False),
         "real_backtest_performed": result.get("real_backtest_performed", False),
@@ -1106,6 +1129,13 @@ def _read_dataset(dataset: str, trade_date: str) -> pd.DataFrame:
     with tempfile.TemporaryDirectory(prefix="stock-read-") as tmp:
         path = _materialize_dataset(dataset, trade_date, Path(tmp))
         return pd.read_parquet(path)
+
+
+def _read_dataset_or_empty(dataset: str, trade_date: str) -> pd.DataFrame:
+    try:
+        return _read_dataset(dataset, trade_date)
+    except FileNotFoundError:
+        return pd.DataFrame()
 
 
 def _materialize_dataset(dataset: str, trade_date: str, tmp_root: Path) -> Path:
@@ -1284,6 +1314,10 @@ def build_parser() -> argparse.ArgumentParser:
     build_tushare_daily_price_promotion_validator.add_argument("--goal14-max-codes", type=int, default=5)
     build_tushare_daily_price_promotion_validator.add_argument("--goal14-max-trade-days", type=int, default=10)
     build_tushare_daily_price_promotion_validator.add_argument("--goal14-max-rows", type=int, default=50)
+    build_tushare_daily_price_promotion_validator.add_argument("--apply", action="store_true")
+    build_tushare_daily_price_promotion_validator.add_argument("--codes")
+    build_tushare_daily_price_promotion_validator.add_argument("--start-date")
+    build_tushare_daily_price_promotion_validator.add_argument("--end-date")
     build_tushare_daily_price_promotion_validator.add_argument("--goal14-execute-standard-write", action="store_true")
     build_tushare_daily_price_promotion_validator.set_defaults(func=_cmd_build_tushare_daily_price_promotion_validator)
 
