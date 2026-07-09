@@ -2,7 +2,7 @@
 
 本仓库是一个本地 Docker 部署的 A股中长线多因子选股系统。当前系统已完成 Docker 本地 mock/offline 端到端闭环验证。Python CLI、PostgreSQL、MinIO、Spring Boot API 已在容器环境中联通，mock 数据可以完成 provider、raw、复权、clean snapshot、universe、factor_daily、selection_result、validate-selection 和 run-backtest，并可通过 Spring API 查询选股摘要和回测摘要。
 
-真实数据方面，AKShare、Baostock、Tushare 仍未进入真实选股或真实回测主链路。Tushare 的 `daily`、`stk_limit`、`adj_factor`、`daily_basic`、`trade_cal`、`suspend_d` 等关键接口已完成 smoke、candidate/staging、coverage expansion、`suspend_d` full coverage audit、promotion preflight、Goal 14 小范围 `daily_price` promotion validator、Goal 15 显式 `--apply` 小范围标准写入路径和 Goal 17 小批次 landing 编排；默认仍只生成 dry-run 报告，不写标准 `daily_price`。
+真实数据方面，AKShare、Baostock、Tushare 仍未进入真实选股或真实回测主链路。Tushare 的 `daily`、`stk_limit`、`adj_factor`、`daily_basic`、`trade_cal`、`suspend_d` 等关键接口已完成 smoke、candidate/staging、coverage expansion、`suspend_d` full coverage audit、promotion preflight、Goal 14 小范围 `daily_price` promotion validator、Goal 15 显式 `--apply` 小范围标准写入路径、Goal 17 小批次 `daily_price` landing 编排和 Goal 18 标准输入 landing；默认仍只生成 dry-run 报告，不写标准层。
 
 系统定位：
 
@@ -39,6 +39,7 @@
 - Goal 14：新增小范围 standard `daily_price` promotion validator；只读取 Goal 13C 产物，验证 `daily_price_candidate_batch` 是否满足标准 `daily_price` 契约并默认输出 dry-run 报告。标准写入必须进入 Goal 15 并显式传 `--apply`，不写 standard `suspension_status`，不进入真实 clean/factor/selection/backtest，详见 `docs/goal14_daily_price_promotion_validator.md`。
 - Goal 15：新增安全 apply 模式；默认仍 dry-run，只有显式传 `--apply` 才会把已验证的 Tushare candidate 行按 code/date 小范围 upsert 到 canonical `raw/daily_price/...`，并执行 read-back verification。Goal 15 不自动启动 clean/factor/selection/backtest，详见 `docs/goal15_tushare_daily_price_apply.md`。
 - Goal 17：新增小批次 Tushare `daily_price` landing 编排；默认不调用 provider、默认 dry-run，可复用已有 Goal 13C candidate/preflight 产物，或显式 `--provider-call` 小范围构建，再运行 Goal 14/15 validator/apply 路径。canonical 写入仍必须传 `--apply`，不写 standard `suspension_status`，不自动启动 clean/factor/selection/backtest，详见 `docs/goal17_tushare_small_batch_daily_price_landing.md`。
+- Goal 18：新增 Tushare master/fundamental/financial 标准输入 landing；默认不调用 provider、默认 dry-run，`daily_basic` 和通过 as-of 校验的 `financial` 只有显式 `--apply` 才可小范围写入 `raw/daily_basic/...` 和 `raw/financial/...`。`stock_basic` 当前快照和 ST 状态只写 candidate，不写 standard `stock_basic` / `st_history` / `suspension_status`，不自动启动 clean/factor/selection/backtest，详见 `docs/goal18_tushare_standard_inputs_landing.md`。
 - Goal 10B：AKShare / Baostock 最小真实数据 smoke，已验证 AKShare `benchmark_price` 可标准化写入 `smoke/akshare/...` 并通过 DuckDB 查询；字段不足的数据集不会绕过 validator 写入标准层。
 - Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke，新增 smoke-only `daily_price_raw_smoke`，只允许写入 `smoke/<provider>/daily_price_raw_smoke/...`，不进入标准 `raw/daily_price/...`。
 - Goal 12A：真实数据标准层契约与数据质量等级冻结，详见 `docs/goal12A_real_data_contract.md`；本阶段只新增契约、守门规则和测试，不接入真实 provider 主链路，不做真实回测。
@@ -46,7 +47,7 @@
 当前未实现：
 
 - 大范围真实标准 `daily_price` promotion。
-- 真实财务数据接入。
+- 大范围真实财务数据接入和真实财务主链路使用。
 - 真实 clean/factor/selection/backtest 主链路。
 - LLM 解释。
 - 复杂 Spring Boot 业务 API / 前端页面。
@@ -493,6 +494,35 @@ candidate/tushare/daily_price_small_batch_run_report/batch_id=<batch_id>/report.
 ```
 
 该报告记录 batch、请求范围、provider 是否启用、source artifact keys、candidate/preflight status、validator status、apply/read-back 结果、blocked reasons 和 downstream firewalls。Goal 17 不写 standard `suspension_status`，不启动 `clean_daily_snapshot`、`factor_input_table`、`factor_daily`、`selection_result` 或真实回测。
+
+### Tushare Goal 18 Standard Inputs Landing
+
+Goal 18 新增标准输入 landing 命令：
+
+```powershell
+docker compose run --rm stock-python python -m stock_selector.cli run-tushare-standard-inputs-small-batch `
+  --batch-id <batch_id> `
+  --codes 000001.SZ,600519.SH `
+  --start-date 2024-06-03 `
+  --end-date 2024-06-04
+```
+
+默认行为不调用 Tushare provider，只读取已有 staging 并写 run report。显式 provider 调用必须传 `--provider-call`，显式标准层写入必须额外传 `--apply`。
+
+Goal 18 标准写入边界：
+
+- `daily_basic`：通过覆盖、重复键、数值和标准 schema 校验后，可小范围 upsert 到 `raw/daily_basic/...`。
+- `financial`：只有严格满足标准字段并且 `announce_date <= start_date` 时，才可按 trade_date 小范围写入 `raw/financial/...`。
+- `stock_basic`：Tushare 当前快照不能声明为历史 stock universe，只写 candidate。
+- `st_history`：当前 ST/name 快照不能声明为历史 ST 区间，不写 standard `st_history` 或 `suspension_status`。
+
+Goal 18 报告路径：
+
+```text
+candidate/tushare/standard_inputs_run_report/batch_id=<batch_id>/report.json
+```
+
+该报告记录 batch、请求范围、provider/apply 状态、每个 dataset 的 source key、行数、校验状态、写入状态、blocked reason、DQ 标记、read-back verification 和 downstream firewalls。Goal 18 不启动 `clean_daily_snapshot`、`factor_input_table`、`factor_daily`、`selection_result` 或真实回测。
 
 ## 幂等与重跑
 
