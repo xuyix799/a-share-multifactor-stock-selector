@@ -21,6 +21,10 @@ from stock_selector.data.tushare_candidate_staging_batch import (
 from stock_selector.data.tushare_daily_price_promotion_validator import (
     build_tushare_daily_price_promotion_validator,
 )
+from stock_selector.data.tushare_daily_price_small_batch import (
+    build_tushare_daily_price_small_batch_blocked_result,
+    run_tushare_daily_price_small_batch,
+)
 from stock_selector.data.tushare_daily_price_candidate import (
     SmokeInput,
     build_dry_run_output_keys,
@@ -508,6 +512,89 @@ def _cmd_build_tushare_daily_price_promotion_validator(args: argparse.Namespace)
             result["standard_daily_price_promotion_apply_report"],
         )
     output = _tushare_daily_price_promotion_validator_cli_output(result)
+    print(json.dumps(output, ensure_ascii=False, default=str))
+    return 0 if result["status"] == "VALIDATOR_PASS" else 1
+
+
+def _cmd_run_tushare_daily_price_small_batch(args: argparse.Namespace) -> int:
+    if args.provider_call and args.no_provider_call:
+        print("invalid input: provider_call and no_provider_call cannot both be set", file=sys.stderr)
+        return 2
+    if args.max_codes <= 0:
+        print("invalid input: max_codes must be positive", file=sys.stderr)
+        return 2
+    if args.max_trade_days <= 0:
+        print("invalid input: max_trade_days must be positive", file=sys.stderr)
+        return 2
+    if args.max_rows <= 0:
+        print("invalid input: max_rows must be positive", file=sys.stderr)
+        return 2
+    if args.sleep_seconds < 0:
+        print("invalid input: sleep_seconds must be non-negative", file=sys.stderr)
+        return 2
+    try:
+        start_date, end_date = validate_date_range(args.start_date, args.end_date)
+        codes = _parse_codes_arg(args.codes)
+    except (DateValidationError, DataValidationError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    provider_call_enabled = bool(args.provider_call)
+    provider = None
+    if provider_call_enabled:
+        settings = load_settings()
+        try:
+            provider = TushareProvider(settings=settings)
+        except ProviderConfigurationError as exc:
+            status = _tushare_provider_config_status(exc)
+            result = build_tushare_daily_price_small_batch_blocked_result(
+                batch_id=args.batch_id,
+                start_date=start_date,
+                end_date=end_date,
+                codes=codes,
+                status=status,
+                blocked_reasons=[str(exc)],
+                provider_call_enabled=True,
+                reuse_existing_staging=args.reuse_existing_staging,
+                apply_standard_write=args.apply,
+                max_codes=args.max_codes,
+                max_trade_days=args.max_trade_days,
+                max_rows=args.max_rows,
+            )
+            _write_tushare_candidate_batch_json(
+                result["small_batch_run_report_key"],
+                result["small_batch_run_report"],
+            )
+            print(json.dumps(_tushare_daily_price_small_batch_cli_output(result), ensure_ascii=False, default=str))
+            return 1
+
+    try:
+        result = run_tushare_daily_price_small_batch(
+            batch_id=args.batch_id,
+            start_date=start_date,
+            end_date=end_date,
+            codes=codes,
+            provider=provider,
+            provider_call_enabled=provider_call_enabled,
+            reuse_existing_staging=args.reuse_existing_staging,
+            apply_standard_write=args.apply,
+            max_codes=args.max_codes,
+            max_trade_days=args.max_trade_days,
+            max_rows=args.max_rows,
+            sleep_seconds=args.sleep_seconds,
+            load_parquet_fn=_load_tushare_candidate_batch_parquet,
+            load_json_fn=_load_tushare_candidate_batch_json,
+            write_parquet_fn=_write_tushare_candidate_batch_parquet,
+            write_json_fn=_write_tushare_candidate_batch_json,
+            standard_daily_price_read_fn=_read_dataset_or_empty,
+            standard_daily_price_write_fn=_write_dataset,
+            cli_command=" ".join(sys.argv),
+        )
+    except (DateValidationError, DataValidationError, ValueError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    output = _tushare_daily_price_small_batch_cli_output(result)
     print(json.dumps(output, ensure_ascii=False, default=str))
     return 0 if result["status"] == "VALIDATOR_PASS" else 1
 
@@ -1091,6 +1178,32 @@ def _tushare_daily_price_promotion_validator_cli_output(result: dict) -> dict:
     }
 
 
+def _tushare_daily_price_small_batch_cli_output(result: dict) -> dict:
+    keys = result.get("output_object_keys", {})
+    return {
+        "provider": "tushare",
+        "goal": "17",
+        "status": result["status"],
+        "batch_id": result["batch_id"],
+        "mode": result.get("mode", "DRY_RUN"),
+        "small_batch_run_report_key": result.get("small_batch_run_report_key") or keys.get("small_batch_run_report"),
+        "daily_price_promotion_validator_report_key": result.get("daily_price_promotion_validator_report_key"),
+        "standard_daily_price_promotion_dry_run_report_key": result.get("standard_daily_price_promotion_dry_run_report_key"),
+        "standard_daily_price_promotion_apply_report_key": result.get("standard_daily_price_promotion_apply_report_key"),
+        "output_object_keys": keys,
+        "provider_call_requested": result.get("provider_call_requested", False),
+        "reused_existing_staging": result.get("reused_existing_staging", False),
+        "apply_requested": result.get("apply_requested", False),
+        "standard_daily_price_write_performed": result.get("standard_daily_price_write_performed", False),
+        "standard_suspension_status_write_performed": result.get("standard_suspension_status_write_performed", False),
+        "clean_factor_selection_backtest_entered": result.get("clean_factor_selection_backtest_entered", False),
+        "real_backtest_performed": result.get("real_backtest_performed", False),
+        "read_back_verification": result.get("read_back_verification"),
+        "upsert_summary": result.get("upsert_summary", {}),
+        "blocked_reasons": result.get("blocked_reasons", []),
+    }
+
+
 def _has_incomplete_critical_coverage(result: dict) -> bool:
     blocking = {
         "INCOMPLETE_DAILY_COVERAGE",
@@ -1320,6 +1433,21 @@ def build_parser() -> argparse.ArgumentParser:
     build_tushare_daily_price_promotion_validator.add_argument("--end-date")
     build_tushare_daily_price_promotion_validator.add_argument("--goal14-execute-standard-write", action="store_true")
     build_tushare_daily_price_promotion_validator.set_defaults(func=_cmd_build_tushare_daily_price_promotion_validator)
+
+    run_tushare_daily_price_small_batch = subparsers.add_parser("run-tushare-daily-price-small-batch")
+    run_tushare_daily_price_small_batch.add_argument("--batch-id", required=True)
+    run_tushare_daily_price_small_batch.add_argument("--codes", default=",".join(DEFAULT_GOAL13_CODES))
+    run_tushare_daily_price_small_batch.add_argument("--start-date", required=True)
+    run_tushare_daily_price_small_batch.add_argument("--end-date", required=True)
+    run_tushare_daily_price_small_batch.add_argument("--apply", action="store_true")
+    run_tushare_daily_price_small_batch.add_argument("--provider-call", action="store_true")
+    run_tushare_daily_price_small_batch.add_argument("--no-provider-call", action="store_true")
+    run_tushare_daily_price_small_batch.add_argument("--reuse-existing-staging", action="store_true")
+    run_tushare_daily_price_small_batch.add_argument("--max-codes", type=int, default=5)
+    run_tushare_daily_price_small_batch.add_argument("--max-trade-days", type=int, default=10)
+    run_tushare_daily_price_small_batch.add_argument("--max-rows", type=int, default=50)
+    run_tushare_daily_price_small_batch.add_argument("--sleep-seconds", type=float, default=12.0)
+    run_tushare_daily_price_small_batch.set_defaults(func=_cmd_run_tushare_daily_price_small_batch)
 
     validate_provider_data = subparsers.add_parser("validate-provider-data")
     validate_provider_data.add_argument("--trade-date", required=True)
