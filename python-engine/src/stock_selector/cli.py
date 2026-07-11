@@ -14,6 +14,7 @@ from stock_selector.cleaning.snapshot_validator import validate_clean_daily_snap
 from stock_selector.config.config_loader import load_factor_weights_config, load_settings
 from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame, validate_stock_code
 from stock_selector.data.mock_data import generate_mock_dataset
+from stock_selector.data.real_clean_inputs_landing import run_real_clean_inputs_small_batch
 from stock_selector.data.tushare_candidate_staging_batch import (
     build_tushare_candidate_staging_batch,
     build_tushare_candidate_staging_batch_blocked_report,
@@ -46,6 +47,7 @@ from stock_selector.data.update_log import create_update_log_repository
 from stock_selector.factors.factor_pipeline import build_factor_daily_for_date
 from stock_selector.factors.factor_validator import validate_factor_daily
 from stock_selector.providers.base import ProviderConfigurationError
+from stock_selector.providers.akshare_provider import AKShareProvider
 from stock_selector.providers.provider_factory import list_providers
 from stock_selector.providers.schema_contract import inspect_schema
 from stock_selector.providers.schema_mapper import SchemaMappingError, normalize_date, normalize_stock_code
@@ -685,6 +687,77 @@ def _cmd_run_tushare_standard_inputs_small_batch(args: argparse.Namespace) -> in
     return 0 if result["status"] == "VALIDATION_PASS" else 1
 
 
+def _cmd_run_real_clean_inputs_small_batch(args: argparse.Namespace) -> int:
+    if args.provider_call and args.no_provider_call:
+        print("invalid input: provider_call and no_provider_call cannot both be set", file=sys.stderr)
+        return 2
+    if args.max_codes <= 0:
+        print("invalid input: max_codes must be positive", file=sys.stderr)
+        return 2
+    if args.max_trade_days <= 0:
+        print("invalid input: max_trade_days must be positive", file=sys.stderr)
+        return 2
+    if args.max_rows <= 0:
+        print("invalid input: max_rows must be positive", file=sys.stderr)
+        return 2
+    if args.sleep_seconds < 0:
+        print("invalid input: sleep_seconds must be non-negative", file=sys.stderr)
+        return 2
+    try:
+        start_date, end_date = validate_date_range(args.start_date, args.end_date)
+        codes = _parse_codes_arg(args.codes)
+    except (DateValidationError, DataValidationError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    provider_call_enabled = bool(args.provider_call)
+    adj_factor_provider = None
+    benchmark_provider = None
+    provider_errors = {}
+    if provider_call_enabled:
+        settings = load_settings()
+        try:
+            adj_factor_provider = TushareProvider(settings=settings)
+        except ProviderConfigurationError as exc:
+            provider_errors["adj_factor"] = str(exc)
+        try:
+            benchmark_provider = AKShareProvider(settings=settings)
+        except ProviderConfigurationError as exc:
+            provider_errors["benchmark_price"] = str(exc)
+
+    try:
+        result = run_real_clean_inputs_small_batch(
+            batch_id=args.batch_id,
+            start_date=start_date,
+            end_date=end_date,
+            codes=codes,
+            adj_factor_provider=adj_factor_provider,
+            benchmark_provider=benchmark_provider,
+            provider_errors=provider_errors,
+            provider_call_enabled=provider_call_enabled,
+            reuse_existing_staging=args.reuse_existing_staging,
+            apply_standard_write=args.apply,
+            max_codes=args.max_codes,
+            max_trade_days=args.max_trade_days,
+            max_rows=args.max_rows,
+            sleep_seconds=args.sleep_seconds,
+            load_parquet_fn=_load_tushare_candidate_batch_parquet,
+            load_json_fn=_load_tushare_candidate_batch_json,
+            write_parquet_fn=_write_tushare_candidate_batch_parquet,
+            write_json_fn=_write_tushare_candidate_batch_json,
+            standard_read_fn=_read_dataset_or_empty,
+            standard_write_fn=_write_dataset,
+            cli_command=" ".join(sys.argv),
+        )
+    except (DateValidationError, DataValidationError, ValueError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    output = _real_clean_inputs_small_batch_cli_output(result)
+    print(json.dumps(output, ensure_ascii=False, default=str))
+    return 0 if result["status"] in {"READY", "READY_FOR_APPLY"} else 1
+
+
 def _cmd_validate_provider_data(args: argparse.Namespace) -> int:
     try:
         trade_date = validate_trade_date(args.trade_date)
@@ -1313,6 +1386,30 @@ def _tushare_standard_inputs_small_batch_cli_output(result: dict) -> dict:
     }
 
 
+def _real_clean_inputs_small_batch_cli_output(result: dict) -> dict:
+    keys = result.get("output_object_keys", {})
+    return {
+        "goal": "20",
+        "status": result["status"],
+        "batch_id": result["batch_id"],
+        "mode": result.get("mode", "DRY_RUN"),
+        "provider_call_requested": result.get("provider_call_requested", False),
+        "reused_existing_staging": result.get("reused_existing_staging", False),
+        "apply_requested": result.get("apply_requested", False),
+        "standard_writes_performed": result.get("standard_writes_performed", False),
+        "ready_for_apply": result.get("ready_for_apply", False),
+        "ready_for_clean": result.get("ready_for_clean", False),
+        "readiness_report_key": result.get("readiness_report_key") or keys.get("readiness_report"),
+        "manifest_key": result.get("manifest_key") or keys.get("manifest"),
+        "output_object_keys": keys,
+        "upsert_summary": result.get("upsert_summary", {}),
+        "read_back_verification": result.get("read_back_verification"),
+        "clean_factor_selection_backtest_entered": result.get("clean_factor_selection_backtest_entered", False),
+        "real_backtest_performed": result.get("real_backtest_performed", False),
+        "blocked_reasons": result.get("blocked_reasons", []),
+    }
+
+
 def _has_incomplete_critical_coverage(result: dict) -> bool:
     blocking = {
         "INCOMPLETE_DAILY_COVERAGE",
@@ -1572,6 +1669,21 @@ def build_parser() -> argparse.ArgumentParser:
     run_tushare_standard_inputs_small_batch.add_argument("--max-rows", type=int, default=50)
     run_tushare_standard_inputs_small_batch.add_argument("--sleep-seconds", type=float, default=12.0)
     run_tushare_standard_inputs_small_batch.set_defaults(func=_cmd_run_tushare_standard_inputs_small_batch)
+
+    run_real_clean_inputs_small_batch = subparsers.add_parser("run-real-clean-inputs-small-batch")
+    run_real_clean_inputs_small_batch.add_argument("--batch-id", required=True)
+    run_real_clean_inputs_small_batch.add_argument("--codes", default=",".join(DEFAULT_GOAL13_CODES[:5]))
+    run_real_clean_inputs_small_batch.add_argument("--start-date", required=True)
+    run_real_clean_inputs_small_batch.add_argument("--end-date", required=True)
+    run_real_clean_inputs_small_batch.add_argument("--apply", action="store_true")
+    run_real_clean_inputs_small_batch.add_argument("--provider-call", action="store_true")
+    run_real_clean_inputs_small_batch.add_argument("--no-provider-call", action="store_true")
+    run_real_clean_inputs_small_batch.add_argument("--reuse-existing-staging", action="store_true")
+    run_real_clean_inputs_small_batch.add_argument("--max-codes", type=int, default=5)
+    run_real_clean_inputs_small_batch.add_argument("--max-trade-days", type=int, default=5)
+    run_real_clean_inputs_small_batch.add_argument("--max-rows", type=int, default=100)
+    run_real_clean_inputs_small_batch.add_argument("--sleep-seconds", type=float, default=12.0)
+    run_real_clean_inputs_small_batch.set_defaults(func=_cmd_run_real_clean_inputs_small_batch)
 
     validate_provider_data = subparsers.add_parser("validate-provider-data")
     validate_provider_data.add_argument("--trade-date", required=True)

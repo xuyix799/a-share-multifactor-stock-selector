@@ -24,7 +24,7 @@ def validate_stock_code(stock_code: str) -> str:
 def validate_dataset_frame(dataset: str, df: pd.DataFrame, trade_date: str) -> None:
     dataset = validate_dataset(dataset)
     trade_date = validate_trade_date(trade_date)
-    if df.empty:
+    if df.empty and dataset != "st_history":
         raise DataValidationError(f"{dataset} is empty")
 
     validators = {
