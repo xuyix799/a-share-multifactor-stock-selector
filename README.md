@@ -2,7 +2,7 @@
 
 本仓库是一个本地 Docker 部署的 A股中长线多因子选股系统。当前系统已完成 Docker 本地 mock/offline 端到端闭环验证。Python CLI、PostgreSQL、MinIO、Spring Boot API 已在容器环境中联通，mock 数据可以完成 provider、raw、复权、clean snapshot、universe、factor_daily、selection_result、validate-selection 和 run-backtest，并可通过 Spring API 查询选股摘要和回测摘要。
 
-真实数据方面，AKShare、Baostock、Tushare 仍未进入真实选股或真实回测主链路。Tushare 的 `daily`、`stk_limit`、`adj_factor`、`daily_basic`、`trade_cal`、`suspend_d` 等关键接口已完成 smoke、candidate/staging、coverage expansion、`suspend_d` full coverage audit、promotion preflight、Goal 14 小范围 `daily_price` promotion validator、Goal 15 显式 `--apply` 小范围标准写入路径、Goal 17 小批次 `daily_price` landing 编排和 Goal 18 标准输入 landing；Goal 20 进一步统一审计真实 clean 所需七项输入，并只在历史语义、覆盖、DQ、写入和读回全部可信时声明 ready。默认仍不访问 provider、不写标准层，也不启动真实 clean/选股/回测。
+真实数据方面，AKShare、Baostock、Tushare 仍未进入真实选股或真实回测主链路。Tushare 的 `daily`、`stk_limit`、`adj_factor`、`daily_basic`、`trade_cal`、`suspend_d` 等关键接口已完成 smoke、candidate/staging、coverage expansion、`suspend_d` full coverage audit、promotion preflight、Goal 14 小范围 `daily_price` promotion validator、Goal 15 显式 `--apply` 小范围标准写入路径、Goal 17 小批次 `daily_price` landing 编排和 Goal 18 标准输入 landing；Goal 20 进一步统一审计真实 clean 所需七项输入，Goal 21 则补充五至十年及单日增量所需的确定性、可恢复历史回填框架。只有历史语义、覆盖、DQ、写入和读回全部可信时才能声明对应范围 ready；默认仍不访问 provider、不写标准层，也不启动真实 clean/选股/回测。
 
 系统定位：
 
@@ -41,6 +41,7 @@
 - Goal 17：新增小批次 Tushare `daily_price` landing 编排；默认不调用 provider、默认 dry-run，可复用已有 Goal 13C candidate/preflight 产物，或显式 `--provider-call` 小范围构建，再运行 Goal 14/15 validator/apply 路径。canonical 写入仍必须传 `--apply`，不写 standard `suspension_status`，不自动启动 clean/factor/selection/backtest，详见 `docs/goal17_tushare_small_batch_daily_price_landing.md`。
 - Goal 18：新增 Tushare master/fundamental/financial 标准输入 landing；默认不调用 provider、默认 dry-run，`daily_basic` 和通过 as-of 校验的 `financial` 只有显式 `--apply` 才可小范围写入 `raw/daily_basic/...` 和 `raw/financial/...`。`stock_basic` 当前快照和 ST 状态只写 candidate，不写 standard `stock_basic` / `st_history` / `suspension_status`，不自动启动 clean/factor/selection/backtest，详见 `docs/goal18_tushare_standard_inputs_landing.md`。
 - Goal 20：新增真实 clean 所需七项标准输入统一 readiness 审计，覆盖 `stock_basic`、`daily_price`、`adj_factor`、`daily_basic`、`financial`、`st_history` 和 `benchmark_price`。默认不调用 provider、默认 dry-run；provider 访问必须显式传 `--provider-call`，标准写入必须显式传 `--apply`。当前快照、smoke-only benchmark、不可读历史证据或任一缺失/语义不可靠输入都会保持 blocked，不启动 clean/factor/selection/backtest，详见 `docs/goal20_real_clean_input_readiness.md`。
+- Goal 21：新增七项标准输入的确定性、可恢复历史回填框架，支持五至十年规划和单日增量、按数据集切块、不可变 attempt staging、chunk checkpoint、默认 resume、幂等 canonical upsert 与读回核验。命令默认 plan-only、不会构造或调用 provider；provider 和标准写入仍分别要求 `--provider-call`、`--apply`。当前 live adapter 无法证明历史语义的输入保持 blocked，本轮不声称已经完成真实十年抓取，也不启动 clean/factor/selection/backtest，详见 `docs/goal21_historical_backfill.md`。
 - Goal 10B：AKShare / Baostock 最小真实数据 smoke，已验证 AKShare `benchmark_price` 可标准化写入 `smoke/akshare/...` 并通过 DuckDB 查询；字段不足的数据集不会绕过 validator 写入标准层。
 - Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke，新增 smoke-only `daily_price_raw_smoke`，只允许写入 `smoke/<provider>/daily_price_raw_smoke/...`，不进入标准 `raw/daily_price/...`。
 - Goal 12A：真实数据标准层契约与数据质量等级冻结，详见 `docs/goal12A_real_data_contract.md`；本阶段只新增契约、守门规则和测试，不接入真实 provider 主链路，不做真实回测。
@@ -564,6 +565,66 @@ candidate/real_clean_inputs/st_history_interval_staging/batch_id=<batch_id>/cove
 ```
 
 `st_history` 在确实没有任何区间行时可以保持空集，但必须由 `coverage.json` 和可读 upstream 空集 evidence 共同证明全 code/date 覆盖；不会为了通过非空校验伪造 ST 行。`ready_for_apply=true` 只表示七项均已有可信 canonical 或已验证、可安全写入的来源；`ready_for_clean=true` 还要求七项 canonical 在请求范围内完整读回并逐值匹配。任一输入缺失、语义不可信、写入/读回失败时 readiness 为 `false`。Goal 20 不调用 `build_clean_daily_snapshot`，也不启动 universe、factor、selection 或 backtest。
+
+### Goal 21 Resumable Historical Backfill
+
+Goal 21 为 Goal 20 的七项输入补充历史回填控制面：
+
+```text
+stock_basic daily_price adj_factor daily_basic financial st_history benchmark_price
+```
+
+默认命令只生成不可变 plan 和 root manifest，不构造 provider、不访问 provider 网络、不写 staging Parquet 或 canonical：
+
+```powershell
+docker compose build stock-python
+docker compose run --rm stock-python python -m stock_selector.cli run-real-history-backfill `
+  --run-id <run_id> `
+  --start-date 2019-01-01 `
+  --end-date 2024-12-31 `
+  --codes 000001.SZ,600519.SH
+```
+
+单日增量使用新的 `run_id`，并把起止日期设为同一天；下面仍是安全的 plan-only，审核 plan 后才按需追加显式门禁：
+
+```powershell
+docker compose run --rm stock-python python -m stock_selector.cli run-real-history-backfill `
+  --run-id goal21-2025-01-02 `
+  --start-date 2025-01-02 `
+  --end-date 2025-01-02 `
+  --universe-key raw/universe/history.parquet
+```
+
+必须提供 `--run-id`、起止日期，以及互斥的 `--codes` 或安全 `.parquet` `--universe-key`。默认 `--resume`；可显式传 `--no-resume` 或 `--force`，但它们不会自动打开 provider/写入门禁。三个 planner 批量参数及默认值为：
+
+```text
+--code-batch-size 10
+--date-batch-days 31
+--report-period-months 3
+```
+
+四种模式彼此清晰隔离：
+
+| 模式 | 参数 | 行为 |
+| --- | --- | --- |
+| plan-only | 无 opt-in | 只写 control artifacts；无 provider 调用、无 canonical 写入 |
+| provider-only | `--provider-call` | 写不可变 attempt staging；不写 `raw/...` |
+| apply-only | `--apply` | 不访问 provider，只消费已核验 staging；缺失/不匹配则 blocked |
+| combined | `--provider-call --apply` | 先 staging，再校验、幂等 upsert 和 canonical read-back |
+
+控制产物位于：
+
+```text
+candidate/real_history_backfill/run_id=<run_id>/plan.json
+candidate/real_history_backfill/run_id=<run_id>/manifest.json
+candidate/real_history_backfill/run_id=<run_id>/dataset=<dataset>/chunk_id=<chunk_id>/manifest.json
+candidate/real_history_backfill/run_id=<run_id>/dataset=<dataset>/chunk_id=<chunk_id>/attempt=<attempt>/report.json
+candidate/real_history_backfill/run_id=<run_id>/dataset=<dataset>/chunk_id=<chunk_id>/attempt=<attempt>/part.parquet
+```
+
+canonical 仍为 `raw/<dataset>/trade_date=YYYY-MM-DD/part.parquet`，由单写者串行执行 atomic、幂等 upsert 和读回核验。运维上禁止并发运行同一 `run_id`，也禁止并发执行会覆盖同一 canonical partition 的 `--apply` 作业；atomic replace 只能防止半写对象，不能防止两个进程 read-merge-write 时丢失彼此更新。当前内置 live 路由只在证据完整时接受 Tushare 的 `daily_price` / `adj_factor` / `daily_basic`；AKShare contract 虽只允许三指数 `benchmark_price`，但当前 CLI 尚无可证明完整语义的公开历史 range adapter，因此 live benchmark 仍 blocked，smoke 产物不会被冒充正式历史。当前 `stock_basic` 快照、未解决字段/单位语义的 `financial`、当前名称/状态倒推的 `st_history` 同样保持 `SEMANTIC_SOURCE_UNAVAILABLE`。Goal 21 不宣称已完成真实十年抓取；Goal 20 继续负责七输入 readiness，Goal 25 负责补齐完整 live capability。
+
+所有 chunk manifest 都保留 source、row count、schema、DQ、coverage、checksum、validation、write/read-back、failure category 和 state；敏感 token/credential 会被脱敏。`--resume` 只有在 staging checksum 和 canonical evidence 均匹配时才跳过，`--force` 也不能绕过显式门禁或历史语义校验。下游 `clean_daily_snapshot`、factor、selection、backtest 防火墙始终关闭。完整说明见 `docs/goal21_historical_backfill.md`。
 
 ## 幂等与重跑
 

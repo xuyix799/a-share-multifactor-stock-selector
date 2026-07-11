@@ -13,6 +13,11 @@ from stock_selector.cleaning.clean_pipeline import build_adjusted_price_for_date
 from stock_selector.cleaning.snapshot_validator import validate_clean_daily_snapshot
 from stock_selector.config.config_loader import load_factor_weights_config, load_settings
 from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame, validate_stock_code
+from stock_selector.data.historical_backfill import (
+    BackfillPlanningError,
+    build_history_backfill_plan,
+    run_real_history_backfill,
+)
 from stock_selector.data.mock_data import generate_mock_dataset
 from stock_selector.data.real_clean_inputs_landing import run_real_clean_inputs_small_batch
 from stock_selector.data.tushare_candidate_staging_batch import (
@@ -48,6 +53,7 @@ from stock_selector.factors.factor_pipeline import build_factor_daily_for_date
 from stock_selector.factors.factor_validator import validate_factor_daily
 from stock_selector.providers.base import ProviderConfigurationError
 from stock_selector.providers.akshare_provider import AKShareProvider
+from stock_selector.providers.historical_provider import HistoricalProviderRouter
 from stock_selector.providers.provider_factory import list_providers
 from stock_selector.providers.schema_contract import inspect_schema
 from stock_selector.providers.schema_mapper import SchemaMappingError, normalize_date, normalize_stock_code
@@ -72,6 +78,7 @@ from stock_selector.storage.postgres_client import create_postgres_client
 from stock_selector.universe.universe_pipeline import build_universe_inputs_for_date
 from stock_selector.utils.date_validator import DateValidationError, validate_date_range, validate_trade_date
 from stock_selector.utils.logger import get_logger
+from stock_selector.utils.path_validator import safe_object_key
 
 logger = get_logger(__name__)
 
@@ -758,6 +765,64 @@ def _cmd_run_real_clean_inputs_small_batch(args: argparse.Namespace) -> int:
     return 0 if result["status"] in {"READY", "READY_FOR_APPLY"} else 1
 
 
+def _cmd_run_real_history_backfill(args: argparse.Namespace) -> int:
+    limits = {
+        "code_batch_size": args.code_batch_size,
+        "date_batch_days": args.date_batch_days,
+        "report_period_months": args.report_period_months,
+    }
+    invalid_limit = next((name for name, value in limits.items() if value <= 0), None)
+    if invalid_limit is not None:
+        print(f"invalid input: {invalid_limit} must be positive", file=sys.stderr)
+        return 2
+
+    try:
+        universe_frame = None
+        universe_key = None
+        codes = None
+        if args.codes is not None:
+            codes = _parse_history_codes(args.codes)
+        else:
+            universe_key = _validate_history_universe_key(args.universe_key)
+            universe_frame = _load_history_universe_frame(universe_key)
+
+        plan = build_history_backfill_plan(
+            run_id=args.run_id,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            codes=codes,
+            universe_frame=universe_frame,
+            universe_key=universe_key,
+            code_batch_size=args.code_batch_size,
+            date_batch_days=args.date_batch_days,
+            report_period_months=args.report_period_months,
+        )
+        fetch_chunk_fn = _build_history_fetch_chunk_fn(plan) if args.provider_call else None
+        canonical_read_fn = _read_history_canonical if args.apply else None
+        canonical_write_fn = _write_dataset if args.apply else None
+        result = run_real_history_backfill(
+            plan=plan,
+            artifact_read_json_fn=_load_tushare_candidate_batch_json,
+            artifact_write_json_fn=_write_tushare_candidate_batch_json,
+            artifact_read_parquet_fn=_load_tushare_candidate_batch_parquet,
+            artifact_write_parquet_fn=_write_tushare_candidate_batch_parquet,
+            fetch_chunk_fn=fetch_chunk_fn,
+            canonical_read_fn=canonical_read_fn,
+            canonical_write_fn=canonical_write_fn,
+            provider_call_enabled=args.provider_call,
+            apply_standard_write=args.apply,
+            resume=args.resume,
+            force=args.force,
+        )
+    except (BackfillPlanningError, DateValidationError, DataValidationError, ValueError, FileNotFoundError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    output = _real_history_backfill_cli_output(result)
+    print(json.dumps(output, ensure_ascii=False, default=str))
+    return 0 if output["status"] in {"DRY_RUN", "STAGED", "COMPLETED"} else 1
+
+
 def _cmd_validate_provider_data(args: argparse.Namespace) -> int:
     try:
         trade_date = validate_trade_date(args.trade_date)
@@ -1435,6 +1500,160 @@ def _parse_codes_arg(value: str | None) -> list[str]:
     return codes or list(DEFAULT_GOAL13_CODES)
 
 
+def _parse_history_codes(value: str | None) -> list[str]:
+    if not isinstance(value, str):
+        raise ValueError("codes must be provided explicitly")
+    codes = []
+    for item in value.split(","):
+        code = item.strip().upper()
+        if code:
+            codes.append(validate_stock_code(code))
+    if not codes:
+        raise ValueError("codes must contain at least one stock code")
+    return codes
+
+
+def _validate_history_universe_key(value: str | None) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("universe_key must be a non-empty Parquet object key")
+    if value != value.strip():
+        raise ValueError("universe_key must not contain leading or trailing whitespace")
+    if len(value) >= 2 and value[0].isalpha() and value[1] == ":":
+        raise ValueError("universe_key must not use a drive-qualified path")
+    normalized = safe_object_key(value)
+    if not normalized.lower().endswith(".parquet"):
+        raise ValueError("universe_key must reference a .parquet object")
+    return normalized
+
+
+def _load_history_universe_frame(object_key: str) -> pd.DataFrame:
+    return _load_tushare_candidate_batch_parquet(object_key)
+
+
+def _build_history_fetch_chunk_fn(plan: dict):
+    provider_holder: dict[str, TushareProvider] = {}
+    router_holder: dict[str, HistoricalProviderRouter] = {}
+
+    def provider() -> TushareProvider:
+        if "tushare" not in provider_holder:
+            provider_holder["tushare"] = TushareProvider(settings=load_settings())
+        return provider_holder["tushare"]
+
+    def raw_fetch(endpoint: str, parameters: dict) -> pd.DataFrame:
+        frame = provider().fetch_raw_endpoint_allow_empty(endpoint, **parameters)
+        if endpoint == "suspend_d":
+            compact = str(parameters.get("trade_date", ""))
+            frame.attrs.update(
+                {
+                    "full_market_event_set": True,
+                    "coverage_complete": not frame.empty,
+                    "sample_truncated": False,
+                    "empty_after_retries": frame.empty,
+                    "covered_trade_dates": [compact] if compact else [],
+                }
+            )
+        return frame
+
+    def trading_calendar(start_date: str, end_date: str) -> pd.DataFrame:
+        return provider().fetch_raw_endpoint_allow_empty(
+            "trade_cal",
+            exchange="SSE",
+            start_date=start_date.replace("-", ""),
+            end_date=end_date.replace("-", ""),
+            fields="cal_date,is_open",
+        )
+
+    # The shipped live route is deliberately narrow: Tushare has audited
+    # historical semantics for daily_price, adj_factor and daily_basic only.
+    # The router returns explicit SEMANTIC_SOURCE_UNAVAILABLE evidence for the
+    # remaining datasets instead of constructing current/smoke substitutes.
+    def fetch_chunk(chunk: dict):
+        if "tushare" not in router_holder:
+            router_holder["tushare"] = HistoricalProviderRouter(
+                plan=plan,
+                provider_name="tushare",
+                raw_fetch_fn=raw_fetch,
+                trading_calendar_fn=trading_calendar,
+            )
+        return router_holder["tushare"].fetch_chunk(chunk)
+
+    return fetch_chunk
+
+
+def _real_history_backfill_cli_output(result: dict) -> dict:
+    gates = result.get("gates", {})
+    provider_requested = gates.get("provider_call_enabled") is True
+    apply_requested = gates.get("apply_standard_write") is True
+    if provider_requested and apply_requested:
+        mode = "PROVIDER_AND_APPLY"
+    elif provider_requested:
+        mode = "PROVIDER_ONLY"
+    elif apply_requested:
+        mode = "APPLY_ONLY"
+    else:
+        mode = "PLAN_ONLY"
+
+    summary = result.get("summary", {})
+    counts = summary.get("state_counts", {})
+    planned = int(summary.get("planned", 0))
+    if not provider_requested and not apply_requested:
+        status = "DRY_RUN"
+    elif int(counts.get("INTERRUPTED", 0)) > 0:
+        status = "INTERRUPTED"
+    elif int(counts.get("FAILED", 0)) > 0:
+        status = "FAILED"
+    elif int(counts.get("BLOCKED", 0)) > 0:
+        status = "BLOCKED"
+    elif apply_requested and summary.get("canonical_ready") is True:
+        status = "COMPLETED"
+    elif provider_requested and not apply_requested and (
+        int(counts.get("STAGED", 0)) + int(counts.get("COMPLETED", 0)) == planned
+    ):
+        status = "STAGED"
+    else:
+        status = "INCOMPLETE"
+
+    gaps = summary.get("gaps", [])
+    blocked_reasons = sorted(
+        {
+            str(gap.get("reason"))
+            for gap in gaps
+            if isinstance(gap, dict) and gap.get("reason")
+        }
+    )
+    failure_categories = sorted(
+        {
+            str(gap.get("category"))
+            for gap in gaps
+            if isinstance(gap, dict) and gap.get("category")
+        }
+    )
+    return {
+        "goal": result.get("goal", "Goal 21 resumable historical backfill"),
+        "status": status,
+        "mode": mode,
+        "run_id": result.get("run_id"),
+        "plan_fingerprint": result.get("plan_fingerprint"),
+        "provider_call_requested": provider_requested,
+        "apply_requested": apply_requested,
+        "resume": gates.get("resume") is True,
+        "force": gates.get("force") is True,
+        "plan_key": result.get("plan_key"),
+        "root_manifest_key": result.get("root_manifest_key"),
+        "planned_chunks": planned,
+        "state_counts": counts,
+        "completion_rate": summary.get("completion_rate", 0.0),
+        "canonical_ready": summary.get("canonical_ready") is True,
+        "attempted_chunk_count": len(result.get("attempted_chunk_ids", [])),
+        "skipped_chunk_count": len(result.get("skipped_chunk_ids", [])),
+        "reconciled_chunk_count": len(result.get("reconciled_chunk_ids", [])),
+        "blocked_reasons": blocked_reasons,
+        "failure_categories": failure_categories,
+        "gap_count": len(gaps),
+        "downstream_firewalls": result.get("downstream_firewalls", {}),
+    }
+
+
 def _tushare_provider_config_status(exc: ProviderConfigurationError) -> str:
     message = str(exc).lower()
     if "disabled" in message:
@@ -1455,6 +1674,13 @@ def _read_dataset_or_empty(dataset: str, trade_date: str) -> pd.DataFrame:
         return _read_dataset(dataset, trade_date)
     except FileNotFoundError:
         return pd.DataFrame()
+
+
+def _read_history_canonical(dataset: str, trade_date: str) -> pd.DataFrame | None:
+    try:
+        return _read_dataset(dataset, trade_date)
+    except FileNotFoundError:
+        return None
 
 
 def _materialize_dataset(dataset: str, trade_date: str, tmp_root: Path) -> Path:
@@ -1684,6 +1910,27 @@ def build_parser() -> argparse.ArgumentParser:
     run_real_clean_inputs_small_batch.add_argument("--max-rows", type=int, default=100)
     run_real_clean_inputs_small_batch.add_argument("--sleep-seconds", type=float, default=12.0)
     run_real_clean_inputs_small_batch.set_defaults(func=_cmd_run_real_clean_inputs_small_batch)
+
+    run_real_history_backfill = subparsers.add_parser(
+        "run-real-history-backfill",
+        allow_abbrev=False,
+    )
+    run_real_history_backfill.add_argument("--run-id", required=True)
+    run_real_history_backfill.add_argument("--start-date", required=True)
+    run_real_history_backfill.add_argument("--end-date", required=True)
+    history_scope = run_real_history_backfill.add_mutually_exclusive_group(required=True)
+    history_scope.add_argument("--codes")
+    history_scope.add_argument("--universe-key")
+    run_real_history_backfill.add_argument("--provider-call", action="store_true")
+    run_real_history_backfill.add_argument("--apply", action="store_true")
+    history_resume = run_real_history_backfill.add_mutually_exclusive_group()
+    history_resume.add_argument("--resume", dest="resume", action="store_true")
+    history_resume.add_argument("--no-resume", dest="resume", action="store_false")
+    run_real_history_backfill.add_argument("--force", action="store_true")
+    run_real_history_backfill.add_argument("--code-batch-size", type=int, default=10)
+    run_real_history_backfill.add_argument("--date-batch-days", type=int, default=31)
+    run_real_history_backfill.add_argument("--report-period-months", type=int, default=3)
+    run_real_history_backfill.set_defaults(resume=True, func=_cmd_run_real_history_backfill)
 
     validate_provider_data = subparsers.add_parser("validate-provider-data")
     validate_provider_data.add_argument("--trade-date", required=True)
