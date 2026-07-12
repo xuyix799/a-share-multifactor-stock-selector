@@ -1,4 +1,5 @@
 import os
+import hashlib
 from time import sleep
 
 import pandas as pd
@@ -10,6 +11,8 @@ from stock_selector.utils.date_validator import validate_trade_date
 
 
 GOAL10_TUSHARE_DATASETS = ("stock_basic", "daily_price", "adj_factor", "daily_basic")
+TUSHARE_SUSPEND_PAGE_SIZE = 5000
+TUSHARE_SUSPEND_MAX_PAGES = 100
 
 
 class TushareProvider(ExternalProviderSkeleton):
@@ -85,6 +88,14 @@ class TushareProvider(ExternalProviderSkeleton):
         return self._fetch(endpoint, **kwargs)
 
     def fetch_raw_endpoint_allow_empty(self, endpoint: str, **kwargs) -> pd.DataFrame:
+        if (
+            endpoint == "suspend_d"
+            and kwargs.get("trade_date")
+            and not kwargs.get("ts_code")
+            and not kwargs.get("start_date")
+            and not kwargs.get("end_date")
+        ):
+            return self._fetch_suspend_d_allow_empty(**kwargs)
         method = getattr(self._pro, endpoint)
         try:
             df = self._run_tushare_call(lambda: method(**kwargs))
@@ -93,6 +104,104 @@ class TushareProvider(ExternalProviderSkeleton):
         if df is None:
             return pd.DataFrame()
         return df.copy()
+
+    def _fetch_suspend_d_allow_empty(self, **kwargs) -> pd.DataFrame:
+        method = getattr(self._pro, "suspend_d")
+        base_parameters = dict(kwargs)
+        base_parameters.pop("offset", None)
+        base_parameters.pop("limit", None)
+        pages: list[pd.DataFrame] = []
+        page_rows: list[int] = []
+        seen_pages: set[str] = set()
+        sticky_truncated = False
+        sticky_incomplete = False
+        sticky_empty_after_retries = False
+        seen_event_keys: set[tuple[str, ...]] = set()
+        terminal_page = False
+
+        for page_number in range(TUSHARE_SUSPEND_MAX_PAGES):
+            parameters = dict(
+                base_parameters,
+                limit=TUSHARE_SUSPEND_PAGE_SIZE,
+                offset=page_number * TUSHARE_SUSPEND_PAGE_SIZE,
+            )
+            try:
+                raw = self._run_tushare_call(lambda: method(**parameters))
+            except Exception as exc:
+                raise ProviderFetchError(f"tushare suspend_d fetch failed: {exc}") from exc
+            page = pd.DataFrame() if raw is None else raw.copy(deep=True)
+            page.attrs = {} if raw is None else dict(raw.attrs)
+            sticky_truncated = sticky_truncated or page.attrs.get("sample_truncated") is True
+            sticky_incomplete = sticky_incomplete or page.attrs.get("coverage_complete") is False
+            sticky_empty_after_retries = (
+                sticky_empty_after_retries
+                or page.attrs.get("empty_after_retries") is True
+            )
+            fingerprint = hashlib.sha256(
+                (
+                    repr(list(page.columns))
+                    + "\n"
+                    + page.to_json(orient="split", date_format="iso", force_ascii=True)
+                ).encode("utf-8")
+            ).hexdigest()
+            if page_number > 0 and fingerprint in seen_pages and len(page) > 0:
+                raise ProviderFetchError("tushare suspend_d pagination did not advance")
+            seen_pages.add(fingerprint)
+            natural_key_columns = [
+                column
+                for column in ("ts_code", "trade_date", "suspend_type")
+                if column in page.columns
+            ]
+            if not page.empty and natural_key_columns:
+                page_event_keys = [
+                    tuple(str(value) for value in row)
+                    for row in page.loc[:, natural_key_columns].itertuples(index=False, name=None)
+                ]
+                if (
+                    len(page_event_keys) != len(set(page_event_keys))
+                    or any(key in seen_event_keys for key in page_event_keys)
+                ):
+                    raise ProviderFetchError(
+                        "tushare suspend_d pagination contains overlapping event keys"
+                    )
+                seen_event_keys.update(page_event_keys)
+            pages.append(page)
+            page_rows.append(int(len(page)))
+            if len(page) < TUSHARE_SUSPEND_PAGE_SIZE:
+                terminal_page = True
+                break
+        if not terminal_page:
+            raise ProviderFetchError("tushare suspend_d pagination did not reach a terminal page")
+
+        if not pages:
+            result = pd.DataFrame()
+        elif len(pages) == 1:
+            result = pages[0].copy(deep=True)
+        else:
+            result = pd.concat(pages, ignore_index=True)
+        compact = str(base_parameters["trade_date"]).replace("-", "")
+        coverage_complete = bool(
+            terminal_page
+            and not sticky_truncated
+            and not sticky_incomplete
+            and not sticky_empty_after_retries
+        )
+        result.attrs.update(
+            {
+                "full_market_event_set": coverage_complete,
+                "coverage_complete": coverage_complete,
+                "sample_truncated": sticky_truncated,
+                "empty_after_retries": sticky_empty_after_retries,
+                "covered_trade_dates": [compact],
+                "pagination": {
+                    "page_size": TUSHARE_SUSPEND_PAGE_SIZE,
+                    "page_count": len(pages),
+                    "row_counts": page_rows,
+                    "terminal_page": terminal_page,
+                },
+            }
+        )
+        return result
 
     def _fetch(self, endpoint: str, **kwargs) -> pd.DataFrame:
         method = getattr(self._pro, endpoint)

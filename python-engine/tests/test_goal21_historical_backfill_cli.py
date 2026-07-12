@@ -30,8 +30,9 @@ def test_goal21_parser_exposes_exact_defaults():
     assert args.apply is False
     assert args.resume is True
     assert args.force is False
-    assert args.code_batch_size == 10
+    assert args.code_batch_size == 250
     assert args.date_batch_days == 31
+    assert args.financial_announce_days == 31
     assert args.report_period_months == 3
 
 
@@ -141,6 +142,10 @@ def test_goal21_handler_default_wiring_is_dry_run_and_preserves_explicit_codes(m
     exit_code = cli.main(BASE_ARGS)
 
     assert exit_code == 0
+    assert captured["plan"]["schema_version"] == "goal21.history_backfill_plan.v2"
+    assert captured["plan"]["identity_schema_version"] == "goal21.history_backfill_identity.v2"
+    assert captured["plan"]["planner_version"] == "goal21.history_backfill_planner.v2"
+    assert captured["plan"]["preflight_estimate"]["chunk_count"] >= captured["plan"]["chunk_count"]
     assert captured["plan"]["scope"]["codes"] == ["000001.SZ", "600519.SH"]
     assert captured["fetch_chunk_fn"] is None
     assert captured["canonical_read_fn"] is None

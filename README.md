@@ -41,7 +41,7 @@
 - Goal 17：新增小批次 Tushare `daily_price` landing 编排；默认不调用 provider、默认 dry-run，可复用已有 Goal 13C candidate/preflight 产物，或显式 `--provider-call` 小范围构建，再运行 Goal 14/15 validator/apply 路径。canonical 写入仍必须传 `--apply`，不写 standard `suspension_status`，不自动启动 clean/factor/selection/backtest，详见 `docs/goal17_tushare_small_batch_daily_price_landing.md`。
 - Goal 18：新增 Tushare master/fundamental/financial 标准输入 landing；默认不调用 provider、默认 dry-run，`daily_basic` 和通过 as-of 校验的 `financial` 只有显式 `--apply` 才可小范围写入 `raw/daily_basic/...` 和 `raw/financial/...`。`stock_basic` 当前快照和 ST 状态只写 candidate，不写 standard `stock_basic` / `st_history` / `suspension_status`，不自动启动 clean/factor/selection/backtest，详见 `docs/goal18_tushare_standard_inputs_landing.md`。
 - Goal 20：新增真实 clean 所需七项标准输入统一 readiness 审计，覆盖 `stock_basic`、`daily_price`、`adj_factor`、`daily_basic`、`financial`、`st_history` 和 `benchmark_price`。默认不调用 provider、默认 dry-run；provider 访问必须显式传 `--provider-call`，标准写入必须显式传 `--apply`。当前快照、smoke-only benchmark、不可读历史证据或任一缺失/语义不可靠输入都会保持 blocked，不启动 clean/factor/selection/backtest，详见 `docs/goal20_real_clean_input_readiness.md`。
-- Goal 21：新增七项标准输入的确定性、可恢复历史回填框架，支持五至十年规划和单日增量、按数据集切块、不可变 attempt staging、chunk checkpoint、默认 resume、幂等 canonical upsert 与读回核验。命令默认 plan-only、不会构造或调用 provider；provider 和标准写入仍分别要求 `--provider-call`、`--apply`。当前 live adapter 无法证明历史语义的输入保持 blocked，本轮不声称已经完成真实十年抓取，也不启动 clean/factor/selection/backtest，详见 `docs/goal21_historical_backfill.md`。
+- Goal 21：新增七项标准输入的确定性、可恢复历史回填框架，并完成评审修复：live 响应先写入带 checksum/语义证据哈希的不可变 raw landing；失败审计按 attempt 隔离；`suspend_d` 必须证明完整分页终止；READY checkpoint 可硬中断恢复；canonical 按逻辑 scope 精确替换；financial 使用公告日增量和严格 predecessor proof；v2 自然轴计划避免全市场十年 Cartesian 膨胀。命令默认 plan-only、不会构造或调用 provider；provider 和标准写入仍分别要求 `--provider-call`、`--apply`。当前 live adapter 无法证明历史语义的输入保持 blocked，本轮不声称已经完成真实十年抓取，也不启动 clean/factor/selection/backtest，详见 `docs/goal21_historical_backfill.md`。
 - Goal 10B：AKShare / Baostock 最小真实数据 smoke，已验证 AKShare `benchmark_price` 可标准化写入 `smoke/akshare/...` 并通过 DuckDB 查询；字段不足的数据集不会绕过 validator 写入标准层。
 - Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke，新增 smoke-only `daily_price_raw_smoke`，只允许写入 `smoke/<provider>/daily_price_raw_smoke/...`，不进入标准 `raw/daily_price/...`。
 - Goal 12A：真实数据标准层契约与数据质量等级冻结，详见 `docs/goal12A_real_data_contract.md`；本阶段只新增契约、守门规则和测试，不接入真实 provider 主链路，不做真实回测。
@@ -595,13 +595,15 @@ docker compose run --rm stock-python python -m stock_selector.cli run-real-histo
   --universe-key raw/universe/history.parquet
 ```
 
-必须提供 `--run-id`、起止日期，以及互斥的 `--codes` 或安全 `.parquet` `--universe-key`。默认 `--resume`；可显式传 `--no-resume` 或 `--force`，但它们不会自动打开 provider/写入门禁。三个 planner 批量参数及默认值为：
+必须提供 `--run-id`、起止日期，以及互斥的 `--codes` 或安全 `.parquet` `--universe-key`。默认 `--resume`；可显式传 `--no-resume` 或 `--force`，但它们不会自动打开 provider/写入门禁。v2 planner 的有效批量参数及默认值为：
 
 ```text
---code-batch-size 10
+--code-batch-size 250
 --date-batch-days 31
---report-period-months 3
+--financial-announce-days 31
 ```
+
+`--report-period-months 3` 仅为旧 v1 runbook 保留解析兼容；v2 会校验其为正数，但不会使用或把它重解释为公告期。
 
 四种模式彼此清晰隔离：
 
@@ -622,9 +624,13 @@ candidate/real_history_backfill/run_id=<run_id>/dataset=<dataset>/chunk_id=<chun
 candidate/real_history_backfill/run_id=<run_id>/dataset=<dataset>/chunk_id=<chunk_id>/attempt=<attempt>/part.parquet
 ```
 
-canonical 仍为 `raw/<dataset>/trade_date=YYYY-MM-DD/part.parquet`，由单写者串行执行 atomic、幂等 upsert 和读回核验。运维上禁止并发运行同一 `run_id`，也禁止并发执行会覆盖同一 canonical partition 的 `--apply` 作业；atomic replace 只能防止半写对象，不能防止两个进程 read-merge-write 时丢失彼此更新。当前内置 live 路由只在证据完整时接受 Tushare 的 `daily_price` / `adj_factor` / `daily_basic`；AKShare contract 虽只允许三指数 `benchmark_price`，但当前 CLI 尚无可证明完整语义的公开历史 range adapter，因此 live benchmark 仍 blocked，smoke 产物不会被冒充正式历史。当前 `stock_basic` 快照、未解决字段/单位语义的 `financial`、当前名称/状态倒推的 `st_history` 同样保持 `SEMANTIC_SOURCE_UNAVAILABLE`。Goal 21 不宣称已完成真实十年抓取；Goal 20 继续负责七输入 readiness，Goal 25 负责补齐完整 live capability。
+live provider 响应先写入 `raw/provider_landing/provider=<provider>/run_id=<run_id>/endpoint=<endpoint>/request=<hash>/response=<hash>/evidence=<hash>/part.parquet` 并读回校验；`suspend_d` 的 completeness/truncation/pagination 也绑定在 evidence hash 中。chunk manifest 保持兼容的单数 `source_key`，完整有序 `source_keys` 和 `provider_calls` 保存在不可变 attempt report，并由 `staging_attempt` 关联。
 
-所有 chunk manifest 都保留 source、row count、schema、DQ、coverage、checksum、validation、write/read-back、failure category 和 state；敏感 token/credential 会被脱敏。`--resume` 只有在 staging checksum 和 canonical evidence 均匹配时才跳过，`--force` 也不能绕过显式门禁或历史语义校验。下游 `clean_daily_snapshot`、factor、selection、backtest 防火墙始终关闭。完整说明见 `docs/goal21_historical_backfill.md`。
+canonical 仍为 `raw/<dataset>/trade_date=YYYY-MM-DD/part.parquet`，由单写者串行执行 atomic、逻辑 scope 精确替换和读回核验。运维上禁止并发运行同一 `run_id`，也禁止并发执行会覆盖同一 canonical partition 的 `--apply` 作业；atomic replace 只能防止半写对象，不能防止两个进程 read-merge-write 时丢失彼此更新。v2 对 5,000 股票、2015-01-01 至 2024-12-31 的全七项计划实际为 592 chunks，preflight 保守估计 710 chunks、13,520 provider calls 和 36,557 canonical reads；超过硬预算会在任何 provider/canonical 操作前 blocked，market sidecar cache 也只保留当前日期窗口。
+
+当前内置 live 路由只在证据完整时接受 Tushare 的 `daily_price` / `adj_factor` / `daily_basic`；AKShare contract 虽只允许三指数 `benchmark_price`，但当前 CLI 尚无可证明完整语义的公开历史 range adapter，因此 live benchmark 仍 blocked，smoke 产物不会被冒充正式历史。当前 `stock_basic` 快照、未解决字段/单位语义的 `financial`、当前名称/状态倒推的 `st_history` 同样保持 `SEMANTIC_SOURCE_UNAVAILABLE`。Goal 21 不宣称已完成真实十年抓取；Goal 20 继续负责七输入 readiness，Goal 25 负责补齐完整 live capability。
+
+所有 chunk manifest 都保留 source、row count、schema、DQ、coverage、checksum、validation、write/read-back、failure category 和 state；敏感 token/credential 会被脱敏。每次新 provider attempt 不继承旧失败证据；atomic staging 写入后即使读回失败也保留 key/checksum 供审计。`--resume` 会先严格核验可恢复的 `READY_TO_CHECKPOINT` report，并且只有 staging checksum 和 canonical exact-scope evidence 均匹配时才跳过；`--force` 也不能绕过显式门禁或历史语义校验。下游 `clean_daily_snapshot`、factor、selection、backtest 防火墙始终关闭。完整说明见 `docs/goal21_historical_backfill.md`。
 
 ## 幂等与重跑
 

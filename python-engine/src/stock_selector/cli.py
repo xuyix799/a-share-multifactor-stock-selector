@@ -15,7 +15,9 @@ from stock_selector.config.config_loader import load_factor_weights_config, load
 from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame, validate_stock_code
 from stock_selector.data.historical_backfill import (
     BackfillPlanningError,
-    build_history_backfill_plan,
+    build_history_backfill_plan,  # noqa: F401 - retained as a v1 compatibility export
+    build_history_backfill_plan_v2,
+    persist_historical_raw_landing,
     run_real_history_backfill,
 )
 from stock_selector.data.mock_data import generate_mock_dataset
@@ -769,6 +771,7 @@ def _cmd_run_real_history_backfill(args: argparse.Namespace) -> int:
     limits = {
         "code_batch_size": args.code_batch_size,
         "date_batch_days": args.date_batch_days,
+        "financial_announce_days": getattr(args, "financial_announce_days", 31),
         "report_period_months": args.report_period_months,
     }
     invalid_limit = next((name for name, value in limits.items() if value <= 0), None)
@@ -786,7 +789,7 @@ def _cmd_run_real_history_backfill(args: argparse.Namespace) -> int:
             universe_key = _validate_history_universe_key(args.universe_key)
             universe_frame = _load_history_universe_frame(universe_key)
 
-        plan = build_history_backfill_plan(
+        plan = build_history_backfill_plan_v2(
             run_id=args.run_id,
             start_date=args.start_date,
             end_date=args.end_date,
@@ -795,9 +798,24 @@ def _cmd_run_real_history_backfill(args: argparse.Namespace) -> int:
             universe_key=universe_key,
             code_batch_size=args.code_batch_size,
             date_batch_days=args.date_batch_days,
-            report_period_months=args.report_period_months,
+            announce_date_batch_days=getattr(args, "financial_announce_days", 31),
         )
-        fetch_chunk_fn = _build_history_fetch_chunk_fn(plan) if args.provider_call else None
+        raw_landing_fn = None
+        if args.provider_call:
+            raw_landing_fn = lambda endpoint, parameters, frame: persist_historical_raw_landing(
+                provider_name="tushare",
+                run_id=plan["run_id"],
+                endpoint=endpoint,
+                parameters=parameters,
+                frame=frame,
+                read_parquet_fn=_load_tushare_candidate_batch_parquet,
+                write_parquet_fn=_write_tushare_candidate_batch_parquet,
+            )
+        fetch_chunk_fn = (
+            _build_history_fetch_chunk_fn(plan, raw_landing_fn=raw_landing_fn)
+            if args.provider_call
+            else None
+        )
         canonical_read_fn = _read_history_canonical if args.apply else None
         canonical_write_fn = _write_dataset if args.apply else None
         result = run_real_history_backfill(
@@ -1530,7 +1548,7 @@ def _load_history_universe_frame(object_key: str) -> pd.DataFrame:
     return _load_tushare_candidate_batch_parquet(object_key)
 
 
-def _build_history_fetch_chunk_fn(plan: dict):
+def _build_history_fetch_chunk_fn(plan: dict, *, raw_landing_fn=None):
     provider_holder: dict[str, TushareProvider] = {}
     router_holder: dict[str, HistoricalProviderRouter] = {}
 
@@ -1540,19 +1558,7 @@ def _build_history_fetch_chunk_fn(plan: dict):
         return provider_holder["tushare"]
 
     def raw_fetch(endpoint: str, parameters: dict) -> pd.DataFrame:
-        frame = provider().fetch_raw_endpoint_allow_empty(endpoint, **parameters)
-        if endpoint == "suspend_d":
-            compact = str(parameters.get("trade_date", ""))
-            frame.attrs.update(
-                {
-                    "full_market_event_set": True,
-                    "coverage_complete": not frame.empty,
-                    "sample_truncated": False,
-                    "empty_after_retries": frame.empty,
-                    "covered_trade_dates": [compact] if compact else [],
-                }
-            )
-        return frame
+        return provider().fetch_raw_endpoint_allow_empty(endpoint, **parameters)
 
     def trading_calendar(start_date: str, end_date: str) -> pd.DataFrame:
         return provider().fetch_raw_endpoint_allow_empty(
@@ -1574,6 +1580,7 @@ def _build_history_fetch_chunk_fn(plan: dict):
                 provider_name="tushare",
                 raw_fetch_fn=raw_fetch,
                 trading_calendar_fn=trading_calendar,
+                raw_landing_fn=raw_landing_fn,
             )
         return router_holder["tushare"].fetch_chunk(chunk)
 
@@ -1927,8 +1934,11 @@ def build_parser() -> argparse.ArgumentParser:
     history_resume.add_argument("--resume", dest="resume", action="store_true")
     history_resume.add_argument("--no-resume", dest="resume", action="store_false")
     run_real_history_backfill.add_argument("--force", action="store_true")
-    run_real_history_backfill.add_argument("--code-batch-size", type=int, default=10)
+    run_real_history_backfill.add_argument("--code-batch-size", type=int, default=250)
     run_real_history_backfill.add_argument("--date-batch-days", type=int, default=31)
+    run_real_history_backfill.add_argument("--financial-announce-days", type=int, default=31)
+    # Retained only so existing v1 runbooks fail neither parsing nor audit;
+    # v2 never reinterprets this report-period option as announcement scope.
     run_real_history_backfill.add_argument("--report-period-months", type=int, default=3)
     run_real_history_backfill.set_defaults(resume=True, func=_cmd_run_real_history_backfill)
 

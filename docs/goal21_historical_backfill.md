@@ -47,11 +47,12 @@ The complete optional flag contract is:
 | `--apply` | off | Permit canonical `raw/...` writes after verified staging and validation. |
 | `--resume` / `--no-resume` | resume on | Reconcile and reuse valid checkpoints, or request a new attempt for enabled stages. |
 | `--force` | off | Rerun only stages whose provider/apply gate is already enabled. It does not open either gate. |
-| `--code-batch-size` | `10` | Maximum stock codes in a stock-scoped planner chunk. |
+| `--code-batch-size` | `250` | Maximum stock codes in provider-side stock batches; the v2 plan stores the universe once instead of copying batches into chunks. |
 | `--date-batch-days` | `31` | Maximum calendar days in a date-window planner chunk. |
-| `--report-period-months` | `3` | Maximum report-period months in a financial planner chunk. |
+| `--financial-announce-days` | `31` | Maximum calendar days in a v2 financial announcement window. |
+| `--report-period-months` | `3` | Legacy v1 runbook compatibility input. It must be positive but is ignored by the v2 planner and is not reinterpreted as announcement scope. |
 
-These are the only planner batch-size controls. There are no Goal 21 CLI flags for dataset selection, row limits, chunk limits, attempt limits, retry delay or provider selection.
+These are the complete CLI batch-size inputs. There are no Goal 21 CLI flags for dataset selection, row limits, chunk limits, attempt limits, retry delay, provider selection or a financial seed manifest.
 
 ## Four execution modes
 
@@ -60,7 +61,7 @@ The provider and canonical-write gates are independent:
 | Invocation | Mode | Permitted effects |
 | --- | --- | --- |
 | no opt-in flags | plan only / dry-run | Write the immutable plan and root control manifest only. It does not construct a provider, access a provider network, write staging Parquet or call a canonical writer. With the local backend it also does not initialize MinIO. |
-| `--provider-call` | provider-only | Fetch, validate and write immutable per-attempt staging. It cannot write canonical `raw/...` objects. Successful chunks may stop at `STAGED`. |
+| `--provider-call` | provider-only | Fetch, write/read/checksum immutable provider landing objects, validate and write immutable per-attempt staging. It cannot write canonical `raw/<dataset>/...` objects. Successful chunks may stop at `STAGED`. |
 | `--apply` | apply-only | Do not construct or call a provider. Consume checksum-verified existing staging and write/read back canonical partitions. Missing, foreign or mismatched staging blocks the affected chunk. |
 | `--provider-call --apply` | combined | Fetch into immutable staging first, then validate, idempotently upsert and read back canonical partitions. |
 
@@ -101,12 +102,12 @@ Goal 21 plans all seven inputs by default and does not replace their standard sc
 
 | Dataset | Chunk axis and required historical evidence |
 | --- | --- |
-| `stock_basic` | Code batch plus snapshot-date window. Rows must be point-in-time history or agree with a proven list/delist master; `list_date` and `delist_date` are preserved. A current listed-only snapshot cannot prove a historical universe. |
-| `daily_price` | Code batch plus date window. The Tushare route must combine trading calendar, daily bars, price limits and complete suspension-event evidence before `is_paused` is accepted. |
-| `adj_factor` | Code batch plus date window. Standard code/date uniqueness, complete scope coverage and finite `adj_factor > 0` are required. |
-| `daily_basic` | Code batch plus date window, with standard schema, unique code/date keys and complete requested coverage. |
-| `financial` | Code batch plus report-period window. Rows are materialized into a canonical trade-date partition only when `announce_date <= trade_date`; future disclosure data is not backfilled into the past. |
-| `st_history` | Code batch plus interval window. Only historical interval evidence with complete code/date coverage is accepted. Current name or current ST state is never inverted into history. A proven empty interval scope is allowed without fabricating rows. |
+| `stock_basic` | One historical-scope chunk referencing the immutable universe. Rows must be point-in-time history or agree with a proven list/delist master; `list_date` and `delist_date` are preserved, and membership requires `list_date <= trade_date < delist_date` when a delist date exists. A current listed-only snapshot cannot prove a historical universe. |
+| `daily_price` | Full-universe trade-date windows. The Tushare route must combine trading calendar, daily bars, price limits and complete suspension-event evidence before `is_paused` is accepted. |
+| `adj_factor` | Full-universe trade-date windows. Standard code/date uniqueness, complete scope coverage and finite `adj_factor > 0` are required. |
+| `daily_basic` | Full-universe trade-date windows, with standard schema, unique code/date keys and complete requested coverage. |
+| `financial` | Ordered `announce_date` windows. A row is accepted when the announcement is inside the chunk and `report_period <= announce_date`; canonical trade dates see only announcements on or before that date. Future disclosure data is never backfilled into the past. |
+| `st_history` | One historical interval-scope chunk. Only historical interval evidence with complete code/date coverage is accepted; intervals use `[start_date, end_date)`, so `end_date == chunk_start` does not overlap. Current name or current ST state is never inverted into history. A proven empty interval scope is allowed without fabricating rows. |
 | `benchmark_price` | Date window covering exactly `000300.SH`, `000905.SH` and `000906.SH`, with historical range lineage and consistent price/change evidence. Smoke-only output cannot satisfy this contract. |
 
 Any unproven historical meaning is `BLOCKED`; the executor does not insert fake values, defaults or future data to complete a chunk.
@@ -129,7 +130,15 @@ candidate/real_history_backfill/run_id=<run_id>/dataset=<dataset>/chunk_id=<chun
 candidate/real_history_backfill/run_id=<run_id>/dataset=<dataset>/chunk_id=<chunk_id>/attempt=<attempt>/part.parquet
 ```
 
-`plan.json` is immutable. A chunk manifest is its current checkpoint; attempt reports and staging Parquet are immutable attempt evidence. The root manifest is a summary, not the only recovery record.
+Every successful live endpoint response first lands at:
+
+```text
+raw/provider_landing/provider=<provider>/run_id=<run_id>/endpoint=<endpoint>/request=<hash>/response=<hash>/evidence=<hash>/part.parquet
+```
+
+The response hash covers rows/schema. The evidence hash binds safety-relevant response metadata; for `suspend_d` that includes completeness, truncation, covered dates and pagination/terminal-page proof. Exact duplicates are reused idempotently; a row or semantic-evidence mismatch fails read-back.
+
+`plan.json` is immutable. A chunk manifest is its current checkpoint; attempt reports and staging Parquet are immutable attempt evidence. The manifest deliberately keeps the v1 scalar `source_key`; the immutable report keeps complete ordered `source_keys` and `provider_calls`, and `staging_attempt` links the checkpoint to that report. Dataset payload lineage precedes the trading-calendar key. The root manifest is a summary, not the only recovery record.
 
 Canonical destinations remain:
 
@@ -137,7 +146,7 @@ Canonical destinations remain:
 raw/<dataset>/trade_date=YYYY-MM-DD/part.parquet
 ```
 
-Canonical partitions are handled by one serialized writer. Each incoming code shard is validated and idempotently upserted by the dataset key, atomically written, then read back and checksum/subset verified. Multiple logical canonical keys in a manifest are audited partition scopes; a proven empty `stock_basic`/`st_history` scope may record a non-materialized partition and does not create a fake canonical row or object.
+Canonical partitions are handled by one serialized writer. Each incoming logical scope is validated and replaces exactly that scope while preserving rows outside it; this removes stale rows that a merge-only upsert would leave behind. The result is atomically written, then read back and checksum/scope verified. Multiple logical canonical keys in a manifest are audited partition scopes; a proven empty `stock_basic`/`st_history` scope may record a non-materialized partition and does not create a fake canonical row or object.
 
 Operationally, do not run two Goal 21 processes with the same `run_id`, and do not run concurrent `--apply` jobs whose scopes can replace the same canonical partition. The atomic writer prevents partial objects, but it is not a cross-process compare-and-swap lock: concurrent read-merge-write cycles can otherwise lose one writer's update. Serialize overlapping applies or schedule provably disjoint canonical partitions.
 
@@ -149,7 +158,7 @@ Chunk states are:
 PENDING RUNNING STAGED COMPLETED FAILED BLOCKED INTERRUPTED
 ```
 
-With the default `--resume`, a chunk is skipped only after its immutable identity, staging checksum and required canonical read-back evidence reconcile. A stale `RUNNING` checkpoint is inspected against staging and canonical data before retry. Ordinary chunk failures are checkpointed and independent chunks continue; an interruption is persisted as `INTERRUPTED` before it is re-raised.
+With the default `--resume`, a chunk is skipped only after its immutable identity, staging checksum and required canonical read-back evidence reconcile. Before starting a new attempt, recovery also inspects an immutable `READY_TO_CHECKPOINT` report left after staging/canonical success but before the final mutable checkpoint. Identity, stages, provenance types, target schema, staging row/checksum, canonical checksums, partition counters/flags and exact scope are revalidated; only then is `STAGED` or `COMPLETED` reconstructed without refetching or rewriting. A stale `RUNNING` checkpoint is inspected against staging and canonical data before retry. Ordinary chunk failures are checkpointed and independent chunks continue; an interruption is persisted as `INTERRUPTED` before it is re-raised.
 
 `--no-resume` requests a new attempt for stages enabled in the invocation. `--force` also reruns enabled stages, but neither option implies `--provider-call` or `--apply`. A provider-only run can therefore be resumed later with apply-only mode, while a completed apply can be skipped only when its evidence still matches.
 
@@ -174,7 +183,13 @@ UNKNOWN
 
 Retryability is stored with the category. Provider parameters, exception messages and saved failure records are sanitized so tokens, passwords, authorization values, API keys and other credentials do not enter the artifacts or compact CLI output.
 
-Each attempted chunk records its immutable scope, attempt number, provider calls/status, source keys, row count, actual/target schema, DQ and coverage, staging key/checksum, canonical keys/checksums, validation, write/read-back evidence, failure and final state. Partial canonical work remains explicitly `FAILED` or `BLOCKED` with per-partition evidence; it is never reported as a completed all-or-nothing write.
+Each attempted chunk records its immutable scope, attempt number, provider calls/status, source keys, row count, actual/target schema, DQ and coverage, staging key/checksum, canonical keys/checksums, validation, write/read-back evidence, failure and final state. A new provider attempt starts with no carried provider evidence, so an exception before a structured result cannot inherit an earlier attempt's audit fields. If atomic staging write succeeds but immediate read-back fails, the failed attempt still records the staging key/checksum/attempt for audit; reuse requires a later independent checksum read. Partial canonical work remains explicitly `FAILED` or `BLOCKED` with per-partition evidence; it is never reported as a completed all-or-nothing write.
+
+## V2 scale bounds
+
+The v2 plan stores the normalized universe once and puts `universe_id`, a stable `materialization_id`, and (for financial only) a strict predecessor dependency in each natural-axis chunk. It does not build separate source and reducer chunk classes. With 5,000 stocks, `2015-01-01` through `2024-12-31`, and defaults `250/31/31`, preflight conservatively estimates `710` chunks, `15,056,320` plan bytes, `13,520` provider calls and `36,557` canonical reads. The actual all-seven plan contains `592` chunks: `118` each for `daily_price`, `adj_factor`, `daily_basic`, `financial` and `benchmark_price`, plus one `stock_basic` and one `st_history` chunk.
+
+Hard defaults are `25,000` chunks, `16 MiB` plan JSON, `215,000` provider calls and `40,000` canonical reads. Both the estimate and actual serialized plan size are gated before provider/canonical execution. Market sidecars are cached only for the active date window, so default ten-year execution does not retain all `stk_limit`/`suspend_d` frames in memory.
 
 ## Current live-provider capability boundary
 
@@ -182,7 +197,7 @@ The built-in routing is intentionally conservative:
 
 - Tushare is eligible only for `daily_price`, `adj_factor` and `daily_basic`, and still blocks a chunk when calendar, endpoint, field, suspension, coverage or DQ evidence is incomplete.
 - The provider contract permits AKShare only for `benchmark_price`, but the current CLI has no trusted public historical-range adapter that proves all three required indexes and the standard price/change contract. Live benchmark chunks therefore remain `SEMANTIC_SOURCE_UNAVAILABLE`; existing smoke-only objects are not reused or promoted.
-- Current `stock_basic` snapshots, unresolved live `financial` field/unit semantics and current-name/current-status-derived `st_history` remain `SEMANTIC_SOURCE_UNAVAILABLE` until a trusted historical adapter supplies the required evidence.
+- Current `stock_basic` snapshots, unresolved live `financial` field/unit semantics and current-name/current-status-derived `st_history` remain `SEMANTIC_SOURCE_UNAVAILABLE` until a trusted historical adapter supplies the required evidence. The programmatic v2 planner supports a strictly verified same-universe financial predecessor manifest, but the CLI exposes no seed-manifest flag and the live financial route remains blocked.
 - Baostock is not treated as satisfying any complete seven-input history contract in this framework.
 - Disabled providers, missing credentials and unsupported routes remain structured `CONFIGURATION_ERROR`/`SEMANTIC_SOURCE_UNAVAILABLE` results rather than silent fallback data.
 

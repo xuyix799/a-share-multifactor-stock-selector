@@ -14,6 +14,7 @@ import pandas as pd
 from stock_selector.data.data_validator import validate_stock_code
 from stock_selector.data.real_clean_inputs_landing import KEY_COLUMNS, REQUIRED_INPUTS
 from stock_selector.providers.schema_contract import REQUIRED_BENCHMARK_INDEXES
+from stock_selector.storage.partition import build_partition
 from stock_selector.utils.date_validator import validate_date_range
 from stock_selector.utils.path_validator import safe_object_key
 
@@ -21,6 +22,9 @@ from stock_selector.utils.path_validator import safe_object_key
 PLAN_SCHEMA_VERSION = "goal21.history_backfill_plan.v1"
 PLANNER_VERSION = "goal21.history_backfill_planner.v1"
 IDENTITY_SCHEMA_VERSION = "goal21.history_backfill_identity.v1"
+PLAN_SCHEMA_VERSION_V2 = "goal21.history_backfill_plan.v2"
+PLANNER_VERSION_V2 = "goal21.history_backfill_planner.v2"
+IDENTITY_SCHEMA_VERSION_V2 = "goal21.history_backfill_identity.v2"
 CHUNK_MANIFEST_SCHEMA_VERSION = "goal21.chunk_manifest.v1"
 SUMMARY_SCHEMA_VERSION = "goal21.chunk_summary.v1"
 BENCHMARK_INDEXES = tuple(sorted(REQUIRED_BENCHMARK_INDEXES))
@@ -34,6 +38,22 @@ DATASET_STRATEGIES = {
     "st_history": "by_code_interval_window",
     "benchmark_price": "by_index_date_window",
 }
+
+DATASET_STRATEGIES_V2 = {
+    "stock_basic": "historical_master_by_code",
+    "daily_price": "full_market_by_trade_date_window",
+    "adj_factor": "full_market_by_trade_date_window",
+    "daily_basic": "full_market_by_trade_date_window",
+    "financial": "by_code_announce_date_window",
+    "st_history": "historical_interval_by_code",
+    "benchmark_price": "by_index_date_window",
+}
+
+DEFAULT_V2_MAX_CHUNKS = 25_000
+DEFAULT_V2_MAX_PLAN_BYTES = 16 * 1024 * 1024
+DEFAULT_V2_MAX_PROVIDER_CALLS = 215_000
+DEFAULT_V2_MAX_CANONICAL_READS = 40_000
+FINANCIAL_SEED_MANIFEST_MAX_BYTES = 64 * 1024
 
 _RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _CHUNK_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
@@ -173,6 +193,91 @@ def dataframe_checksum(frame: pd.DataFrame, *, key_columns: Iterable[str] | None
     return _stable_hash(payload)
 
 
+def persist_historical_raw_landing(
+    *,
+    provider_name: str,
+    run_id: str,
+    endpoint: str,
+    parameters: dict[str, Any],
+    frame: pd.DataFrame,
+    read_parquet_fn: Callable[[str], pd.DataFrame],
+    write_parquet_fn: Callable[[str, pd.DataFrame], Any],
+) -> str:
+    """Persist one immutable provider response and verify its exact read-back."""
+
+    run_id = _validate_run_id(run_id)
+    provider = str(provider_name).strip().lower()
+    endpoint = str(endpoint).strip().lower()
+    segment_pattern = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+    if not segment_pattern.fullmatch(provider) or not segment_pattern.fullmatch(endpoint):
+        raise BackfillPlanningError("INVALID_RAW_LANDING_SCOPE", "provider or endpoint is unsafe")
+    if not isinstance(parameters, dict):
+        raise BackfillPlanningError("INVALID_RAW_LANDING_SCOPE", "parameters must be a dictionary")
+    if not isinstance(frame, pd.DataFrame):
+        raise BackfillExecutionError("SCHEMA_DRIFT", "raw landing frame must be a DataFrame")
+    try:
+        request_hash = _stable_hash(_checksum_value(parameters))
+    except (TypeError, ValueError) as exc:
+        raise BackfillPlanningError(
+            "INVALID_RAW_LANDING_SCOPE",
+            "provider parameters are not deterministically serializable",
+        ) from exc
+    checksum = dataframe_checksum(frame)
+    response_evidence = historical_raw_landing_evidence(endpoint, frame)
+    evidence_hash = _stable_hash(_checksum_value(response_evidence))
+    object_key = (
+        f"raw/provider_landing/provider={provider}/run_id={run_id}/"
+        f"endpoint={endpoint}/request={request_hash[:24]}/"
+        f"response={checksum[:24]}/evidence={evidence_hash[:24]}/part.parquet"
+    )
+    try:
+        safe_object_key(object_key)
+    except ValueError as exc:
+        raise BackfillPlanningError("INVALID_RAW_LANDING_SCOPE", "raw landing key is unsafe") from exc
+
+    try:
+        persisted = read_parquet_fn(object_key)
+    except FileNotFoundError:
+        write_parquet_fn(object_key, frame.copy(deep=True))
+        try:
+            persisted = read_parquet_fn(object_key)
+        except FileNotFoundError as exc:
+            raise BackfillExecutionError(
+                "READBACK_FAILED",
+                "raw landing object is missing after atomic write",
+            ) from exc
+    if not isinstance(persisted, pd.DataFrame):
+        raise BackfillExecutionError("READBACK_FAILED", "raw landing read-back is not a DataFrame")
+    if dataframe_checksum(persisted) != checksum:
+        raise BackfillExecutionError("READBACK_FAILED", "raw landing checksum mismatch")
+    if historical_raw_landing_evidence(endpoint, persisted) != response_evidence:
+        raise BackfillExecutionError(
+            "READBACK_FAILED",
+            "raw landing semantic evidence mismatch",
+        )
+    return object_key
+
+
+def historical_raw_landing_evidence(
+    endpoint: str,
+    frame: pd.DataFrame,
+) -> dict[str, Any]:
+    """Return safety-relevant response metadata bound to raw landing identity."""
+
+    if str(endpoint).strip().lower() != "suspend_d":
+        return {}
+    attrs = frame.attrs if isinstance(frame, pd.DataFrame) else {}
+    pagination = attrs.get("pagination")
+    return {
+        "full_market_event_set": deepcopy(attrs.get("full_market_event_set")),
+        "coverage_complete": deepcopy(attrs.get("coverage_complete")),
+        "sample_truncated": deepcopy(attrs.get("sample_truncated")),
+        "empty_after_retries": deepcopy(attrs.get("empty_after_retries")),
+        "covered_trade_dates": deepcopy(attrs.get("covered_trade_dates")),
+        "pagination": deepcopy(pagination) if isinstance(pagination, dict) else None,
+    }
+
+
 def classify_backfill_failure(error: BaseException) -> dict[str, Any]:
     """Classify and sanitize a backfill failure for persisted control records."""
 
@@ -224,8 +329,8 @@ def build_chunk_manifest(
 
     if not isinstance(chunk, dict) or "chunk_id" not in chunk or "dataset" not in chunk:
         raise BackfillPlanningError("INVALID_CHUNK", "manifest chunk must expose chunk_id and dataset")
-    semantics = _validated_chunk_semantics(chunk)
-    if chunk["chunk_id"] != _chunk_id(str(chunk["dataset"]), semantics):
+    semantics, expected_chunk_id = _validated_chunk_identity(chunk)
+    if chunk["chunk_id"] != expected_chunk_id:
         raise BackfillPlanningError(
             "TAMPERED_CHUNK_ID",
             f"chunk_id does not match chunk semantics: {chunk['chunk_id']}",
@@ -239,6 +344,7 @@ def build_chunk_manifest(
     normalized_failure = _normalize_failure_record(failure)
     _validate_failure_state(state, normalized_failure)
     _validate_manifest_evidence(
+        chunk=chunk,
         dataset=chunk["dataset"],
         state=state,
         provider_status=provider_status,
@@ -474,6 +580,699 @@ def build_history_backfill_plan(
     }
 
 
+def estimate_history_backfill_v1_risk(
+    *,
+    start_date: str,
+    end_date: str,
+    code_count: int,
+    code_batch_size: int,
+    date_batch_days: int,
+    report_period_months: int,
+) -> dict[str, Any]:
+    """Estimate the legacy Cartesian planner without materializing its chunks."""
+
+    try:
+        start_date, end_date = validate_date_range(start_date, end_date)
+    except ValueError as exc:
+        raise BackfillPlanningError("INVALID_DATE_RANGE", str(exc)) from exc
+    _validate_positive_limit("code_count", code_count)
+    _validate_positive_limit("code_batch_size", code_batch_size)
+    _validate_positive_limit("date_batch_days", date_batch_days)
+    _validate_positive_limit("report_period_months", report_period_months)
+
+    date_count = (date.fromisoformat(end_date) - date.fromisoformat(start_date)).days + 1
+    date_window_count = (date_count + date_batch_days - 1) // date_batch_days
+    report_window_count = len(
+        _split_report_period_windows(start_date, end_date, report_period_months)
+    )
+    code_batch_count = (code_count + code_batch_size - 1) // code_batch_size
+    # Five v1 datasets repeat code batches for every date window, financial
+    # repeats them for report-period windows, and benchmark is market-level.
+    chunk_count = (
+        5 * date_window_count * code_batch_count
+        + report_window_count * code_batch_count
+        + date_window_count
+    )
+    open_date_upper_bound = _weekday_count(start_date, end_date)
+    provider_calls = (
+        3 * code_count * date_window_count
+        + 2 * code_batch_count * open_date_upper_bound
+        + 1
+    )
+    financial_chunks = report_window_count * code_batch_count
+    canonical_reads = financial_chunks * open_date_upper_bound
+    return {
+        "planner_version": PLANNER_VERSION,
+        "date_count": date_count,
+        "date_window_count": date_window_count,
+        "report_window_count": report_window_count,
+        "code_batch_count": code_batch_count,
+        "chunk_count": chunk_count,
+        # Derived from the measured compact v1 representation. The estimate
+        # deliberately excludes Python deepcopy overhead and pretty-printing.
+        "plan_bytes_upper_bound": chunk_count * 343,
+        "provider_call_count_upper_bound": provider_calls,
+        "canonical_read_count_upper_bound": canonical_reads,
+        "financial_canonical_read_count_upper_bound": canonical_reads,
+    }
+
+
+def estimate_history_backfill_plan_v2(
+    *,
+    start_date: str,
+    end_date: str,
+    code_count: int,
+    code_batch_size: int,
+    date_batch_days: int,
+    announce_date_batch_days: int,
+) -> dict[str, Any]:
+    """Return a constant-space upper bound for the natural-axis v2 plan."""
+
+    try:
+        start_date, end_date = validate_date_range(start_date, end_date)
+    except ValueError as exc:
+        raise BackfillPlanningError("INVALID_DATE_RANGE", str(exc)) from exc
+    for name, value in (
+        ("code_count", code_count),
+        ("code_batch_size", code_batch_size),
+        ("date_batch_days", date_batch_days),
+        ("announce_date_batch_days", announce_date_batch_days),
+    ):
+        _validate_positive_limit(name, value)
+
+    date_count = (date.fromisoformat(end_date) - date.fromisoformat(start_date)).days + 1
+    date_window_count = (date_count + date_batch_days - 1) // date_batch_days
+    announce_window_count = (
+        date_count + announce_date_batch_days - 1
+    ) // announce_date_batch_days
+    code_batch_count = (code_count + code_batch_size - 1) // code_batch_size
+    open_date_upper_bound = _weekday_count(start_date, end_date)
+
+    # Four price-like/benchmark date axes plus daily_price itself are market
+    # windows. Stock/ST use one code cohort each and financial uses bounded
+    # announcement-window cohorts that are reduced once per canonical date.
+    market_window_chunks = 5 * date_window_count
+    historical_semantic_chunks = 2
+    financial_source_chunks = announce_window_count
+    chunk_count = market_window_chunks + historical_semantic_chunks + financial_source_chunks
+
+    market_provider_calls = 5 * open_date_upper_bound + 3 * date_window_count + 1
+    provider_calls = (
+        market_provider_calls
+        + financial_source_chunks
+        + historical_semantic_chunks
+    )
+    # A successful fresh apply performs one read before write and one exact
+    # read-back per materialized partition. Financial may additionally scan a
+    # bounded seed window once when resuming an existing history chain.
+    canonical_reads = 14 * open_date_upper_bound + 31
+    plan_bytes = (
+        16_384
+        + FINANCIAL_SEED_MANIFEST_MAX_BYTES
+        + code_count * 24
+        + code_count * 24 * (announce_window_count + 2)
+        + chunk_count * 640
+    )
+    return {
+        "planner_version": PLANNER_VERSION_V2,
+        "date_count": date_count,
+        "date_window_count": date_window_count,
+        "announce_window_count": announce_window_count,
+        "code_batch_count": code_batch_count,
+        "chunk_count": chunk_count,
+        "plan_bytes_upper_bound": plan_bytes,
+        "provider_call_count_upper_bound": provider_calls,
+        "market_level_provider_call_count_upper_bound": market_provider_calls,
+        "canonical_read_count_upper_bound": canonical_reads,
+        "financial_canonical_read_count_upper_bound": 2 * open_date_upper_bound + 31,
+    }
+
+
+def build_history_backfill_plan_v2(
+    *,
+    run_id: str,
+    start_date: str,
+    end_date: str,
+    codes: Iterable[str] | None = None,
+    universe_frame: pd.DataFrame | None = None,
+    universe_key: str | None = None,
+    code_batch_size: int,
+    date_batch_days: int,
+    announce_date_batch_days: int,
+    datasets: Iterable[str] | None = None,
+    max_chunks: int = DEFAULT_V2_MAX_CHUNKS,
+    max_plan_bytes: int = DEFAULT_V2_MAX_PLAN_BYTES,
+    max_provider_calls: int = DEFAULT_V2_MAX_PROVIDER_CALLS,
+    max_canonical_reads: int = DEFAULT_V2_MAX_CANONICAL_READS,
+    financial_seed_manifest: dict[str, Any] | None = None,
+    generated_at_fn: Callable[[], str] | None = None,
+) -> dict[str, Any]:
+    """Build a bounded v2 plan whose chunks follow provider-natural axes."""
+
+    run_id = _validate_run_id(run_id)
+    try:
+        start_date, end_date = validate_date_range(start_date, end_date)
+    except ValueError as exc:
+        raise BackfillPlanningError("INVALID_DATE_RANGE", str(exc)) from exc
+    for name, value in (
+        ("code_batch_size", code_batch_size),
+        ("date_batch_days", date_batch_days),
+        ("announce_date_batch_days", announce_date_batch_days),
+        ("max_chunks", max_chunks),
+        ("max_plan_bytes", max_plan_bytes),
+        ("max_provider_calls", max_provider_calls),
+        ("max_canonical_reads", max_canonical_reads),
+    ):
+        _validate_positive_limit(name, value)
+
+    normalized_codes, universe_source, normalized_universe_key = _normalize_universe(
+        codes=codes,
+        universe_frame=universe_frame,
+        universe_key=universe_key,
+    )
+    universe_id = _stable_hash(
+        {
+            "codes": normalized_codes,
+            "universe_source": universe_source,
+            "universe_key": normalized_universe_key,
+        }
+    )
+    selected_datasets = _normalize_datasets(datasets)
+    normalized_seed_manifest = _normalize_financial_seed_manifest(
+        financial_seed_manifest,
+        codes=normalized_codes,
+        universe_id=universe_id,
+        start_date=start_date,
+        selected_datasets=selected_datasets,
+    )
+    estimate = estimate_history_backfill_plan_v2(
+        start_date=start_date,
+        end_date=end_date,
+        code_count=len(normalized_codes),
+        code_batch_size=code_batch_size,
+        date_batch_days=date_batch_days,
+        announce_date_batch_days=announce_date_batch_days,
+    )
+    if normalized_universe_key is not None:
+        estimate["plan_bytes_upper_bound"] += len(
+            normalized_universe_key.encode("utf-8")
+        )
+    exceeded = [
+        ("chunk_count", estimate["chunk_count"], max_chunks),
+        ("plan_bytes", estimate["plan_bytes_upper_bound"], max_plan_bytes),
+        ("provider_calls", estimate["provider_call_count_upper_bound"], max_provider_calls),
+        ("canonical_reads", estimate["canonical_read_count_upper_bound"], max_canonical_reads),
+    ]
+    over_budget = [f"{name}={actual}>{limit}" for name, actual, limit in exceeded if actual > limit]
+    if over_budget:
+        raise BackfillPlanningError(
+            "PLAN_BUDGET_EXCEEDED",
+            "v2 preflight budget exceeded: " + ", ".join(over_budget),
+        )
+
+    date_windows = _split_date_windows(start_date, end_date, date_batch_days)
+    announce_windows = _split_date_windows(
+        start_date,
+        end_date,
+        announce_date_batch_days,
+    )
+    chunks: list[dict[str, Any]] = []
+    for dataset in selected_datasets:
+        if dataset == "financial":
+            previous_chunk_id: str | None = None
+            for window_start, window_end in announce_windows:
+                materialization_id = _v2_materialization_id(dataset, window_start, window_end)
+                financial_chunk = _build_chunk_v2(
+                    dataset=dataset,
+                    codes=[],
+                    universe_id=universe_id,
+                    start_date=window_start,
+                    end_date=window_end,
+                    axis="announce_date",
+                    materialization_id=materialization_id,
+                    dependency_keys=[] if previous_chunk_id is None else [previous_chunk_id],
+                )
+                chunks.append(financial_chunk)
+                previous_chunk_id = financial_chunk["chunk_id"]
+            continue
+        if dataset in {"stock_basic", "st_history"}:
+            materialization_id = _v2_materialization_id(dataset, start_date, end_date)
+            chunks.append(
+                _build_chunk_v2(
+                    dataset=dataset,
+                    codes=[],
+                    universe_id=universe_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                    axis="historical_scope",
+                    materialization_id=materialization_id,
+                )
+            )
+            continue
+        for window_start, window_end in date_windows:
+            chunks.append(
+                _build_chunk_v2(
+                    dataset=dataset,
+                    codes=[],
+                    universe_id=universe_id,
+                    start_date=window_start,
+                    end_date=window_end,
+                    axis="trade_date",
+                    materialization_id=_v2_materialization_id(dataset, window_start, window_end),
+                    index_codes=list(BENCHMARK_INDEXES) if dataset == "benchmark_price" else None,
+                )
+            )
+
+    scope = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "date_count": (date.fromisoformat(end_date) - date.fromisoformat(start_date)).days + 1,
+        "codes": normalized_codes,
+        "code_count": len(normalized_codes),
+        "universe_source": universe_source,
+        "universe_key": normalized_universe_key,
+        "universe_id": universe_id,
+        "financial_seed": normalized_seed_manifest,
+    }
+    limits = {
+        "code_batch_size": code_batch_size,
+        "date_batch_days": date_batch_days,
+        "announce_date_batch_days": announce_date_batch_days,
+        "max_chunks": max_chunks,
+        "max_plan_bytes": max_plan_bytes,
+        "max_provider_calls": max_provider_calls,
+        "max_canonical_reads": max_canonical_reads,
+    }
+    strategies = {dataset: DATASET_STRATEGIES_V2[dataset] for dataset in selected_datasets}
+    fingerprint_payload = {
+        "identity_schema_version": IDENTITY_SCHEMA_VERSION_V2,
+        "planner_version": PLANNER_VERSION_V2,
+        "scope": scope,
+        "datasets": selected_datasets,
+        "limits": limits,
+        "strategies": strategies,
+        "chunks": chunks,
+    }
+    generated_at_fn = generated_at_fn or _utc_now_iso
+    plan = {
+        "schema_version": PLAN_SCHEMA_VERSION_V2,
+        "identity_schema_version": IDENTITY_SCHEMA_VERSION_V2,
+        "planner_version": PLANNER_VERSION_V2,
+        "run_id": run_id,
+        "generated_at": generated_at_fn(),
+        "plan_fingerprint": _stable_hash(fingerprint_payload),
+        "scope": scope,
+        "limits": limits,
+        "datasets": selected_datasets,
+        "strategies": strategies,
+        "preflight_estimate": estimate,
+        "chunk_count": len(chunks),
+        "chunks": chunks,
+    }
+    actual_plan_bytes = len(_stable_json(plan).encode("utf-8"))
+    if actual_plan_bytes > max_plan_bytes:
+        raise BackfillPlanningError(
+            "PLAN_BUDGET_EXCEEDED",
+            "v2 actual plan budget exceeded: "
+            f"actual_plan_bytes={actual_plan_bytes}>{max_plan_bytes}",
+        )
+    return plan
+
+
+def validate_financial_announce_chunk_v2(chunk: dict[str, Any], frame: pd.DataFrame) -> None:
+    """Validate a financial source shard on announcement-time semantics."""
+
+    if not isinstance(chunk, dict) or chunk.get("dataset") != "financial":
+        raise BackfillExecutionError("DQ_FAILED", "financial v2 chunk is invalid")
+    if chunk.get("axis") != "announce_date":
+        raise BackfillExecutionError("DQ_FAILED", "financial v2 chunk must use announce_date axis")
+    if not isinstance(frame, pd.DataFrame):
+        raise BackfillExecutionError("DQ_FAILED", "financial source must be a DataFrame")
+    required = {"stock_code", "report_period", "announce_date"}
+    if not required.issubset(frame.columns):
+        raise BackfillExecutionError("DQ_FAILED", "financial source schema is incomplete")
+    if frame.empty:
+        return
+    start = chunk.get("announce_date_start")
+    end = chunk.get("announce_date_end")
+    try:
+        validate_date_range(start, end)
+    except (TypeError, ValueError) as exc:
+        raise BackfillExecutionError("DQ_FAILED", "financial announcement window is invalid") from exc
+    report_period = frame["report_period"].astype(str)
+    announce_date = frame["announce_date"].astype(str)
+    if ((announce_date < start) | (announce_date > end)).any():
+        raise BackfillExecutionError("DQ_FAILED", "financial announcement is outside the chunk")
+    if (report_period > announce_date).any():
+        raise BackfillExecutionError("DQ_FAILED", "financial report period is after its announcement")
+    codes = set(chunk.get("codes", []))
+    if codes and not frame["stock_code"].astype(str).isin(codes).all():
+        raise BackfillExecutionError("DQ_FAILED", "financial row is outside the chunk code scope")
+
+
+def _normalize_financial_seed_manifest(
+    manifest: dict[str, Any] | None,
+    *,
+    codes: list[str],
+    universe_id: str,
+    start_date: str,
+    selected_datasets: list[str],
+) -> dict[str, Any] | None:
+    if manifest is None:
+        return None
+    if "financial" not in selected_datasets:
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed evidence is invalid when financial is not planned",
+        )
+    if not isinstance(manifest, dict):
+        raise BackfillPlanningError("INVALID_FINANCIAL_SEED", "financial seed manifest must be an object")
+    serialized = _stable_json(manifest).encode("utf-8")
+    if len(serialized) > FINANCIAL_SEED_MANIFEST_MAX_BYTES:
+        raise BackfillPlanningError("INVALID_FINANCIAL_SEED", "financial seed manifest is too large")
+    try:
+        normalized = _validate_persisted_manifest(deepcopy(manifest))
+    except BackfillPlanningError as exc:
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            f"financial seed manifest is invalid: {exc}",
+        ) from exc
+    if (
+        normalized.get("dataset") != "financial"
+        or normalized.get("state") != "COMPLETED"
+        or normalized.get("failure") is not None
+    ):
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed must come from a completed financial manifest",
+        )
+    chunk = normalized.get("chunk")
+    if (
+        not isinstance(chunk, dict)
+        or chunk.get("chunk_schema_version") != "goal21.history_backfill_chunk.v2"
+        or chunk.get("axis") != "announce_date"
+        or chunk.get("universe_id") != universe_id
+        or chunk.get("codes") != []
+        or not isinstance(chunk.get("dependency_keys"), list)
+    ):
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed must be a v2 announce-date reducer for the same immutable universe",
+        )
+    source_key = normalized.get("source_key")
+    if not _valid_financial_upstream_source_key(source_key):
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed manifest lacks upstream source lineage",
+        )
+    coverage = normalized.get("coverage")
+    if (
+        not isinstance(coverage, dict)
+        or coverage.get("complete") is not True
+        or coverage.get("requested_codes") != codes
+    ):
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed manifest does not prove the requested universe",
+        )
+    validation = normalized.get("validation")
+    read_back = normalized.get("read_back_result")
+    if (
+        not isinstance(validation, dict)
+        or validation.get("passed") is not True
+        or not isinstance(read_back, dict)
+        or read_back.get("success") is not True
+    ):
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed manifest lacks successful validation and read-back",
+        )
+    reducer = validation.get("financial_reducer")
+    terminal = reducer.get("terminal") if isinstance(reducer, dict) else None
+    prior_state_checksum = reducer.get("prior_state_checksum") if isinstance(reducer, dict) else None
+    reducer_seed = reducer.get("seed") if isinstance(reducer, dict) else None
+    if (
+        not isinstance(reducer, dict)
+        or reducer.get("dependency_keys") != chunk["dependency_keys"]
+        or not isinstance(prior_state_checksum, str)
+        or re.fullmatch(r"[0-9a-f]{64}", prior_state_checksum) is None
+        or not _valid_financial_seed_summary(reducer_seed, codes=codes)
+        or not isinstance(terminal, dict)
+        or terminal.get("required") is not True
+        or terminal.get("passed") is not True
+        or isinstance(terminal.get("pending_row_count"), bool)
+        or terminal.get("pending_row_count") != 0
+    ):
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed manifest lacks a complete final v2 reducer proof",
+        )
+    terminal_date = terminal.get("last_materialized_trade_date")
+    try:
+        terminal_date = validate_date_range(str(terminal_date), str(terminal_date))[0]
+    except (TypeError, ValueError) as exc:
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed terminal materialization date is invalid",
+        ) from exc
+    terminal_anchor = _normalize_financial_terminal_anchor(terminal.get("anchor"))
+    if (
+        terminal_anchor is None
+        or terminal_anchor["trade_date"] != terminal_date
+        or terminal.get("state_checksum") != terminal_anchor["checksum"]
+        or terminal_date >= start_date
+    ):
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed terminal anchor does not prove the predecessor state",
+        )
+    coverage_dates = coverage.get("canonical_trade_dates")
+    try:
+        normalized_coverage_dates = [
+            validate_date_range(str(value), str(value))[0]
+            for value in coverage_dates
+        ]
+    except (TypeError, ValueError) as exc:
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed canonical coverage dates are invalid",
+        ) from exc
+    if (
+        not isinstance(coverage_dates, list)
+        or normalized_coverage_dates != coverage_dates
+        or normalized_coverage_dates != sorted(set(normalized_coverage_dates))
+        or (
+            normalized_coverage_dates
+            and terminal_date != normalized_coverage_dates[-1]
+        )
+    ):
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed terminal proof does not match canonical coverage",
+        )
+    canonical_checksums = normalized.get("canonical_checksums")
+    canonical_keys = normalized.get("canonical_keys")
+    partitions = read_back.get("partitions")
+    if (
+        not isinstance(canonical_checksums, dict)
+        or not isinstance(canonical_keys, list)
+        or not isinstance(partitions, list)
+    ):
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed canonical evidence is incomplete",
+        )
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    prefix = "raw/financial/trade_date="
+    suffix = "/part.parquet"
+    for record in partitions:
+        if not isinstance(record, dict):
+            continue
+        object_key = record.get("object_key")
+        if not isinstance(object_key, str) or not object_key.startswith(prefix) or not object_key.endswith(suffix):
+            continue
+        trade_date = object_key[len(prefix) : -len(suffix)]
+        try:
+            trade_date = validate_date_range(trade_date, trade_date)[0]
+        except (TypeError, ValueError):
+            continue
+        checksum = record.get("checksum")
+        if (
+            trade_date >= start_date
+            or object_key != build_partition("financial", trade_date).object_key
+            or object_key not in canonical_keys
+            or canonical_checksums.get(object_key) != checksum
+            or not isinstance(checksum, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", checksum)
+            or isinstance(record.get("row_count"), bool)
+            or not isinstance(record.get("row_count"), int)
+            or record["row_count"] < 0
+            or record.get("materialized") is not True
+            or record.get("exact_read_back_success") is not True
+        ):
+            continue
+        candidates.append((trade_date, deepcopy(record)))
+    if normalized_coverage_dates and not candidates:
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "financial seed manifest has no verified predecessor partition",
+        )
+    if normalized_coverage_dates:
+        seed_trade_date, seed_record = max(candidates, key=lambda value: value[0])
+        if (
+            seed_trade_date != terminal_date
+            or seed_record["object_key"] != terminal_anchor["object_key"]
+            or seed_record["checksum"] != terminal_anchor["checksum"]
+            or seed_record["row_count"] != terminal_anchor["row_count"]
+        ):
+            raise BackfillPlanningError(
+                "INVALID_FINANCIAL_SEED",
+                "financial seed predecessor is not the final verified v2 materialization",
+            )
+    elif canonical_keys != [] or canonical_checksums != {} or partitions != []:
+        raise BackfillPlanningError(
+            "INVALID_FINANCIAL_SEED",
+            "zero-partition financial seed tail has contradictory canonical evidence",
+        )
+    return {
+        "manifest": normalized,
+        "manifest_fingerprint": _stable_hash(normalized),
+        "trade_date": terminal_anchor["trade_date"],
+        "object_key": terminal_anchor["object_key"],
+        "checksum": terminal_anchor["checksum"],
+        "row_count": terminal_anchor["row_count"],
+        "coverage_codes": list(codes),
+        "source_key": source_key,
+    }
+
+
+def _normalize_financial_terminal_anchor(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    trade_date = value.get("trade_date")
+    object_key = value.get("object_key")
+    checksum = value.get("checksum")
+    row_count = value.get("row_count")
+    try:
+        normalized_date = validate_date_range(str(trade_date), str(trade_date))[0]
+    except (TypeError, ValueError):
+        return None
+    if (
+        object_key != build_partition("financial", normalized_date).object_key
+        or not isinstance(checksum, str)
+        or re.fullmatch(r"[0-9a-f]{64}", checksum) is None
+        or isinstance(row_count, bool)
+        or not isinstance(row_count, int)
+        or row_count < 0
+        or value.get("exact_read_back_success") is not True
+    ):
+        return None
+    return {
+        "trade_date": normalized_date,
+        "object_key": object_key,
+        "checksum": checksum,
+        "row_count": row_count,
+        "exact_read_back_success": True,
+    }
+
+
+def _valid_financial_seed_summary(value: Any, *, codes: list[str]) -> bool:
+    if not isinstance(value, dict):
+        return False
+    trade_date = value.get("trade_date")
+    object_key = value.get("object_key")
+    checksum = value.get("checksum")
+    row_count = value.get("row_count")
+    source_key = value.get("source_key")
+    fingerprint = value.get("source_manifest_fingerprint")
+    try:
+        normalized_date = validate_date_range(str(trade_date), str(trade_date))[0]
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        value.get("mode") == "COMPLETED_PREDECESSOR_MANIFEST"
+        and object_key == build_partition("financial", normalized_date).object_key
+        and isinstance(checksum, str)
+        and re.fullmatch(r"[0-9a-f]{64}", checksum)
+        and not isinstance(row_count, bool)
+        and isinstance(row_count, int)
+        and row_count >= 0
+        and value.get("coverage_codes") == codes
+        and _valid_financial_upstream_source_key(source_key)
+        and isinstance(fingerprint, str)
+        and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+        and value.get("exact_read_back_success") is True
+    )
+
+
+def _valid_financial_upstream_source_key(value: Any) -> bool:
+    """Accept only durable upstream lineage for cross-run financial state."""
+
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        safe_object_key(value)
+    except ValueError:
+        return False
+    normalized = value.casefold()
+    return not normalized.startswith(("smoke/", "candidate/"))
+
+
+def _build_chunk_v2(
+    *,
+    dataset: str,
+    codes: list[str],
+    universe_id: str,
+    start_date: str,
+    end_date: str,
+    axis: str,
+    materialization_id: str,
+    index_codes: list[str] | None = None,
+    dependency_keys: list[str] | None = None,
+) -> dict[str, Any]:
+    chunk: dict[str, Any] = {
+        "chunk_schema_version": "goal21.history_backfill_chunk.v2",
+        "dataset": dataset,
+        "strategy": DATASET_STRATEGIES_V2[dataset],
+        "axis": axis,
+        "key_columns": list(KEY_COLUMNS[dataset]),
+        "codes": list(codes),
+        "universe_id": universe_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "materialization_id": materialization_id,
+        "dependency_keys": list(dependency_keys or []),
+    }
+    if dataset == "financial":
+        chunk["announce_date_start"] = start_date
+        chunk["announce_date_end"] = end_date
+    if dataset == "benchmark_price":
+        chunk["index_codes"] = list(index_codes or BENCHMARK_INDEXES)
+    chunk["chunk_id"] = _chunk_id_v2(dataset, chunk)
+    return chunk
+
+
+def _chunk_id_v2(dataset: str, semantics: dict[str, Any]) -> str:
+    identity = {
+        "identity_schema_version": IDENTITY_SCHEMA_VERSION_V2,
+        "planner_version": PLANNER_VERSION_V2,
+        "chunk": semantics,
+    }
+    return f"{dataset}-v2-{_stable_hash(identity)[:20]}"
+
+
+def _v2_materialization_id(dataset: str, start_date: str, end_date: str) -> str:
+    return f"{dataset}-materialize-{_stable_hash([dataset, start_date, end_date])[:20]}"
+
+
+def _weekday_count(start_date: str, end_date: str) -> int:
+    start = np.datetime64(start_date, "D")
+    # busday_count excludes the upper bound, so add one day for an inclusive
+    # conservative weekday estimate. Exchange holidays only lower this value.
+    end_exclusive = np.datetime64(end_date, "D") + np.timedelta64(1, "D")
+    return int(np.busday_count(start, end_exclusive))
+
+
 def build_history_backfill_output_keys(run_id: str, chunks: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Build safe Goal 21 control and immutable attempt artifact keys."""
 
@@ -491,8 +1290,7 @@ def build_history_backfill_output_keys(run_id: str, chunks: Iterable[dict[str, A
             raise BackfillPlanningError("INVALID_CHUNK_ID", f"unsafe chunk_id: {chunk_id}")
         if chunk_id in chunk_keys:
             raise BackfillPlanningError("DUPLICATE_CHUNK_ID", f"duplicate chunk_id: {chunk_id}")
-        semantics = _validated_chunk_semantics(chunk)
-        expected_chunk_id = _chunk_id(dataset, semantics)
+        semantics, expected_chunk_id = _validated_chunk_identity(chunk)
         if chunk_id != expected_chunk_id:
             raise BackfillPlanningError(
                 "TAMPERED_CHUNK_ID",
@@ -582,6 +1380,92 @@ def _chunk_id(dataset: str, semantics: dict[str, Any]) -> str:
         "chunk": semantics,
     }
     return f"{dataset}-{_stable_hash(identity)[:20]}"
+
+
+def _validated_chunk_identity(chunk: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    if chunk.get("chunk_schema_version") == "goal21.history_backfill_chunk.v2":
+        semantics = _validated_chunk_semantics_v2(chunk)
+        return semantics, _chunk_id_v2(str(chunk["dataset"]), semantics)
+    semantics = _validated_chunk_semantics(chunk)
+    return semantics, _chunk_id(str(chunk["dataset"]), semantics)
+
+
+def _validated_chunk_semantics_v2(chunk: dict[str, Any]) -> dict[str, Any]:
+    dataset = str(chunk.get("dataset", ""))
+    if dataset not in REQUIRED_INPUTS:
+        raise BackfillPlanningError("UNSUPPORTED_DATASET", f"unsupported dataset: {dataset}")
+    required_fields = {
+        "chunk_schema_version",
+        "dataset",
+        "strategy",
+        "axis",
+        "key_columns",
+        "codes",
+        "universe_id",
+        "start_date",
+        "end_date",
+        "materialization_id",
+        "dependency_keys",
+        "chunk_id",
+    }
+    if dataset == "financial":
+        required_fields.update({"announce_date_start", "announce_date_end"})
+    if dataset == "benchmark_price":
+        required_fields.add("index_codes")
+    if set(chunk) != required_fields:
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 chunk fields do not match its dataset")
+    if chunk["strategy"] != DATASET_STRATEGIES_V2[dataset]:
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 chunk strategy is invalid")
+    expected_axes = {
+        "financial": "announce_date",
+        "stock_basic": "historical_scope",
+        "st_history": "historical_scope",
+    }
+    if chunk["axis"] != expected_axes.get(dataset, "trade_date"):
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 chunk axis is invalid")
+    if chunk["key_columns"] != list(KEY_COLUMNS[dataset]):
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 chunk key columns are invalid")
+    try:
+        start_date, end_date = validate_date_range(chunk["start_date"], chunk["end_date"])
+    except (TypeError, ValueError) as exc:
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 chunk date range is invalid") from exc
+    if start_date != chunk["start_date"] or end_date != chunk["end_date"]:
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 chunk dates are not normalized")
+    codes = chunk["codes"]
+    if not isinstance(codes, list):
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 chunk codes must be a list")
+    try:
+        normalized_codes = sorted({validate_stock_code(str(value)) for value in codes})
+    except ValueError as exc:
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 chunk codes are invalid") from exc
+    if codes != normalized_codes:
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 chunk codes are not normalized")
+    if codes:
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 chunks must reference the plan universe")
+    universe_id = chunk["universe_id"]
+    if not isinstance(universe_id, str) or not re.fullmatch(r"[0-9a-f]{64}", universe_id):
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 universe identity is invalid")
+    materialization_id = chunk["materialization_id"]
+    if not isinstance(materialization_id, str) or not _CHUNK_ID_PATTERN.fullmatch(materialization_id):
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 materialization identity is invalid")
+    dependency_keys = chunk["dependency_keys"]
+    if not isinstance(dependency_keys, list) or len(dependency_keys) != len(set(dependency_keys)):
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 dependency keys are not canonical")
+    if any(not isinstance(value, str) or not _CHUNK_ID_PATTERN.fullmatch(value) for value in dependency_keys):
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "v2 dependency key is invalid")
+    if dataset == "financial":
+        if len(dependency_keys) > 1:
+            raise BackfillPlanningError("TAMPERED_CHUNK_ID", "financial chunks have at most one dependency")
+    elif dependency_keys:
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "non-financial dependency keys must be empty")
+    if dataset == "financial" and (
+        chunk["announce_date_start"] != start_date or chunk["announce_date_end"] != end_date
+    ):
+        raise BackfillPlanningError("TAMPERED_CHUNK_ID", "financial announcement scope is invalid")
+    if dataset == "benchmark_price":
+        if chunk["index_codes"] != list(BENCHMARK_INDEXES):
+            raise BackfillPlanningError("TAMPERED_CHUNK_ID", "benchmark index coverage is invalid")
+    return {key: deepcopy(value) for key, value in chunk.items() if key != "chunk_id"}
 
 
 def _validated_chunk_semantics(chunk: dict[str, Any]) -> dict[str, Any]:
@@ -1035,6 +1919,7 @@ def _validate_failure_state(state: str, failure: Any) -> None:
 
 def _validate_manifest_evidence(
     *,
+    chunk: dict[str, Any],
     dataset: str,
     state: Any,
     provider_status: Any,
@@ -1080,7 +1965,15 @@ def _validate_manifest_evidence(
         _validate_evidence_object_key(source_key, "source_key")
         _validate_evidence_object_key(staging_key, "staging_key")
         if row_count == 0:
-            if dataset not in {"stock_basic", "st_history"}:
+            closed_v2_window = (
+                chunk.get("chunk_schema_version") == "goal21.history_backfill_chunk.v2"
+                and isinstance(coverage, dict)
+                and (
+                    coverage.get("canonical_trade_dates") == []
+                    or coverage.get("financial_announce_window_empty") is True
+                )
+            )
+            if dataset not in {"stock_basic", "st_history"} and not closed_v2_window:
                 raise BackfillPlanningError(
                     "INVALID_MANIFEST_EVIDENCE",
                     f"{dataset} cannot use VALID_EMPTY staging evidence",
@@ -1107,13 +2000,27 @@ def _validate_manifest_evidence(
             and isinstance(canonical_checksums, dict)
             and set(canonical_checksums) == set(canonical_keys)
         )
+        zero_partition_evidence = (
+            chunk.get("chunk_schema_version") == "goal21.history_backfill_chunk.v2"
+            and isinstance(coverage, dict)
+            and coverage.get("canonical_trade_dates") == []
+            and canonical_keys == []
+            and canonical_checksums == {}
+            and _evidence_succeeded(validation)
+            and _evidence_succeeded(write_result)
+            and _evidence_succeeded(read_back_result)
+            and isinstance(write_result.get("partitions"), list)
+            and write_result["partitions"] == []
+            and isinstance(read_back_result.get("partitions"), list)
+            and read_back_result["partitions"] == []
+        )
         if scalar_canonical_evidence and plural_canonical_evidence:
             raise BackfillPlanningError(
                 "INVALID_MANIFEST_EVIDENCE",
                 "canonical scalar and plural evidence are mutually exclusive",
             )
         complete_canonical_evidence = (
-            (scalar_canonical_evidence or plural_canonical_evidence)
+            (scalar_canonical_evidence or plural_canonical_evidence or zero_partition_evidence)
             and _evidence_succeeded(validation)
             and _evidence_succeeded(write_result)
             and _evidence_succeeded(read_back_result)

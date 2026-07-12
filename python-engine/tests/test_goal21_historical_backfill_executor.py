@@ -1012,7 +1012,9 @@ def test_canonical_written_before_checkpoint_is_reconciled_without_second_write(
     assert final["state"] == "COMPLETED"
     assert _event_count(harness, "canonical_write") == 0
     assert result["reconciled_chunk_ids"] == [plan["chunks"][0]["chunk_id"]]
-    assert final["write_result"]["status"] == "RECONCILED_EXISTING_WRITE"
+    # The immutable READY report is now the authoritative crash-recovery
+    # record, so its already-verified WRITTEN evidence is restored verbatim.
+    assert final["write_result"]["status"] == "WRITTEN"
 
 
 def test_stale_running_partial_canonical_is_idempotently_repaired_when_apply_enabled():

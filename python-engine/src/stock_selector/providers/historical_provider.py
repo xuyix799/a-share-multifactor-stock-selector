@@ -13,10 +13,16 @@ import pandas as pd
 
 from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame
 from stock_selector.data.historical_backfill import (
+    BackfillExecutionError,
     FAILURE_CATEGORIES,
+    PLAN_SCHEMA_VERSION_V2,
     build_history_backfill_output_keys,
     build_history_backfill_plan,
+    build_history_backfill_plan_v2,
     classify_backfill_failure,
+    dataframe_checksum,
+    historical_raw_landing_evidence,
+    validate_financial_announce_chunk_v2,
 )
 from stock_selector.data.real_clean_inputs_landing import KEY_COLUMNS
 from stock_selector.providers.base import ProviderConfigurationError
@@ -27,6 +33,7 @@ from stock_selector.providers.schema_mapper import SchemaMappingError, normalize
 RawFetchFn = Callable[[str, dict[str, Any]], pd.DataFrame]
 TradingCalendarFn = Callable[[str, str], pd.DataFrame]
 FetchChunkFn = Callable[[dict[str, Any]], "HistoricalChunkFetchResult"]
+RawLandingFn = Callable[[str, dict[str, Any], pd.DataFrame], str]
 
 _RESULT_STATUSES = {"FETCHED", "VALID_EMPTY", "BLOCKED", "FAILED"}
 _RETRYABLE_FAILURES = {
@@ -167,8 +174,20 @@ class HistoricalChunkFetchResult:
             if coverage.get("complete") is not True or coverage.get("valid_empty") is True:
                 raise ValueError("FETCHED requires complete non-empty coverage")
         elif self.provider_status == "VALID_EMPTY":
-            if self.dataset not in {"stock_basic", "st_history"} or not frame.empty or not self.valid_empty:
-                raise ValueError("VALID_EMPTY is limited to proven empty historical membership or ST evidence")
+            historical_empty = self.dataset in {"stock_basic", "st_history"}
+            closed_market_empty = (
+                coverage.get("closed_market_window") is True and not canonical_dates
+            )
+            financial_window_empty = (
+                self.dataset == "financial"
+                and coverage.get("financial_announce_window_empty") is True
+            )
+            if (
+                not (historical_empty or closed_market_empty or financial_window_empty)
+                or not frame.empty
+                or not self.valid_empty
+            ):
+                raise ValueError("VALID_EMPTY lacks a proven historical-empty contract")
             required_semantics = _SOURCE_SEMANTICS[self.dataset]
             if self.source_semantics != required_semantics or not source_keys:
                 raise ValueError("VALID_EMPTY requires trusted historical lineage")
@@ -210,14 +229,30 @@ def _validated_plan_copy(plan: dict[str, Any]) -> dict[str, Any]:
             "end_date": scope["end_date"],
             "code_batch_size": limits["code_batch_size"],
             "date_batch_days": limits["date_batch_days"],
-            "report_period_months": limits["report_period_months"],
             "datasets": copied["datasets"],
             "generated_at_fn": lambda: copied["generated_at"],
         }
+        if copied.get("schema_version") == PLAN_SCHEMA_VERSION_V2:
+            builder = build_history_backfill_plan_v2
+            common.update(
+                announce_date_batch_days=limits["announce_date_batch_days"],
+                max_chunks=limits["max_chunks"],
+                max_plan_bytes=limits["max_plan_bytes"],
+                max_provider_calls=limits["max_provider_calls"],
+                max_canonical_reads=limits["max_canonical_reads"],
+                financial_seed_manifest=(
+                    scope.get("financial_seed", {}).get("manifest")
+                    if isinstance(scope.get("financial_seed"), dict)
+                    else None
+                ),
+            )
+        else:
+            builder = build_history_backfill_plan
+            common["report_period_months"] = limits["report_period_months"]
         if universe_source == "codes":
-            rebuilt = build_history_backfill_plan(codes=scope["codes"], **common)
+            rebuilt = builder(codes=scope["codes"], **common)
         elif universe_source == "universe_frame":
-            rebuilt = build_history_backfill_plan(
+            rebuilt = builder(
                 universe_frame=pd.DataFrame({"stock_code": scope["codes"]}),
                 universe_key=scope.get("universe_key"),
                 **common,
@@ -246,6 +281,7 @@ class HistoricalProviderRouter:
         provider_name: str,
         raw_fetch_fn: RawFetchFn | None,
         trading_calendar_fn: TradingCalendarFn | None,
+        raw_landing_fn: RawLandingFn | None = None,
     ) -> None:
         copied_plan = _validated_plan_copy(plan)
         build_history_backfill_output_keys(copied_plan.get("run_id", ""), copied_plan["chunks"])
@@ -258,7 +294,13 @@ class HistoricalProviderRouter:
         self._provider_name = str(provider_name).strip().lower()
         self._raw_fetch_fn = raw_fetch_fn
         self._trading_calendar_fn = trading_calendar_fn
+        self._raw_landing_fn = raw_landing_fn
         self._calendar_open_dates: tuple[str, ...] | None = None
+        self._calendar_predecessor_trade_date: str | None = None
+        self._calendar_source_keys: tuple[str, ...] = ()
+        self._calendar_call: dict[str, Any] | None = None
+        self._active_calendar_call: dict[str, Any] | None = None
+        self._market_sidecar_cache: dict[tuple[str, str], pd.DataFrame] = {}
 
     def fetch_chunk(self, chunk: dict[str, Any]) -> HistoricalChunkFetchResult:
         candidate = deepcopy(chunk)
@@ -266,26 +308,58 @@ class HistoricalProviderRouter:
         if planned is None or candidate != planned:
             raise HistoricalProviderError("CONFIGURATION_ERROR", "foreign or tampered Goal 21 chunk")
 
-        dataset = planned["dataset"]
+        self._active_calendar_call = None
+        runtime_chunk = _resolved_provider_chunk(planned, self._plan)
+        self._prune_market_sidecar_cache(runtime_chunk)
+        dataset = runtime_chunk["dataset"]
         capability_error = _capability_error(self._provider_name, dataset)
         if capability_error is not None:
-            return self._failure_result(planned, HistoricalProviderError(*capability_error))
+            return self._failure_result(runtime_chunk, HistoricalProviderError(*capability_error))
 
         try:
+            calendar_was_cached = self._calendar_open_dates is not None
             open_dates = self._calendar()
-            canonical_dates = _canonical_dates(planned, open_dates, dataset)
+            self._active_calendar_call = deepcopy(self._calendar_call)
+            if calendar_was_cached and self._active_calendar_call is not None:
+                self._active_calendar_call["status"] = "REUSED_VERIFIED_RAW"
+            canonical_dates = _canonical_dates(runtime_chunk, open_dates, dataset)
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:
-            return self._failure_result(planned, exc)
+            return self._failure_result(runtime_chunk, exc)
 
         try:
+            if (
+                runtime_chunk.get("chunk_schema_version") == "goal21.history_backfill_chunk.v2"
+                and not canonical_dates
+                and dataset in {"daily_price", "adj_factor", "daily_basic", "benchmark_price"}
+            ):
+                target = list(get_schema_contract(dataset).columns)
+                closed_attrs = {
+                    "source_keys": list(self._calendar_source_keys),
+                    "raw_landing_verified": bool(self._calendar_source_keys),
+                    "coverage_complete": True,
+                    "sample_truncated": False,
+                    "requested_codes": list(runtime_chunk.get("codes", [])),
+                    "requested_indexes": list(runtime_chunk.get("index_codes", [])),
+                    "coverage_start_date": runtime_chunk["start_date"],
+                    "coverage_end_date": runtime_chunk["end_date"],
+                    "covered_trade_dates": [],
+                }
+                return self._success_result(
+                    runtime_chunk,
+                    pd.DataFrame(columns=target),
+                    raw_schema=tuple(target),
+                    attrs=closed_attrs,
+                    provider_calls=(),
+                    canonical_dates=(),
+                )
             if self._raw_fetch_fn is None:
                 raise HistoricalProviderError("CONFIGURATION_ERROR", "raw_fetch_fn is required")
             if self._provider_name == "tushare" and dataset == "daily_price":
-                normalized, raw_schema, attrs, calls = self._fetch_tushare_daily_price(planned, canonical_dates)
+                normalized, raw_schema, attrs, calls = self._fetch_tushare_daily_price(runtime_chunk, canonical_dates)
             else:
-                raw, calls = self._fetch_simple(planned, canonical_dates)
+                raw, calls = self._fetch_simple(runtime_chunk, canonical_dates)
                 raw_schema = tuple(raw.columns)
                 attrs = deepcopy(raw.attrs)
                 if dataset == "stock_basic" and "list_status" in raw.columns:
@@ -391,7 +465,7 @@ class HistoricalProviderRouter:
                     ) from exc
             try:
                 return self._success_result(
-                    planned,
+                    runtime_chunk,
                     normalized,
                     raw_schema=raw_schema,
                     attrs=attrs,
@@ -412,14 +486,14 @@ class HistoricalProviderRouter:
             raise
         except _ObservedProviderError as exc:
             return self._failure_result(
-                planned,
+                runtime_chunk,
                 exc.error,
                 actual_schema=exc.actual_schema,
                 provider_calls=exc.provider_calls,
                 canonical_dates=canonical_dates,
             )
         except Exception as exc:
-            return self._failure_result(planned, exc, canonical_dates=canonical_dates)
+            return self._failure_result(runtime_chunk, exc, canonical_dates=canonical_dates)
 
     def _calendar(self) -> tuple[str, ...]:
         if self._calendar_open_dates is not None:
@@ -431,8 +505,70 @@ class HistoricalProviderRouter:
         end_date = scope.get("end_date")
         if not isinstance(start_date, str) or not isinstance(end_date, str):
             raise HistoricalProviderError("CONFIGURATION_ERROR", "plan scope is missing dates")
-        raw = self._trading_calendar_fn(start_date, end_date)
-        if not isinstance(raw, pd.DataFrame) or raw.empty:
+        calendar_start_date = start_date
+        if (
+            self._plan.get("schema_version") == PLAN_SCHEMA_VERSION_V2
+            and "financial" in self._plan.get("datasets", [])
+        ):
+            calendar_start_date = (date.fromisoformat(start_date) - timedelta(days=31)).isoformat()
+        parameters = {
+            "exchange": "SSE",
+            "start_date": calendar_start_date.replace("-", ""),
+            "end_date": end_date.replace("-", ""),
+            "fields": "cal_date,is_open",
+        }
+        calendar_call: dict[str, Any] = {
+            "endpoint": "trade_cal",
+            "strategy": "full_calendar_scope",
+            "parameters": parameters,
+            "row_count": 0,
+            "status": "RUNNING",
+        }
+        try:
+            raw = self._trading_calendar_fn(calendar_start_date, end_date)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            calendar_call["status"] = "FAILED"
+            self._calendar_call = calendar_call
+            self._active_calendar_call = deepcopy(calendar_call)
+            raise
+        if not isinstance(raw, pd.DataFrame):
+            calendar_call["status"] = "SCHEMA_DRIFT"
+            self._calendar_call = calendar_call
+            self._active_calendar_call = deepcopy(calendar_call)
+            raise HistoricalProviderError("SCHEMA_DRIFT", "trading calendar is not a DataFrame")
+        calendar_call["row_count"] = int(len(raw))
+        calendar_call["status"] = "VALID_EMPTY" if raw.empty else "FETCHED"
+        if self._raw_landing_fn is not None:
+            try:
+                source_key = self._raw_landing_fn(
+                    "trade_cal",
+                    deepcopy(parameters),
+                    raw.copy(deep=True),
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                calendar_call["status"] = "RAW_LANDING_FAILED"
+                self._calendar_call = calendar_call
+                self._active_calendar_call = deepcopy(calendar_call)
+                raise HistoricalProviderError("READBACK_FAILED", "trading calendar raw landing failed") from exc
+            if not isinstance(source_key, str) or not _safe_source_key(source_key):
+                calendar_call["status"] = "RAW_LANDING_FAILED"
+                self._calendar_call = calendar_call
+                self._active_calendar_call = deepcopy(calendar_call)
+                raise HistoricalProviderError(
+                    "SEMANTIC_SOURCE_UNAVAILABLE",
+                    "trading calendar raw landing key is invalid",
+                )
+            self._calendar_source_keys = (source_key,)
+            calendar_call["source_keys"] = [source_key]
+            calendar_call["raw_checksum"] = dataframe_checksum(raw)
+            calendar_call["raw_read_back_verified"] = True
+        self._calendar_call = calendar_call
+        self._active_calendar_call = deepcopy(calendar_call)
+        if raw.empty:
             raise HistoricalProviderError("SEMANTIC_SOURCE_UNAVAILABLE", "trading calendar is empty")
         frame = raw.copy(deep=True)
         date_columns = [column for column in ("trade_date", "cal_date") if column in frame.columns]
@@ -454,9 +590,9 @@ class HistoricalProviderRouter:
             else:
                 raise HistoricalProviderError("DQ_FAILED", "invalid trading calendar is_open value")
         frame["_is_open"] = normalized_open
-        expected = list(_iter_dates(start_date, end_date))
+        expected = list(_iter_dates(calendar_start_date, end_date))
         observed = frame["_date"].tolist()
-        if any(value < start_date or value > end_date for value in observed):
+        if any(value < calendar_start_date or value > end_date for value in observed):
             raise HistoricalProviderError("DQ_FAILED", "trading calendar contains out-of-scope dates")
         if set(observed) != set(expected):
             raise HistoricalProviderError(
@@ -464,6 +600,8 @@ class HistoricalProviderRouter:
                 "trading calendar cannot prove the full requested range",
             )
         self._calendar_open_dates = tuple(sorted(frame.loc[frame["_is_open"], "_date"].tolist()))
+        predecessors = [value for value in self._calendar_open_dates if value < start_date]
+        self._calendar_predecessor_trade_date = max(predecessors) if predecessors else None
         return tuple(self._calendar_open_dates)
 
     def _fetch_simple(
@@ -475,25 +613,17 @@ class HistoricalProviderRouter:
         calls: list[dict[str, Any]] = []
         if self._provider_name in {"fixture", "mock"}:
             parameters = _simple_parameters(chunk)
-            raw = _call_raw(self._raw_fetch_fn, dataset, parameters, "fixture_historical_chunk", calls)
+            raw = _call_raw(
+                self._raw_fetch_fn,
+                dataset,
+                parameters,
+                "fixture_historical_chunk",
+                calls,
+                raw_landing_fn=self._raw_landing_fn,
+            )
             return raw, tuple(calls)
         if self._provider_name == "tushare":
-            frames: list[pd.DataFrame] = []
-            fields = {
-                "adj_factor": "ts_code,trade_date,adj_factor",
-                "daily_basic": "ts_code,trade_date,pe_ttm,pb,ps_ttm,total_mv,circ_mv,turnover_rate",
-            }.get(dataset)
-            for code in chunk.get("codes", []):
-                parameters = {
-                    "ts_code": code,
-                    "start_date": chunk["start_date"].replace("-", ""),
-                    "end_date": chunk["end_date"].replace("-", ""),
-                }
-                if fields is not None:
-                    parameters["fields"] = fields
-                endpoint = dataset
-                frames.append(_call_raw(self._raw_fetch_fn, endpoint, parameters, "by_code_date_window", calls))
-            return _concat_frames(frames), tuple(calls)
+            return self._fetch_tushare_simple(chunk, canonical_dates, calls)
         if self._provider_name == "akshare" and dataset == "benchmark_price":
             frames = []
             for index_code in chunk.get("index_codes", []):
@@ -502,9 +632,110 @@ class HistoricalProviderRouter:
                     "start_date": chunk["start_date"],
                     "end_date": chunk["end_date"],
                 }
-                frames.append(_call_raw(self._raw_fetch_fn, dataset, parameters, "by_index_date_window", calls))
-            return _concat_frames(frames), tuple(calls)
+                frames.append(
+                    _call_raw(
+                        self._raw_fetch_fn,
+                        dataset,
+                        parameters,
+                        "by_index_date_window",
+                        calls,
+                        raw_landing_fn=self._raw_landing_fn,
+                    )
+                )
+            raw = _concat_frames(frames)
+            raw.attrs.update(
+                {
+                    "coverage_complete": True,
+                    "sample_truncated": any(
+                        frame.attrs.get("sample_truncated") is True for frame in frames
+                    ),
+                    "requested_indexes": list(chunk.get("index_codes", [])),
+                    "coverage_start_date": chunk["start_date"],
+                    "coverage_end_date": chunk["end_date"],
+                }
+            )
+            return raw, tuple(calls)
         raise HistoricalProviderError("CONFIGURATION_ERROR", "unsupported provider route")
+
+    def _fetch_tushare_simple(
+        self,
+        chunk: dict[str, Any],
+        canonical_dates: tuple[str, ...],
+        calls: list[dict[str, Any]],
+    ) -> tuple[pd.DataFrame, tuple[dict[str, Any], ...]]:
+        dataset = chunk["dataset"]
+        frames: list[pd.DataFrame] = []
+        raw_schema: tuple[str, ...] = ()
+        fields = {
+            "adj_factor": "ts_code,trade_date,adj_factor",
+            "daily_basic": "ts_code,trade_date,pe_ttm,pb,ps_ttm,total_mv,circ_mv,turnover_rate",
+        }.get(dataset)
+        try:
+            if chunk.get("chunk_schema_version") == "goal21.history_backfill_chunk.v2":
+                for trade_date in canonical_dates:
+                    parameters = {"trade_date": trade_date.replace("-", "")}
+                    if fields is not None:
+                        parameters["fields"] = fields
+                    frames.append(
+                        _call_raw(
+                            self._raw_fetch_fn,
+                            dataset,
+                            parameters,
+                            "full_market_by_trade_date",
+                            calls,
+                            raw_landing_fn=self._raw_landing_fn,
+                        )
+                    )
+                raw = _concat_frames(frames)
+                raw_schema = tuple(raw.columns)
+                if "ts_code" in raw.columns:
+                    attrs = deepcopy(raw.attrs)
+                    normalized_codes = raw["ts_code"].map(normalize_stock_code)
+                    raw = raw[normalized_codes.isin(chunk.get("codes", []))].copy()
+                    raw.attrs = attrs
+                raw.attrs.update(
+                    {
+                        "coverage_complete": True,
+                        "sample_truncated": raw.attrs.get("sample_truncated") is True,
+                        "requested_codes": list(chunk.get("codes", [])),
+                        "coverage_start_date": chunk["start_date"],
+                        "coverage_end_date": chunk["end_date"],
+                    }
+                )
+                return raw, tuple(calls)
+            for code in chunk.get("codes", []):
+                parameters = {
+                    "ts_code": code,
+                    "start_date": chunk["start_date"].replace("-", ""),
+                    "end_date": chunk["end_date"].replace("-", ""),
+                }
+                if fields is not None:
+                    parameters["fields"] = fields
+                frames.append(
+                    _call_raw(
+                        self._raw_fetch_fn,
+                        dataset,
+                        parameters,
+                        "by_code_date_window",
+                        calls,
+                        raw_landing_fn=self._raw_landing_fn,
+                    )
+                )
+            raw = _concat_frames(frames)
+            raw_schema = tuple(raw.columns)
+            return raw, tuple(calls)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except _ObservedProviderError:
+            raise
+        except Exception as exc:
+            if isinstance(exc, (SchemaMappingError, ValueError, TypeError)):
+                exc = HistoricalProviderError("SCHEMA_DRIFT", str(exc))
+            raise _ObservedProviderError(
+                exc,
+                actual_schema=raw_schema,
+                provider_calls=tuple(calls),
+            ) from exc
 
     def _fetch_tushare_daily_price(
         self,
@@ -545,14 +776,37 @@ class HistoricalProviderRouter:
         observe_schema: Callable[[tuple[str, ...]], None],
     ) -> tuple[pd.DataFrame, tuple[str, ...], dict[str, Any], tuple[dict[str, Any], ...]]:
         daily_frames = []
-        for code in chunk.get("codes", []):
-            parameters = {
-                "start_date": chunk["start_date"].replace("-", ""),
-                "end_date": chunk["end_date"].replace("-", ""),
-                "fields": "ts_code,trade_date,open,high,low,close,pre_close,vol,amount",
-                "ts_code": code,
-            }
-            daily_frames.append(_call_raw(self._raw_fetch_fn, "daily", parameters, "by_code_date_window", calls))
+        if chunk.get("chunk_schema_version") == "goal21.history_backfill_chunk.v2":
+            daily_requests = [
+                {
+                    "trade_date": trade_date.replace("-", ""),
+                    "fields": "ts_code,trade_date,open,high,low,close,pre_close,vol,amount",
+                }
+                for trade_date in canonical_dates
+            ]
+            daily_strategy = "full_market_by_trade_date"
+        else:
+            daily_requests = [
+                {
+                    "start_date": chunk["start_date"].replace("-", ""),
+                    "end_date": chunk["end_date"].replace("-", ""),
+                    "fields": "ts_code,trade_date,open,high,low,close,pre_close,vol,amount",
+                    "ts_code": code,
+                }
+                for code in chunk.get("codes", [])
+            ]
+            daily_strategy = "by_code_date_window"
+        for parameters in daily_requests:
+            daily_frames.append(
+                _call_raw(
+                    self._raw_fetch_fn,
+                    "daily",
+                    parameters,
+                    daily_strategy,
+                    calls,
+                    raw_landing_fn=self._raw_landing_fn,
+                )
+            )
         daily = _concat_frames(daily_frames)
         raw_schema = tuple(daily.columns)
         observe_schema(raw_schema)
@@ -560,8 +814,7 @@ class HistoricalProviderRouter:
         suspend_frames = []
         for trade_date in canonical_dates:
             compact = trade_date.replace("-", "")
-            limit = _call_raw(
-                self._raw_fetch_fn,
+            limit = self._market_sidecar(
                 "stk_limit",
                 {
                     "trade_date": compact,
@@ -585,11 +838,11 @@ class HistoricalProviderRouter:
             limit_frames.append(limit)
         for trade_date in canonical_dates:
             compact = trade_date.replace("-", "")
-            suspend = _call_raw(
-                self._raw_fetch_fn,
+            suspend = self._market_sidecar(
                 "suspend_d",
                 {
                     "trade_date": compact,
+                    "suspend_type": "S",
                     "fields": "ts_code,trade_date,suspend_timing,suspend_type",
                 },
                 "full_market_event_set_by_trade_date",
@@ -633,6 +886,7 @@ class HistoricalProviderRouter:
         normalized_limits = _normalize_limit_frame(limits)
         normalized_suspends = _normalize_suspend_frame(suspends)
         codes = set(chunk.get("codes", []))
+        normalized_daily = normalized_daily[normalized_daily["stock_code"].isin(codes)].copy()
         normalized_limits = normalized_limits[normalized_limits["stock_code"].isin(codes)].copy()
         normalized_suspends = normalized_suspends[normalized_suspends["stock_code"].isin(codes)].copy()
         merged = normalized_daily.merge(
@@ -650,7 +904,89 @@ class HistoricalProviderRouter:
         ]
         merged["pct_chg"] = ((merged["close"] / merged["pre_close"]) - 1.0) * 100.0
         target = get_schema_contract("daily_price").columns
-        return merged[target], raw_schema, {}, tuple(calls)
+        attrs = _merge_frame_attrs(daily_frames + limit_frames + suspend_frames)
+        attrs.update(
+            {
+                "source_semantics": _SOURCE_SEMANTICS["daily_price"],
+                "coverage_complete": True,
+                "suspend_d_full_event_coverage": True,
+                "full_market_event_set": True,
+                "sample_truncated": any(
+                    frame.attrs.get("sample_truncated") is True
+                    for frame in daily_frames + limit_frames + suspend_frames
+                ),
+                "requested_codes": list(chunk.get("codes", [])),
+                "coverage_start_date": chunk["start_date"],
+                "coverage_end_date": chunk["end_date"],
+                "covered_trade_dates": list(canonical_dates),
+                "pause_event_keys": [list(value) for value in sorted(suspend_keys)],
+                "daily_rows_omit_suspended": True,
+            }
+        )
+        return merged[target], raw_schema, attrs, tuple(calls)
+
+    def _market_sidecar(
+        self,
+        endpoint: str,
+        parameters: dict[str, Any],
+        strategy: str,
+        calls: list[dict[str, Any]],
+        *,
+        allow_none: bool = False,
+    ) -> pd.DataFrame | None:
+        trade_date = str(parameters.get("trade_date", ""))
+        cache_key = (endpoint, trade_date)
+        cached = self._market_sidecar_cache.get(cache_key)
+        if cached is not None:
+            copied = cached.copy(deep=True)
+            copied.attrs = deepcopy(cached.attrs)
+            call = {
+                "endpoint": endpoint,
+                "strategy": strategy,
+                "parameters": deepcopy(parameters),
+                "row_count": int(len(copied)),
+                "status": "REUSED_VERIFIED_RAW",
+                "source_keys": list(copied.attrs.get("source_keys", [])),
+            }
+            if isinstance(copied.attrs.get("raw_checksum"), str):
+                call.update(
+                    raw_checksum=copied.attrs["raw_checksum"],
+                    raw_read_back_verified=True,
+                )
+            response_evidence = historical_raw_landing_evidence(endpoint, copied)
+            if response_evidence:
+                call["response_evidence"] = response_evidence
+            calls.append(call)
+            return copied
+        result = _call_raw(
+            self._raw_fetch_fn,
+            endpoint,
+            parameters,
+            strategy,
+            calls,
+            allow_none=allow_none,
+            raw_landing_fn=self._raw_landing_fn,
+        )
+        if result is not None:
+            cached = result.copy(deep=True)
+            cached.attrs = deepcopy(result.attrs)
+            self._market_sidecar_cache[cache_key] = cached
+        return result
+
+    def _prune_market_sidecar_cache(self, chunk: dict[str, Any]) -> None:
+        """Retain only sidecars reusable by the active date window.
+
+        V1 may revisit the same market date for several code chunks, while V2
+        advances one natural date window at a time. Window-local eviction keeps
+        both reuse semantics and memory bounded by the configured date batch.
+        """
+
+        start = str(chunk.get("start_date", "")).replace("-", "")
+        end = str(chunk.get("end_date", "")).replace("-", "")
+        for cache_key in list(self._market_sidecar_cache):
+            trade_date = str(cache_key[1]).replace("-", "")
+            if not start or not end or trade_date < start or trade_date > end:
+                self._market_sidecar_cache.pop(cache_key, None)
 
     def _success_result(
         self,
@@ -664,8 +1000,20 @@ class HistoricalProviderRouter:
     ) -> HistoricalChunkFetchResult:
         dataset = chunk["dataset"]
         target = tuple(get_schema_contract(dataset).columns)
+        attrs = deepcopy(attrs)
+        if self._provider_name not in {"fixture", "mock"}:
+            raw_keys = attrs.get("source_keys", [])
+            if not isinstance(raw_keys, (list, tuple)):
+                raw_keys = []
+            attrs["source_keys"] = list(
+                dict.fromkeys([*map(str, raw_keys), *self._calendar_source_keys])
+            )
+            attrs["raw_landing_verified"] = bool(self._calendar_source_keys) and (
+                attrs.get("raw_landing_verified") is True
+            )
+        provider_calls = self._with_calendar_call(provider_calls)
         source_keys, source_semantics = _lineage(dataset, attrs, self._provider_name)
-        if source_keys:
+        if source_keys and self._provider_name in {"fixture", "mock"}:
             _validate_fixture_scope_proof(dataset, attrs, chunk)
         coverage, dq, validation, status, valid_empty = _validate_normalized_result(
             dataset,
@@ -676,6 +1024,14 @@ class HistoricalProviderRouter:
             source_keys,
             source_semantics,
         )
+        if (
+            dataset == "financial"
+            and chunk.get("chunk_schema_version") == "goal21.history_backfill_chunk.v2"
+        ):
+            coverage = dict(
+                coverage,
+                predecessor_trade_date=self._calendar_predecessor_trade_date,
+            )
         ordered = frame.loc[:, list(target)].copy(deep=True)
         ordered = ordered.sort_values(KEY_COLUMNS[dataset], kind="mergesort").reset_index(drop=True)
         return HistoricalChunkFetchResult(
@@ -708,6 +1064,17 @@ class HistoricalProviderRouter:
         canonical_dates: tuple[str, ...] = (),
     ) -> HistoricalChunkFetchResult:
         dataset = chunk["dataset"]
+        provider_calls = self._with_calendar_call(provider_calls)
+        failure_source_keys: list[str] = (
+            list(self._calendar_source_keys)
+            if self._active_calendar_call is not None
+            else []
+        )
+        for call in provider_calls:
+            values = call.get("source_keys", [])
+            if isinstance(values, list):
+                failure_source_keys.extend(str(value) for value in values)
+        failure_source_keys = list(dict.fromkeys(failure_source_keys))
         failure = classify_backfill_failure(error)
         if isinstance(error, ProviderConfigurationError):
             failure.update(category="CONFIGURATION_ERROR", retryable=False)
@@ -721,7 +1088,7 @@ class HistoricalProviderRouter:
             frame=pd.DataFrame(columns=target),
             provider_status=status,
             provider_name=self._provider_name,
-            source_keys=(),
+            source_keys=tuple(failure_source_keys),
             source_semantics=None,
             provider_calls=provider_calls,
             actual_schema=actual_schema,
@@ -734,6 +1101,18 @@ class HistoricalProviderRouter:
             validation={"passed": False, "errors": [failure["message"]]},
             failure=failure,
         )
+
+    def _with_calendar_call(
+        self,
+        provider_calls: tuple[dict[str, Any], ...],
+    ) -> tuple[dict[str, Any], ...]:
+        calendar_call = self._active_calendar_call
+        calls = [deepcopy(value) for value in provider_calls]
+        if calendar_call is None:
+            return tuple(calls)
+        if any(value.get("endpoint") == "trade_cal" for value in calls):
+            return tuple(calls)
+        return (deepcopy(calendar_call), *calls)
 
 
 def iter_historical_canonical_partitions(
@@ -779,9 +1158,31 @@ def _capability_error(provider_name: str, dataset: str) -> tuple[str, str] | Non
 
 
 def _canonical_dates(chunk: dict[str, Any], open_dates: tuple[str, ...], dataset: str) -> tuple[str, ...]:
-    if dataset in {"financial", "st_history"}:
+    if dataset in {"financial", "st_history"} and chunk.get("chunk_schema_version") != "goal21.history_backfill_chunk.v2":
         return tuple(open_dates)
     return tuple(value for value in open_dates if chunk["start_date"] <= value <= chunk["end_date"])
+
+
+def _resolved_provider_chunk(chunk: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    resolved = deepcopy(chunk)
+    if resolved.get("chunk_schema_version") != "goal21.history_backfill_chunk.v2":
+        return resolved
+    scope = plan.get("scope", {})
+    if resolved.get("universe_id") != scope.get("universe_id"):
+        raise HistoricalProviderError("CONFIGURATION_ERROR", "v2 chunk universe identity is inconsistent")
+    if resolved["dataset"] in {
+        "stock_basic",
+        "daily_price",
+        "adj_factor",
+        "daily_basic",
+        "financial",
+        "st_history",
+    }:
+        codes = scope.get("codes")
+        if not isinstance(codes, list) or not codes:
+            raise HistoricalProviderError("CONFIGURATION_ERROR", "v2 plan universe is empty")
+        resolved["codes"] = list(codes)
+    return resolved
 
 
 def _call_raw(
@@ -792,6 +1193,7 @@ def _call_raw(
     calls: list[dict[str, Any]],
     *,
     allow_none: bool = False,
+    raw_landing_fn: RawLandingFn | None = None,
 ) -> pd.DataFrame | None:
     if fetch_fn is None:
         raise HistoricalProviderError("CONFIGURATION_ERROR", "raw_fetch_fn is required")
@@ -855,15 +1257,45 @@ def _call_raw(
         )
     copied = raw.copy(deep=True)
     copied.attrs = deepcopy(raw.attrs)
-    calls.append(
-        {
-            "endpoint": endpoint,
-            "strategy": strategy,
-            "parameters": clean_parameters,
-            "row_count": int(len(copied)),
-            "status": "VALID_EMPTY" if copied.empty else "FETCHED",
-        }
-    )
+    call = {
+        "endpoint": endpoint,
+        "strategy": strategy,
+        "parameters": clean_parameters,
+        "row_count": int(len(copied)),
+        "status": "VALID_EMPTY" if copied.empty else "FETCHED",
+    }
+    response_evidence = historical_raw_landing_evidence(endpoint, copied)
+    if response_evidence:
+        call["response_evidence"] = response_evidence
+    if raw_landing_fn is not None:
+        try:
+            source_key = raw_landing_fn(endpoint, deepcopy(clean_parameters), copied.copy(deep=True))
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            call["status"] = "RAW_LANDING_FAILED"
+            calls.append(call)
+            raise _ObservedProviderError(exc, provider_calls=tuple(calls)) from exc
+        if not isinstance(source_key, str) or not _safe_source_key(source_key):
+            call["status"] = "RAW_LANDING_FAILED"
+            calls.append(call)
+            raise _ObservedProviderError(
+                HistoricalProviderError(
+                    "SEMANTIC_SOURCE_UNAVAILABLE",
+                    "raw landing did not return a safe immutable source key",
+                ),
+                provider_calls=tuple(calls),
+            )
+        existing_keys = copied.attrs.get("source_keys", [])
+        if not isinstance(existing_keys, (list, tuple)):
+            existing_keys = []
+        copied.attrs["source_keys"] = list(dict.fromkeys([*map(str, existing_keys), source_key]))
+        copied.attrs["raw_landing_verified"] = True
+        copied.attrs["raw_checksum"] = dataframe_checksum(copied)
+        call["source_keys"] = [source_key]
+        call["raw_checksum"] = copied.attrs["raw_checksum"]
+        call["raw_read_back_verified"] = True
+    calls.append(call)
     return copied
 
 
@@ -884,6 +1316,7 @@ def _merge_frame_attrs(frames: list[pd.DataFrame]) -> dict[str, Any]:
         "snapshot_coverage_complete",
         "suspend_d_full_event_coverage",
         "full_market_event_set",
+        "raw_landing_verified",
     }
     union_fields = {
         "source_keys",
@@ -1129,6 +1562,21 @@ def _validate_normalized_result(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str, bool]:
     codes = list(chunk.get("codes", []))
     indexes = list(chunk.get("index_codes", []))
+    if (
+        chunk.get("chunk_schema_version") == "goal21.history_backfill_chunk.v2"
+        and not canonical_dates
+        and dataset in {"daily_price", "adj_factor", "daily_basic", "benchmark_price"}
+        and frame.empty
+    ):
+        coverage = _coverage_base(chunk, canonical_dates, expected_count=0, covered_count=0)
+        coverage.update(complete=True, valid_empty=True, closed_market_window=True)
+        return (
+            coverage,
+            {"passed": True, "level": "STRICT", "blocked_reasons": []},
+            {"passed": True, "errors": []},
+            "VALID_EMPTY",
+            True,
+        )
     if dataset == "st_history" and frame.empty:
         _validate_st_empty_proof(attrs, chunk, source_keys, source_semantics)
         coverage = _coverage_base(chunk, canonical_dates, expected_count=0, covered_count=0)
@@ -1158,6 +1606,30 @@ def _validate_normalized_result(
             "VALID_EMPTY",
             True,
         )
+    if (
+        dataset == "financial"
+        and frame.empty
+        and chunk.get("chunk_schema_version") == "goal21.history_backfill_chunk.v2"
+    ):
+        _validate_financial_semantics(frame, chunk, attrs, source_semantics)
+        if not source_keys or attrs.get("coverage_complete") is not True:
+            raise HistoricalProviderError(
+                "SEMANTIC_SOURCE_UNAVAILABLE",
+                "empty financial announcement window lacks complete verified lineage",
+            )
+        coverage = _coverage_base(chunk, canonical_dates, expected_count=0, covered_count=0)
+        coverage.update(
+            complete=True,
+            valid_empty=True,
+            financial_announce_window_empty=True,
+        )
+        return (
+            coverage,
+            {"passed": True, "level": "STRICT", "blocked_reasons": []},
+            {"passed": True, "errors": []},
+            "VALID_EMPTY",
+            True,
+        )
     if frame.empty:
         raise HistoricalProviderError("EMPTY_RESULT", f"{dataset} returned no rows")
     if attrs.get("sample_truncated") is True:
@@ -1174,6 +1646,7 @@ def _validate_normalized_result(
         if (~frame["trade_date"].isin(canonical_dates)).any():
             raise HistoricalProviderError("DQ_FAILED", f"{dataset} contains out-of-window rows")
     if dataset in {"daily_price", "adj_factor", "daily_basic"}:
+        pause_event_keys: set[tuple[Any, ...]] = set()
         if dataset == "daily_price" and source_keys:
             if attrs.get("suspend_d_full_event_coverage") is not True:
                 raise HistoricalProviderError(
@@ -1199,12 +1672,26 @@ def _validate_normalized_result(
                     ].itertuples(index=False, name=None),
                 )
             )
-            if asserted_pauses != pause_event_keys:
+            if attrs.get("daily_rows_omit_suspended") is True:
+                if asserted_pauses:
+                    raise HistoricalProviderError(
+                        "DQ_FAILED",
+                        "Tushare daily rows cannot assert a paused trading row",
+                    )
+            elif asserted_pauses != pause_event_keys:
                 raise HistoricalProviderError(
                     "SEMANTIC_SOURCE_UNAVAILABLE",
                     "daily_price pause values and historical event evidence do not match exactly",
                 )
         expected = {(code, day) for code in codes for day in canonical_dates}
+        if dataset == "daily_price" and attrs.get("daily_rows_omit_suspended") is True:
+            unexpected_pause_keys = pause_event_keys - expected
+            if unexpected_pause_keys:
+                raise HistoricalProviderError(
+                    "DQ_FAILED",
+                    "suspension evidence contains rows outside the requested scope",
+                )
+            expected -= pause_event_keys
         observed = set(map(tuple, frame[["stock_code", "trade_date"]].itertuples(index=False, name=None)))
         _require_exact_axis(dataset, expected, observed)
         expected_count = len(expected)
@@ -1305,6 +1792,19 @@ def _lineage(
         if semantics != _SOURCE_SEMANTICS[dataset]:
             raise HistoricalProviderError("SEMANTIC_SOURCE_UNAVAILABLE", f"untrusted {dataset} source semantics")
         return keys, str(semantics)
+    if provider_name in {"tushare", "akshare", "baostock"} and attrs.get("raw_landing_verified") is True:
+        if not isinstance(raw_keys, (list, tuple)) or not raw_keys:
+            raise HistoricalProviderError(
+                "SEMANTIC_SOURCE_UNAVAILABLE",
+                "verified live raw landing keys are required",
+            )
+        keys = tuple(dict.fromkeys(str(value) for value in raw_keys))
+        if any(not _safe_source_key(key) for key in keys):
+            raise HistoricalProviderError(
+                "SEMANTIC_SOURCE_UNAVAILABLE",
+                "unsafe or self-referential live raw landing key",
+            )
+        return keys, _SOURCE_SEMANTICS[dataset]
     return (), str(semantics) if semantics is not None else None
 
 
@@ -1504,10 +2004,16 @@ def _validate_financial_semantics(
         raise HistoricalProviderError("DQ_FAILED", "financial source contains unrequested stock codes")
     if frame.duplicated(["stock_code", "report_period", "announce_date"]).any():
         raise HistoricalProviderError("DQ_FAILED", "duplicate financial disclosure keys")
-    start = chunk.get("report_period_start")
-    end = chunk.get("report_period_end")
-    if ((frame["report_period"] < start) | (frame["report_period"] > end)).any():
-        raise HistoricalProviderError("DQ_FAILED", "financial report period is outside the chunk")
+    if chunk.get("chunk_schema_version") == "goal21.history_backfill_chunk.v2":
+        try:
+            validate_financial_announce_chunk_v2(chunk, frame)
+        except BackfillExecutionError as exc:
+            raise HistoricalProviderError(exc.failure_category, str(exc)) from exc
+    else:
+        start = chunk.get("report_period_start")
+        end = chunk.get("report_period_end")
+        if ((frame["report_period"] < start) | (frame["report_period"] > end)).any():
+            raise HistoricalProviderError("DQ_FAILED", "financial report period is outside the chunk")
 
 
 def _validate_st_semantics(
@@ -1525,7 +2031,12 @@ def _validate_st_semantics(
         raise HistoricalProviderError("DQ_FAILED", "ST source contains unrequested stock codes")
     current_markers = {"CURRENT_NAME_SNAPSHOT", "CURRENT_ST_SNAPSHOT"}
     current_sources = {"current_stock_basic_snapshot", "current_name_snapshot", "current_st_snapshot"}
-    if set(frame["st_type"].astype(str)) & current_markers or set(frame["source"].astype(str)) & current_sources:
+    if (
+        {value.strip().upper() for value in frame["st_type"].astype(str)}
+        & current_markers
+        or {value.strip().lower() for value in frame["source"].astype(str)}
+        & current_sources
+    ):
         raise HistoricalProviderError("SEMANTIC_SOURCE_UNAVAILABLE", "current ST/name snapshot cannot be historical")
     for row in frame.itertuples(index=False):
         if row.end_date is not None and row.end_date <= row.start_date:
@@ -1692,8 +2203,14 @@ def _validate_result_evidence(
 def _sanitize_provider_call(value: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("provider call evidence must be a dictionary")
-    allowed = {"endpoint", "strategy", "parameters", "row_count", "status"}
-    if set(value) != allowed:
+    required = {"endpoint", "strategy", "parameters", "row_count", "status"}
+    optional = {
+        "source_keys",
+        "raw_checksum",
+        "raw_read_back_verified",
+        "response_evidence",
+    }
+    if not required.issubset(value) or set(value) - required - optional:
         raise ValueError("provider call evidence fields are incomplete or unsupported")
     if not isinstance(value["endpoint"], str) or not value["endpoint"]:
         raise ValueError("provider call endpoint must be a non-empty string")
@@ -1705,11 +2222,92 @@ def _sanitize_provider_call(value: dict[str, Any]) -> dict[str, Any]:
     if isinstance(row_count, bool) or not isinstance(row_count, int) or row_count < 0:
         raise ValueError("provider call row_count must be a non-negative integer")
     status = value["status"]
-    if status not in {"FETCHED", "VALID_EMPTY", "MISSING", "FAILED", "SCHEMA_DRIFT"}:
+    if status not in {
+        "FETCHED",
+        "VALID_EMPTY",
+        "MISSING",
+        "FAILED",
+        "SCHEMA_DRIFT",
+        "RAW_LANDING_FAILED",
+        "REUSED_VERIFIED_RAW",
+    }:
         raise ValueError("provider call status is invalid")
-    if (status == "FETCHED") != (row_count > 0):
+    if status in {"FETCHED", "VALID_EMPTY"} and ((status == "FETCHED") != (row_count > 0)):
         raise ValueError("provider call status and row_count disagree")
-    result = {key: deepcopy(value[key]) for key in allowed}
+    source_keys = value.get("source_keys", [])
+    if not isinstance(source_keys, list) or any(
+        not isinstance(key, str) or not _safe_source_key(key) for key in source_keys
+    ):
+        raise ValueError("provider call source_keys are invalid")
+    result = {key: deepcopy(value[key]) for key in required}
+    if "source_keys" in value:
+        result["source_keys"] = list(dict.fromkeys(source_keys))
+    if "raw_checksum" in value:
+        checksum = value["raw_checksum"]
+        if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+            raise ValueError("provider call raw checksum is invalid")
+        result["raw_checksum"] = checksum
+    if "raw_read_back_verified" in value:
+        if value["raw_read_back_verified"] is not True:
+            raise ValueError("provider call raw read-back flag must be true")
+        result["raw_read_back_verified"] = True
+    if "response_evidence" in value:
+        evidence = value["response_evidence"]
+        expected_fields = {
+            "full_market_event_set",
+            "coverage_complete",
+            "sample_truncated",
+            "empty_after_retries",
+            "covered_trade_dates",
+            "pagination",
+        }
+        if value["endpoint"] != "suspend_d" or not isinstance(evidence, dict):
+            raise ValueError("provider call response evidence is invalid")
+        if set(evidence) != expected_fields:
+            raise ValueError("provider call response evidence fields are invalid")
+        for field in (
+            "full_market_event_set",
+            "coverage_complete",
+            "sample_truncated",
+            "empty_after_retries",
+        ):
+            if evidence[field] is not None and type(evidence[field]) is not bool:
+                raise ValueError("provider call response evidence flags are invalid")
+        covered_dates = evidence["covered_trade_dates"]
+        if covered_dates is not None and (
+            not isinstance(covered_dates, list)
+            or any(not isinstance(item, str) for item in covered_dates)
+        ):
+            raise ValueError("provider call response evidence dates are invalid")
+        pagination = evidence["pagination"]
+        if pagination is not None:
+            if not isinstance(pagination, dict) or set(pagination) != {
+                "page_size",
+                "page_count",
+                "row_counts",
+                "terminal_page",
+            }:
+                raise ValueError("provider call pagination evidence is invalid")
+            page_size = pagination["page_size"]
+            page_count = pagination["page_count"]
+            row_counts = pagination["row_counts"]
+            if (
+                isinstance(page_size, bool)
+                or not isinstance(page_size, int)
+                or page_size <= 0
+                or isinstance(page_count, bool)
+                or not isinstance(page_count, int)
+                or page_count <= 0
+                or not isinstance(row_counts, list)
+                or len(row_counts) != page_count
+                or any(
+                    isinstance(item, bool) or not isinstance(item, int) or item < 0
+                    for item in row_counts
+                )
+                or type(pagination["terminal_page"]) is not bool
+            ):
+                raise ValueError("provider call pagination evidence is invalid")
+        result["response_evidence"] = deepcopy(evidence)
     result["endpoint"] = _sanitize_json_value(result["endpoint"])
     result["strategy"] = _sanitize_json_value(result["strategy"])
     result["parameters"] = _sanitize_json_value(result["parameters"])

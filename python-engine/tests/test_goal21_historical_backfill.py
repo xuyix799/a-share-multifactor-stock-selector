@@ -1702,6 +1702,7 @@ def test_daily_price_uses_code_range_daily_date_limit_and_full_market_suspend_ca
             {
                 "trade_date": "20240102",
                 "fields": "ts_code,trade_date,suspend_timing,suspend_type",
+                "suspend_type": "S",
             },
         ),
         (
@@ -1709,10 +1710,14 @@ def test_daily_price_uses_code_range_daily_date_limit_and_full_market_suspend_ca
             {
                 "trade_date": "20240103",
                 "fields": "ts_code,trade_date,suspend_timing,suspend_type",
+                "suspend_type": "S",
             },
         ),
     ]
-    assert [call["endpoint"] for call in result.provider_calls] == [item[0] for item in observed]
+    assert [call["endpoint"] for call in result.provider_calls] == [
+        "trade_cal",
+        *[item[0] for item in observed],
+    ]
     persisted_calls = json.dumps(result.provider_calls, ensure_ascii=False).lower()
     for secret in [
         "header-secret",
@@ -2002,8 +2007,8 @@ def test_st_history_requires_historical_interval_proof_and_strict_valid_empty_ev
     assert invalid_interval_result.failure["category"] == "DQ_FAILED"
 
     current = _copy_frame(valid)
-    current.loc[0, "st_type"] = "CURRENT_ST_SNAPSHOT"
-    current.loc[0, "source"] = "current_st_snapshot"
+    current.loc[0, "st_type"] = "Current_ST_Snapshot"
+    current.loc[0, "source"] = "Current_St_Snapshot"
     current_result = provider.HistoricalProviderRouter(
         plan=plan,
         provider_name="fixture",
@@ -2127,8 +2132,9 @@ def test_historical_provider_failure_conversion_is_precise_and_redacted(case, ca
     assert "super-secret" not in result.failure["message"]
     if case == "schema":
         assert result.actual_schema == ("ts_code", "trade_date")
-        assert len(result.provider_calls) == 1
-        assert result.provider_calls[0]["endpoint"] == "adj_factor"
+        assert len(result.provider_calls) == 2
+        assert result.provider_calls[0]["endpoint"] == "trade_cal"
+        assert result.provider_calls[1]["endpoint"] == "adj_factor"
 
 
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), SystemExit(7)], ids=["keyboard", "system-exit"])
@@ -2420,13 +2426,17 @@ def test_router_defensive_copies_plan_chunk_raw_attrs_calendar_calls_and_result_
     first.frame.loc[0, "adj_factor"] = 77.0
     first.coverage["complete"] = False
     first.dq["blocked_reasons"].append("caller mutation")
-    first.provider_calls[0]["parameters"]["start_date"] = "19000101"
+    next(
+        call for call in first.provider_calls if call["endpoint"] == "adj_factor"
+    )["parameters"]["start_date"] = "19000101"
     second = router.fetch_chunk(deepcopy(original_chunk))
 
     assert second.frame.loc[0, "adj_factor"] == 1.0
     assert second.coverage["complete"] is True
     assert second.dq["blocked_reasons"] == []
-    assert second.provider_calls[0]["parameters"]["start_date"] == "2024-01-02"
+    assert next(
+        call for call in second.provider_calls if call["endpoint"] == "adj_factor"
+    )["parameters"]["start_date"] == "2024-01-02"
     assert len(calendar_frames) == 1
     serialized = json.dumps(
         {
@@ -2569,8 +2579,8 @@ def test_failure_results_preserve_raw_schema_and_sanitized_provider_calls():
 
     assert result.provider_status == "BLOCKED"
     assert result.actual_schema == tuple(raw.columns)
-    assert len(result.provider_calls) == 1
-    assert result.provider_calls[0]["endpoint"] == "adj_factor"
+    assert len(result.provider_calls) == 2
+    assert [call["endpoint"] for call in result.provider_calls] == ["trade_cal", "adj_factor"]
 
 
 def test_failure_schema_labels_are_normalized_to_json_safe_strings():
@@ -2732,7 +2742,8 @@ def test_fixture_pause_event_proof_must_match_is_paused_in_both_directions():
     assert result.provider_status == "BLOCKED"
     assert result.failure["category"] == "SEMANTIC_SOURCE_UNAVAILABLE"
     assert result.actual_schema == tuple(raw.columns)
-    assert len(result.provider_calls) == 1
+    assert len(result.provider_calls) == 2
+    assert result.provider_calls[0]["endpoint"] == "trade_cal"
 
 
 def test_financial_rows_cannot_escape_the_requested_code_scope():
@@ -2887,7 +2898,11 @@ def test_benchmark_missing_change_field_is_schema_drift_with_observed_evidence()
     assert result.provider_status == "BLOCKED"
     assert result.failure["category"] == "SCHEMA_DRIFT"
     assert result.actual_schema == tuple(raw.columns)
-    assert len(result.provider_calls) == 1
+    assert len(result.provider_calls) == 2
+    assert [call["endpoint"] for call in result.provider_calls] == [
+        "trade_cal",
+        "benchmark_price",
+    ]
 
 
 def test_provider_configuration_error_is_nonretryable_and_keeps_failed_call_evidence():
@@ -2914,8 +2929,9 @@ def test_provider_configuration_error_is_nonretryable_and_keeps_failed_call_evid
     assert result.failure["category"] == "CONFIGURATION_ERROR"
     assert result.failure["retryable"] is False
     assert result.failure["exception_type"] == "ProviderConfigurationError"
-    assert len(result.provider_calls) == 1
-    assert result.provider_calls[0]["status"] == "FAILED"
+    assert len(result.provider_calls) == 2
+    assert result.provider_calls[0]["endpoint"] == "trade_cal"
+    assert result.provider_calls[1]["status"] == "FAILED"
     assert "configuration-secret" not in json.dumps(result.provider_calls).lower()
     assert "configuration-secret" not in result.failure["message"].lower()
 
@@ -2937,8 +2953,9 @@ def test_non_dataframe_response_records_stable_schema_and_failed_provider_call()
     assert result.provider_status == "BLOCKED"
     assert result.failure["category"] == "SCHEMA_DRIFT"
     assert result.actual_schema == ("NON_DATAFRAME:dict",)
-    assert len(result.provider_calls) == 1
-    assert result.provider_calls[0]["status"] == "SCHEMA_DRIFT"
+    assert len(result.provider_calls) == 2
+    assert result.provider_calls[0]["endpoint"] == "trade_cal"
+    assert result.provider_calls[1]["status"] == "SCHEMA_DRIFT"
 
 
 def test_composite_daily_price_schema_error_keeps_all_calls_and_primary_raw_schema():
@@ -2991,7 +3008,12 @@ def test_composite_daily_price_schema_error_keeps_all_calls_and_primary_raw_sche
     assert result.provider_status == "BLOCKED"
     assert result.failure["category"] == "SCHEMA_DRIFT"
     assert result.actual_schema == tuple(daily.columns)
-    assert [call["endpoint"] for call in result.provider_calls] == ["daily", "stk_limit", "suspend_d"]
+    assert [call["endpoint"] for call in result.provider_calls] == [
+        "trade_cal",
+        "daily",
+        "stk_limit",
+        "suspend_d",
+    ]
 
 
 def test_unknown_provider_parameter_objects_are_stringified_then_redacted():
@@ -3301,7 +3323,12 @@ def test_live_suspend_rows_must_equal_the_requested_trade_date():
 
     assert result.provider_status == "BLOCKED"
     assert result.failure["category"] == "DQ_FAILED"
-    assert [call["endpoint"] for call in result.provider_calls] == ["daily", "stk_limit", "suspend_d"]
+    assert [call["endpoint"] for call in result.provider_calls] == [
+        "trade_cal",
+        "daily",
+        "stk_limit",
+        "suspend_d",
+    ]
 
 
 def test_live_limit_rows_must_equal_the_requested_trade_date():
@@ -3357,7 +3384,11 @@ def test_live_limit_rows_must_equal_the_requested_trade_date():
 
     assert result.provider_status == "BLOCKED"
     assert result.failure["category"] == "DQ_FAILED"
-    assert [call["endpoint"] for call in result.provider_calls] == ["daily", "stk_limit"]
+    assert [call["endpoint"] for call in result.provider_calls] == [
+        "trade_cal",
+        "daily",
+        "stk_limit",
+    ]
 
 
 def test_proven_complete_empty_suspend_without_columns_is_accepted():
@@ -3433,7 +3464,8 @@ def test_empty_dataframe_without_columns_is_empty_result_not_schema_drift():
     assert result.provider_status == "BLOCKED"
     assert result.failure["category"] == "EMPTY_RESULT"
     assert result.actual_schema == ()
-    assert len(result.provider_calls) == 1
+    assert len(result.provider_calls) == 2
+    assert result.provider_calls[0]["endpoint"] == "trade_cal"
 
 
 def test_present_but_invalid_numeric_value_is_dq_failed_not_schema_drift():
@@ -3599,7 +3631,8 @@ def test_multicode_concat_propagates_later_sample_truncation_evidence():
 
     assert result.provider_status == "BLOCKED"
     assert result.failure["category"] == "DQ_FAILED"
-    assert len(result.provider_calls) == 2
+    assert len(result.provider_calls) == 3
+    assert result.provider_calls[0]["endpoint"] == "trade_cal"
 
 
 def _historical_provider_module():
