@@ -14,6 +14,7 @@ from stock_selector.data.historical_backfill import (
     BackfillPlanningError,
     build_history_backfill_plan,  # noqa: F401 - retained as a v1 compatibility export
     build_history_backfill_plan_v2,
+    dataframe_checksum,
     persist_historical_raw_landing,
     run_real_history_backfill,
 )
@@ -907,6 +908,41 @@ def _cmd_run_real_history_backfill(args: argparse.Namespace) -> int:
     return 0 if output["status"] in {"DRY_RUN", "STAGED", "COMPLETED"} else 1
 
 
+def _cmd_run_real_clean_universe_range(args: argparse.Namespace) -> int:
+    from stock_selector.data.real_clean_universe import run_real_clean_universe_range
+
+    try:
+        start_date, end_date = validate_date_range(args.start_date, args.end_date)
+        trade_dates = (
+            _parse_goal22_trade_dates(args.trade_dates)
+            if args.trade_dates
+            else _discover_goal22_trade_dates(start_date, end_date)
+        )
+        input_reader = _Goal22CanonicalInputReader()
+        result = run_real_clean_universe_range(
+            run_id=args.run_id,
+            start_date=start_date,
+            end_date=end_date,
+            trade_dates=trade_dates,
+            input_read_fn=input_reader.read,
+            artifact_read_json_fn=_load_tushare_candidate_batch_json,
+            artifact_write_json_fn=_write_tushare_candidate_batch_json,
+            processed_read_fn=_read_goal22_processed if args.apply else None,
+            processed_write_fn=_write_goal22_processed if args.apply else None,
+            apply_processed_write=args.apply,
+            resume=args.resume,
+            force=args.force,
+            trade_date_source=("EXPLICIT_CLI" if args.trade_dates else "STANDARD_MARKET_PARTITION_UNION"),
+        )
+    except (DateValidationError, DataValidationError, DatasetValidationError, ValueError, FileNotFoundError) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    output = _real_clean_universe_range_cli_output(result)
+    print(json.dumps(output, ensure_ascii=False, default=str))
+    return 0 if output["status"] in {"READY_FOR_APPLY", "COMPLETED"} else 1
+
+
 def _cmd_validate_provider_data(args: argparse.Namespace) -> int:
     try:
         trade_date = validate_trade_date(args.trade_date)
@@ -1597,6 +1633,90 @@ def _parse_history_codes(value: str | None) -> list[str]:
     return codes
 
 
+def _parse_goal22_trade_dates(value: str) -> list[str]:
+    trade_dates = sorted(
+        {
+            validate_trade_date(item.strip())
+            for item in value.split(",")
+            if item.strip()
+        }
+    )
+    if not trade_dates:
+        raise ValueError("trade_dates must contain at least one date")
+    return trade_dates
+
+
+def _discover_goal22_trade_dates(start_date: str, end_date: str) -> list[str]:
+    start_date, end_date = validate_date_range(start_date, end_date)
+    trade_dates = {
+        _goal22_partition_date(dataset, object_key)
+        for dataset in ("daily_price", "adj_factor", "daily_basic", "benchmark_price")
+        for object_key in _list_goal22_partition_keys(dataset)
+        if start_date <= _goal22_partition_date(dataset, object_key) <= end_date
+    }
+    if not trade_dates:
+        raise FileNotFoundError(
+            "no standard market input partitions found in the requested range; "
+            "provide --trade-dates to audit an explicit trading calendar"
+        )
+    return sorted(trade_dates)
+
+
+class _Goal22CanonicalInputReader:
+    def __init__(self) -> None:
+        self._keys: dict[str, list[str]] = {}
+        self._frames: dict[str, pd.DataFrame] = {}
+
+    def read(self, dataset: str, trade_date: str):
+        from stock_selector.data.real_clean_universe import INPUT_KEY_COLUMNS, InputArtifact, InputVersion
+
+        dataset = validate_dataset(dataset)
+        trade_date = validate_trade_date(trade_date)
+        if dataset in {"financial", "st_history"}:
+            object_keys = [
+                key
+                for key in self._dataset_keys(dataset)
+                if _goal22_partition_date(dataset, key) <= trade_date
+            ]
+        else:
+            object_keys = [f"raw/{dataset}/trade_date={trade_date}/part.parquet"]
+        if not object_keys:
+            raise FileNotFoundError(f"missing raw history for {dataset} <= {trade_date}")
+
+        frames: list[pd.DataFrame] = []
+        versions: list[InputVersion] = []
+        keys = INPUT_KEY_COLUMNS[dataset]
+        for object_key in object_keys:
+            frame = self._read_object(object_key)
+            if not frame.empty and frame.duplicated(keys).any():
+                raise DataValidationError(f"duplicate logical keys in canonical input {object_key}")
+            frames.append(frame)
+            versions.append(
+                InputVersion(
+                    object_key=object_key,
+                    row_count=len(frame),
+                    checksum=dataframe_checksum(frame),
+                )
+            )
+        combined = pd.concat(frames, ignore_index=True)
+        if not combined.empty:
+            distinct_rows = combined.drop_duplicates().reset_index(drop=True)
+            if distinct_rows.duplicated(keys, keep=False).any():
+                raise DataValidationError(f"conflicting historical versions for {dataset} logical keys")
+            combined = distinct_rows.drop_duplicates(keys, keep="last").reset_index(drop=True)
+        return InputArtifact(frame=combined, versions=tuple(versions))
+
+    def _dataset_keys(self, dataset: str) -> list[str]:
+        if dataset not in self._keys:
+            self._keys[dataset] = _list_goal22_partition_keys(dataset)
+        return self._keys[dataset]
+
+    def _read_object(self, object_key: str) -> pd.DataFrame:
+        if object_key not in self._frames:
+            self._frames[object_key] = _load_tushare_candidate_batch_parquet(object_key)
+        return self._frames[object_key].copy(deep=True)
+
+
 def _validate_history_universe_key(value: str | None) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError("universe_key must be a non-empty Parquet object key")
@@ -1727,6 +1847,22 @@ def _real_history_backfill_cli_output(result: dict) -> dict:
     }
 
 
+def _real_clean_universe_range_cli_output(result: dict) -> dict:
+    return {
+        "goal": "22",
+        "run_id": result.get("run_id"),
+        "status": result.get("status"),
+        "mode": result.get("mode", "DRY_RUN"),
+        "apply_requested": result.get("apply_requested", False),
+        "date_statuses": result.get("date_statuses", {}),
+        "status_counts": result.get("status_counts", {}),
+        "range_manifest_key": result.get("range_manifest_key"),
+        "daily_report_keys": result.get("daily_report_keys", {}),
+        "processed_output_keys": result.get("processed_output_keys", {}),
+        "downstream_firewalls": result.get("downstream_firewalls", {}),
+    }
+
+
 def _tushare_provider_config_status(exc: ProviderConfigurationError) -> str:
     message = str(exc).lower()
     if "disabled" in message:
@@ -1754,6 +1890,92 @@ def _read_history_canonical(dataset: str, trade_date: str) -> pd.DataFrame | Non
         return _read_dataset(dataset, trade_date)
     except FileNotFoundError:
         return None
+
+
+def _list_goal22_partition_keys(dataset: str) -> list[str]:
+    dataset = validate_dataset(dataset)
+    settings = load_settings()
+    prefix = f"raw/{dataset}/trade_date="
+    if _storage_backend(settings) == "local":
+        root = _local_root(settings) / "raw" / dataset
+        if not root.exists():
+            return []
+        keys = [
+            f"raw/{dataset}/{path.parent.name}/part.parquet"
+            for path in root.glob("trade_date=*/part.parquet")
+        ]
+    else:
+        client = create_minio_client(settings)
+        bucket = settings["storage"]["minio_bucket_raw"]
+        keys = [
+            item.object_name
+            for item in client.list_objects(bucket, prefix=prefix, recursive=True)
+            if item.object_name.endswith("/part.parquet")
+        ]
+    valid_keys = []
+    for object_key in keys:
+        try:
+            _goal22_partition_date(dataset, object_key)
+        except (DateValidationError, ValueError):
+            continue
+        valid_keys.append(object_key)
+    return sorted(set(valid_keys), key=lambda key: (_goal22_partition_date(dataset, key), key))
+
+
+def _goal22_partition_date(dataset: str, object_key: str) -> str:
+    prefix = f"raw/{dataset}/trade_date="
+    if not object_key.startswith(prefix) or not object_key.endswith("/part.parquet"):
+        raise ValueError(f"invalid raw partition key for {dataset}: {object_key}")
+    suffix = object_key[len(prefix) :]
+    partition_date, separator, tail = suffix.partition("/")
+    if separator != "/" or tail != "part.parquet":
+        raise ValueError(f"invalid raw partition key for {dataset}: {object_key}")
+    return validate_trade_date(partition_date)
+
+
+def _read_goal22_processed(dataset: str, trade_date: str) -> pd.DataFrame:
+    dataset = validate_dataset(dataset)
+    trade_date = validate_trade_date(trade_date)
+    object_key = f"processed/{dataset}/trade_date={trade_date}/part.parquet"
+    settings = load_settings()
+    if _storage_backend(settings) == "local":
+        path = _local_root(settings) / object_key
+        if not path.exists():
+            raise FileNotFoundError(object_key)
+        return pd.read_parquet(path)
+
+    client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_processed"]
+    with tempfile.TemporaryDirectory(prefix="stock-goal22-processed-read-") as tmp:
+        target = Path(tmp) / object_key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            client.fget_object(bucket, object_key, str(target))
+        except S3Error as exc:
+            if exc.code in {"NoSuchKey", "NoSuchBucket", "NoSuchObject"}:
+                raise FileNotFoundError(object_key) from exc
+            raise
+        return pd.read_parquet(target)
+
+
+def _write_goal22_processed(dataset: str, trade_date: str, frame: pd.DataFrame) -> str:
+    dataset = validate_dataset(dataset)
+    trade_date = validate_trade_date(trade_date)
+    validate_dataset_frame(dataset, frame, trade_date)
+    object_key = f"processed/{dataset}/trade_date={trade_date}/part.parquet"
+    settings = load_settings()
+    if _storage_backend(settings) == "local":
+        write_parquet_local_atomic(frame, _local_root(settings) / object_key)
+        return object_key
+
+    client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_processed"]
+    ensure_buckets(client, [bucket])
+    with tempfile.TemporaryDirectory(prefix="stock-goal22-processed-write-") as tmp:
+        local_file = Path(tmp) / "part.parquet"
+        frame.to_parquet(local_file, index=False)
+        AtomicObjectWriter(client, tmp_dir=Path(tmp)).write_file_atomic(bucket, object_key, local_file)
+    return object_key
 
 
 def _materialize_dataset(dataset: str, trade_date: str, tmp_root: Path) -> Path:
@@ -2007,6 +2229,24 @@ def build_parser() -> argparse.ArgumentParser:
     # v2 never reinterprets this report-period option as announcement scope.
     run_real_history_backfill.add_argument("--report-period-months", type=int, default=3)
     run_real_history_backfill.set_defaults(resume=True, func=_cmd_run_real_history_backfill)
+
+    run_real_clean_universe = subparsers.add_parser(
+        "run-real-clean-universe-range",
+        allow_abbrev=False,
+    )
+    run_real_clean_universe.add_argument("--run-id", required=True)
+    run_real_clean_universe.add_argument("--start-date", required=True)
+    run_real_clean_universe.add_argument("--end-date", required=True)
+    run_real_clean_universe.add_argument(
+        "--trade-dates",
+        help="optional comma-separated authoritative trading dates; otherwise discover the union of market input partitions",
+    )
+    run_real_clean_universe.add_argument("--apply", action="store_true")
+    goal22_resume = run_real_clean_universe.add_mutually_exclusive_group()
+    goal22_resume.add_argument("--resume", dest="resume", action="store_true")
+    goal22_resume.add_argument("--no-resume", dest="resume", action="store_false")
+    run_real_clean_universe.add_argument("--force", action="store_true")
+    run_real_clean_universe.set_defaults(resume=True, func=_cmd_run_real_clean_universe_range)
 
     validate_provider_data = subparsers.add_parser("validate-provider-data")
     validate_provider_data.add_argument("--trade-date", required=True)

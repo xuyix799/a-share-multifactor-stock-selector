@@ -53,10 +53,14 @@ class AtomicObjectWriter:
     def _temp_key_for(final_key: str) -> str:
         path = PureObjectKey(final_key)
         parent = path.parent
+        temp_root = "_raw_tmp"
         if parent.startswith("raw/"):
             parent = parent[len("raw/") :]
+        elif parent.startswith("processed/"):
+            parent = parent[len("processed/") :]
+            temp_root = "_processed_tmp"
         suffix = Path(path.name).suffix or ".parquet"
-        return safe_object_key(f"_raw_tmp/{parent}/{uuid4().hex}{suffix}")
+        return safe_object_key(f"{temp_root}/{parent}/{uuid4().hex}{suffix}")
 
 
 def write_parquet_local_atomic(df: pd.DataFrame, final_path: Path | str) -> Path:
