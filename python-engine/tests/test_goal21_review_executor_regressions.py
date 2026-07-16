@@ -1390,6 +1390,147 @@ def _leave_ready_report_without_final_checkpoint(
     return harness, ready
 
 
+def _leave_provider_only_ready_report_without_final_checkpoint(
+    plan: dict[str, Any],
+) -> tuple[MemoryHarness, dict[str, Any]]:
+    harness = MemoryHarness()
+    harness.fetch_factory = _adj_result
+
+    def fail_staged_checkpoint(key: str, payload: dict[str, Any]) -> None:
+        if (
+            "/chunk_id=" in key
+            and key.endswith("/manifest.json")
+            and payload.get("state") == "STAGED"
+        ):
+            raise InjectedFailure(
+                "final provider checkpoint unavailable",
+                failure_category="WRITE_FAILED",
+            )
+
+    harness.json_write_hook = fail_staged_checkpoint
+    _run(harness, plan, provider=True, apply=False)
+    ready = harness.attempt_report(plan)
+    assert ready["state"] == "READY_TO_CHECKPOINT"
+    assert ready["checkpoint_target_state"] == "STAGED"
+    assert ready["requested_stages"] == ["provider"]
+    assert harness.manifest(plan)["state"] == "FAILED"
+    harness.json_write_hook = None
+    return harness, ready
+
+
+def _leave_apply_only_ready_report_without_final_checkpoint(
+    plan: dict[str, Any],
+) -> tuple[MemoryHarness, dict[str, Any]]:
+    harness = MemoryHarness()
+    harness.fetch_factory = _adj_result
+    _run(harness, plan, provider=True, apply=False)
+
+    def fail_completed_checkpoint(key: str, payload: dict[str, Any]) -> None:
+        if (
+            "/chunk_id=" in key
+            and key.endswith("/manifest.json")
+            and payload.get("state") == "COMPLETED"
+        ):
+            raise InjectedFailure(
+                "final apply checkpoint unavailable",
+                failure_category="WRITE_FAILED",
+            )
+
+    harness.json_write_hook = fail_completed_checkpoint
+    _run(harness, plan, provider=False, apply=True)
+    ready = harness.attempt_report(plan, attempt=2)
+    assert ready["state"] == "READY_TO_CHECKPOINT"
+    assert ready["checkpoint_target_state"] == "COMPLETED"
+    assert ready["requested_stages"] == ["apply"]
+    assert harness.manifest(plan)["state"] == "FAILED"
+    harness.json_write_hook = None
+    return harness, ready
+
+
+@pytest.mark.parametrize(
+    ("report_mode", "manifest_stages"),
+    [
+        ("combined", ["apply"]),
+        ("combined", ["provider"]),
+        ("apply_only", ["provider", "apply"]),
+        ("apply_only", ["provider"]),
+    ],
+)
+def test_ready_recovery_rejects_legal_but_conflicting_manifest_and_report_stages(
+    report_mode: str,
+    manifest_stages: list[str],
+):
+    plan = _plan(
+        run_id=(
+            "goal21-final-ready-stage-conflict-"
+            f"{report_mode}-{'-'.join(manifest_stages)}"
+        )
+    )
+    if report_mode == "combined":
+        harness, ready = _leave_ready_report_without_final_checkpoint(plan)
+    else:
+        harness, ready = _leave_apply_only_ready_report_without_final_checkpoint(plan)
+
+    manifest_key = _keys(plan)["chunks"][plan["chunks"][0]["chunk_id"]]["manifest"]
+    tampered_manifest = deepcopy(harness.json_objects[manifest_key])
+    tampered_manifest["requested_stages"] = list(manifest_stages)
+    harness.json_objects[manifest_key] = tampered_manifest
+    manifest_before = deepcopy(tampered_manifest)
+    report_before = deepcopy(ready)
+    harness.reset_events()
+
+    with pytest.raises(backfill.BackfillPlanningError) as exc_info:
+        _run(harness, plan, provider=False, apply=True)
+
+    assert exc_info.value.code == "INVALID_READY_REPORT"
+    assert harness.json_objects[manifest_key] == manifest_before
+    assert harness.attempt_report(plan, attempt=ready["attempt"]) == report_before
+    assert _event_count(harness, "fetch") == 0
+    assert _event_count(harness, "artifact_parquet_write") == 0
+    assert _event_count(harness, "canonical_write") == 0
+    assert not any(
+        event[0] == "chunk_manifest_write" and event[2] in {"STAGED", "COMPLETED"}
+        for event in harness.events
+    )
+
+
+def test_provider_only_ready_recovery_still_reconstructs_staged_without_refetch():
+    plan = _plan(run_id="goal21-final-provider-only-ready-recovery")
+    harness, ready = _leave_provider_only_ready_report_without_final_checkpoint(plan)
+    harness.reset_events()
+
+    _run(harness, plan, provider=True, apply=False)
+
+    manifest = harness.manifest(plan)
+    assert manifest["state"] == "STAGED"
+    assert manifest["requested_stages"] == ready["requested_stages"] == ["provider"]
+    assert manifest["attempt_count"] == ready["attempt"] == 1
+    assert _event_count(harness, "fetch") == 0
+    assert _event_count(harness, "artifact_parquet_write") == 0
+    assert _event_count(harness, "canonical_write") == 0
+
+
+def test_apply_only_ready_recovery_still_reconstructs_completed_without_rewrite():
+    plan = _plan(run_id="goal21-final-apply-only-ready-recovery")
+    harness, ready = _leave_apply_only_ready_report_without_final_checkpoint(plan)
+    canonical_before = harness.canonical_objects[("adj_factor", DATE_1)].copy(deep=True)
+    harness.reset_events()
+
+    _run(harness, plan, provider=False, apply=True)
+
+    manifest = harness.manifest(plan)
+    assert manifest["state"] == "COMPLETED"
+    assert manifest["requested_stages"] == ready["requested_stages"] == ["apply"]
+    assert manifest["attempt_count"] == ready["attempt"] == 2
+    assert _event_count(harness, "fetch") == 0
+    assert _event_count(harness, "artifact_parquet_write") == 0
+    assert _event_count(harness, "canonical_write") == 0
+    pd.testing.assert_frame_equal(
+        harness.canonical_objects[("adj_factor", DATE_1)],
+        canonical_before,
+    )
+
+
 def test_apply_only_recovers_valid_ready_report_without_refetch_or_duplicate_write():
     plan = _plan(run_id="goal21-review-ready-recovery")
     harness, ready = _leave_ready_report_without_final_checkpoint(plan)

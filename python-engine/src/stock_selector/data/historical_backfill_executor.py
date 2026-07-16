@@ -1020,6 +1020,8 @@ def _recover_ready_checkpoint(
         ["provider", "apply"],
     ):
         raise invalid("READY report requested stages are invalid")
+    if manifest.get("requested_stages") != requested_stages:
+        raise invalid("READY report requested stages do not match the mutable manifest")
     target_state = report.get("checkpoint_target_state")
     if target_state not in {"STAGED", "COMPLETED"}:
         raise invalid("READY report checkpoint target is invalid")

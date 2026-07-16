@@ -8,9 +8,6 @@ from pathlib import Path
 import pandas as pd
 from minio.error import S3Error
 
-from stock_selector.backtesting.backtest_pipeline import BacktestConfig, run_backtest
-from stock_selector.cleaning.clean_pipeline import build_adjusted_price_for_date, build_clean_snapshot_for_date
-from stock_selector.cleaning.snapshot_validator import validate_clean_daily_snapshot
 from stock_selector.config.config_loader import load_factor_weights_config, load_settings
 from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame, validate_stock_code
 from stock_selector.data.historical_backfill import (
@@ -51,8 +48,6 @@ from stock_selector.data.tushare_suspension_status_candidate import (
 )
 from stock_selector.data.update_pipeline import update_provider_data
 from stock_selector.data.update_log import create_update_log_repository
-from stock_selector.factors.factor_pipeline import build_factor_daily_for_date
-from stock_selector.factors.factor_validator import validate_factor_daily
 from stock_selector.providers.base import ProviderConfigurationError
 from stock_selector.providers.akshare_provider import AKShareProvider
 from stock_selector.providers.historical_provider import HistoricalProviderRouter
@@ -62,8 +57,6 @@ from stock_selector.providers.schema_mapper import SchemaMappingError, normalize
 from stock_selector.providers.tushare_goal10r_probe import probe_tushare_goal10r
 from stock_selector.providers.tushare_goal12b_probe import probe_tushare_goal12b
 from stock_selector.providers.tushare_provider import TushareProvider
-from stock_selector.scoring.selection_pipeline import build_selection_for_date
-from stock_selector.scoring.selection_validator import validate_selection_result
 from stock_selector.storage.atomic_writer import AtomicObjectWriter
 from stock_selector.storage.atomic_writer import write_parquet_local_atomic
 from stock_selector.storage.duckdb_query import query_dataset_file, query_stock_price_files
@@ -77,7 +70,6 @@ from stock_selector.storage.partition import (
     validate_provider_smoke_dataset,
 )
 from stock_selector.storage.postgres_client import create_postgres_client
-from stock_selector.universe.universe_pipeline import build_universe_inputs_for_date
 from stock_selector.utils.date_validator import DateValidationError, validate_date_range, validate_trade_date
 from stock_selector.utils.logger import get_logger
 from stock_selector.utils.path_validator import safe_object_key
@@ -96,6 +88,80 @@ DEFAULT_GOAL13_CODES = [
     "600900.SH",
     "002415.SZ",
 ]
+
+
+def build_adjusted_price_for_date(*args, **kwargs):
+    from stock_selector.cleaning.clean_pipeline import (
+        build_adjusted_price_for_date as implementation,
+    )
+
+    return implementation(*args, **kwargs)
+
+
+def build_clean_snapshot_for_date(*args, **kwargs):
+    from stock_selector.cleaning.clean_pipeline import (
+        build_clean_snapshot_for_date as implementation,
+    )
+
+    return implementation(*args, **kwargs)
+
+
+def validate_clean_daily_snapshot(*args, **kwargs):
+    from stock_selector.cleaning.snapshot_validator import (
+        validate_clean_daily_snapshot as implementation,
+    )
+
+    return implementation(*args, **kwargs)
+
+
+def build_universe_inputs_for_date(*args, **kwargs):
+    from stock_selector.universe.universe_pipeline import (
+        build_universe_inputs_for_date as implementation,
+    )
+
+    return implementation(*args, **kwargs)
+
+
+def build_factor_daily_for_date(*args, **kwargs):
+    from stock_selector.factors.factor_pipeline import (
+        build_factor_daily_for_date as implementation,
+    )
+
+    return implementation(*args, **kwargs)
+
+
+def validate_factor_daily(*args, **kwargs):
+    from stock_selector.factors.factor_validator import validate_factor_daily as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def build_selection_for_date(*args, **kwargs):
+    from stock_selector.scoring.selection_pipeline import (
+        build_selection_for_date as implementation,
+    )
+
+    return implementation(*args, **kwargs)
+
+
+def validate_selection_result(*args, **kwargs):
+    from stock_selector.scoring.selection_validator import (
+        validate_selection_result as implementation,
+    )
+
+    return implementation(*args, **kwargs)
+
+
+def BacktestConfig(*args, **kwargs):
+    from stock_selector.backtesting.backtest_pipeline import BacktestConfig as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def run_backtest(*args, **kwargs):
+    from stock_selector.backtesting.backtest_pipeline import run_backtest as implementation
+
+    return implementation(*args, **kwargs)
 
 
 def _cmd_validate_date(args: argparse.Namespace) -> int:

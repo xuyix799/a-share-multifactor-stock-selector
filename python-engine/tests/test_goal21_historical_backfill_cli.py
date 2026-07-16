@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import ast
+import importlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pandas as pd
 import pytest
@@ -21,6 +26,170 @@ BASE_ARGS = [
     "--codes",
     "000001.SZ,600519.SH",
 ]
+
+FORBIDDEN_DOWNSTREAM_MODULES = (
+    "stock_selector.cleaning",
+    "stock_selector.universe",
+    "stock_selector.factors",
+    "stock_selector.scoring",
+    "stock_selector.backtesting",
+)
+
+GOAL21_FRAMEWORK_PATHS = (
+    Path(__file__).resolve().parents[1] / "src" / "stock_selector" / "cli.py",
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "stock_selector"
+    / "data"
+    / "historical_backfill.py",
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "stock_selector"
+    / "data"
+    / "historical_backfill_executor.py",
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "stock_selector"
+    / "providers"
+    / "historical_provider.py",
+)
+
+DOWNSTREAM_ENTRYPOINTS = {
+    "stock_selector.cleaning.clean_pipeline": (
+        "build_adjusted_price_for_date",
+        "build_clean_snapshot_for_date",
+    ),
+    "stock_selector.cleaning.snapshot_validator": ("validate_clean_daily_snapshot",),
+    "stock_selector.universe.universe_pipeline": ("build_universe_inputs_for_date",),
+    "stock_selector.factors.factor_pipeline": ("build_factor_daily_for_date",),
+    "stock_selector.factors.factor_validator": ("validate_factor_daily",),
+    "stock_selector.scoring.selection_pipeline": ("build_selection_for_date",),
+    "stock_selector.scoring.selection_validator": ("validate_selection_result",),
+    "stock_selector.backtesting.backtest_pipeline": ("BacktestConfig", "run_backtest"),
+}
+
+
+class _ModuleImportVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.imports: list[str] = []
+
+    def visit_Import(self, node: ast.Import) -> None:
+        self.imports.extend(alias.name for alias in node.names)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module:
+            self.imports.append(node.module)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return None
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return None
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return None
+
+
+def _module_runtime_imports(path: Path) -> list[str]:
+    visitor = _ModuleImportVisitor()
+    visitor.visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+    return visitor.imports
+
+
+def _is_forbidden_downstream_module(module_name: str) -> bool:
+    return any(
+        module_name == prefix or module_name.startswith(f"{prefix}.")
+        for prefix in FORBIDDEN_DOWNSTREAM_MODULES
+    )
+
+
+def test_goal21_framework_and_cli_have_no_module_runtime_downstream_imports():
+    violations = {
+        str(path.relative_to(Path(__file__).resolve().parents[1])): sorted(
+            module_name
+            for module_name in _module_runtime_imports(path)
+            if _is_forbidden_downstream_module(module_name)
+        )
+        for path in GOAL21_FRAMEWORK_PATHS
+    }
+    violations = {path: imports for path, imports in violations.items() if imports}
+
+    assert violations == {}
+
+
+def test_goal21_default_dry_run_fresh_process_never_loads_downstream_modules(tmp_path):
+    script = f"""
+import json
+import sys
+
+forbidden = {FORBIDDEN_DOWNSTREAM_MODULES!r}
+
+def loaded():
+    return sorted(
+        name
+        for name in sys.modules
+        if any(name == prefix or name.startswith(prefix + '.') for prefix in forbidden)
+    )
+
+from stock_selector import cli
+
+after_import = loaded()
+exit_code = cli.main({BASE_ARGS!r})
+after_dry_run = loaded()
+print('__GOAL21_FIREWALL__=' + json.dumps({{
+    'exit_code': exit_code,
+    'after_import': after_import,
+    'after_dry_run': after_dry_run,
+}}))
+"""
+    env = os.environ.copy()
+    env["STOCK_PARQUET_BACKEND"] = "local"
+    env["STOCK_LOCAL_DATA_DIR"] = str(tmp_path)
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(
+        value for value in (source_root, env.get("PYTHONPATH")) if value
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    marker = next(
+        line for line in completed.stdout.splitlines() if line.startswith("__GOAL21_FIREWALL__=")
+    )
+    evidence = json.loads(marker.split("=", 1)[1])
+    assert evidence == {"exit_code": 0, "after_import": [], "after_dry_run": []}
+
+
+def test_goal21_handler_does_not_invoke_any_downstream_entrypoint(monkeypatch, tmp_path, capsys):
+    calls: list[str] = []
+
+    def forbidden(entrypoint: str):
+        def invoke(*args, **kwargs):
+            calls.append(entrypoint)
+            pytest.fail(f"Goal 21 invoked downstream entrypoint: {entrypoint}")
+
+        return invoke
+
+    for module_name, entrypoint_names in DOWNSTREAM_ENTRYPOINTS.items():
+        module = importlib.import_module(module_name)
+        for entrypoint_name in entrypoint_names:
+            spy = forbidden(f"{module_name}.{entrypoint_name}")
+            monkeypatch.setattr(module, entrypoint_name, spy)
+            monkeypatch.setattr(cli, entrypoint_name, spy, raising=False)
+
+    monkeypatch.setenv("STOCK_PARQUET_BACKEND", "local")
+    monkeypatch.setenv("STOCK_LOCAL_DATA_DIR", str(tmp_path))
+
+    assert cli.main(BASE_ARGS) == 0
+    assert calls == []
+    capsys.readouterr()
 
 
 def test_goal21_parser_exposes_exact_defaults():
