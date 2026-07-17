@@ -9,6 +9,7 @@ from typing import Any, Callable
 import pandas as pd
 
 from stock_selector.data.data_validator import DataValidationError, validate_dataset_frame, validate_stock_code
+from stock_selector.data.real_clean_input_gate import readiness_payload_checksum
 from stock_selector.data.tushare_candidate_staging_batch import build_tushare_candidate_staging_batch_output_keys
 from stock_selector.data.tushare_standard_inputs_landing import _upsert_frame
 from stock_selector.providers.schema_contract import REQUIRED_BENCHMARK_INDEXES, get_schema_contract
@@ -302,6 +303,7 @@ def run_real_clean_inputs_small_batch(
         "ready_for_clean": ready_for_clean,
         "requested_scope": requested_scope,
         "readiness_report_key": output_keys["readiness_report"],
+        "readiness_report_checksum": readiness_payload_checksum(report),
         "source_keys": {dataset: inputs[dataset]["source_keys"] for dataset in REQUIRED_INPUTS},
         "blocked_reasons": blocked_reasons,
         "downstream_firewalls": downstream_firewalls,
@@ -772,6 +774,8 @@ def _verify_all_canonical_inputs(
     ready_for_apply: bool,
     writes_succeeded: bool,
 ) -> dict[str, Any]:
+    from stock_selector.data.historical_backfill import dataframe_checksum
+
     should_verify = ready_for_apply and (not apply_requested or writes_succeeded)
     if not should_verify:
         return {"passed": False, "status": "NOT_RUN", "details": []}
@@ -783,12 +787,23 @@ def _verify_all_canonical_inputs(
         dataset_passed = True
         for trade_date in trade_dates:
             try:
-                actual = standard_read_fn(dataset, trade_date)
-                actual = _scope_frame(dataset, actual, codes)
+                object_frame = standard_read_fn(dataset, trade_date)
+                actual = _scope_frame(dataset, object_frame, codes)
                 validate_dataset_frame(dataset, actual, trade_date)
                 expected = expected_frames[dataset][trade_date]
                 _assert_scope_equal(dataset, actual, expected)
-                dataset_details.append({"trade_date": trade_date, "passed": True, "row_count": len(actual)})
+                dataset_details.append(
+                    {
+                        "trade_date": trade_date,
+                        "passed": True,
+                        "row_count": len(actual),
+                        "object_key": build_partition(dataset, trade_date).object_key,
+                        "object_row_count": len(object_frame),
+                        "object_checksum": dataframe_checksum(object_frame),
+                        "scope_row_count": len(actual),
+                        "scope_checksum": dataframe_checksum(actual),
+                    }
+                )
             except Exception as exc:
                 dataset_passed = False
                 all_passed = False

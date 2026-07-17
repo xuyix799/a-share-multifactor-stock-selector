@@ -20,9 +20,11 @@ Default dry-run:
 
 ```powershell
 docker compose run --rm stock-python python -m stock_selector.cli run-real-clean-universe-range `
-  --run-id goal22-2024-h1 `
+  --run-id goal22-2024-01-small `
   --start-date 2024-01-02 `
-  --end-date 2024-06-28
+  --end-date 2024-01-03 `
+  --trade-dates 2024-01-02,2024-01-03 `
+  --readiness-report-key candidate/real_clean_inputs/readiness_report/batch_id=<batch-id>/report.json
 ```
 
 Dry-run reads and validates the standard inputs, executes all five calculations in memory, and writes only the range manifest and per-day DQ JSON. It does not write any `processed/...` Parquet object.
@@ -31,25 +33,36 @@ Processed writes require the independent explicit gate:
 
 ```powershell
 docker compose run --rm stock-python python -m stock_selector.cli run-real-clean-universe-range `
-  --run-id goal22-2024-h1 `
+  --run-id goal22-2024-01-small `
   --start-date 2024-01-02 `
-  --end-date 2024-06-28 `
+  --end-date 2024-01-03 `
+  --trade-dates 2024-01-02,2024-01-03 `
+  --readiness-report-key candidate/real_clean_inputs/readiness_report/batch_id=<batch-id>/report.json `
   --apply
 ```
 
 The command defaults to `--resume`. `--no-resume` ignores a prior daily completion report, while `--force` recomputes every date. Neither option implies `--apply`; unchanged processed objects are still not rewritten.
 
-### Trading-date source
+### Trusted readiness and trading-date gates
 
-Without `--trade-dates`, the CLI uses the union of standard `daily_price`, `adj_factor`, `daily_basic` and `benchmark_price` partition dates in the requested range. This lets one missing market input block a date still evidenced by another market input.
-
-For an authoritative calendar audit, especially when a date could be missing from all four market datasets, pass the exact dates explicitly:
+Both gates are mandatory:
 
 ```powershell
 --trade-dates 2024-06-03,2024-06-04,2024-06-05
+--readiness-report-key candidate/real_clean_inputs/readiness_report/batch_id=<batch-id>/report.json
 ```
 
-The manifest records the date source as `EXPLICIT_CLI` or `STANDARD_MARKET_PARTITION_UNION`. An explicit date outside the requested start/end range is rejected.
+Repeat `--readiness-report-key` when several Goal 20 batches audited the requested dates. Every contributing report must cover the requested dates with the same exact code scope.
+
+Goal 22 accepts a receipt only when:
+
+- the key uses the Goal 20 readiness-report prefix and its companion manifest is readable;
+- the report is `READY`, `ready_for_apply=true`, `ready_for_clean=true`, has no blockers, and all seven validation, coverage and canonical read-back checks passed;
+- the companion manifest is `COMPLETED`, points to that report, has the same audit scope and source lineage, and binds the report checksum;
+- every requested date has all seven canonical object keys, whole-object row counts/checksums and audited-scope row counts/checksums;
+- the current canonical objects still match those versions exactly.
+
+There is deliberately no raw-partition date discovery fallback. Omitting either gate is a CLI error. A requested date remains in the plan and DQ even when all four market partitions are later missing.
 
 ## Input contract and historical semantics
 
@@ -59,8 +72,8 @@ Every date requires all seven standard input families:
 stock_basic daily_price adj_factor daily_basic financial st_history benchmark_price
 ```
 
-- `stock_basic`, `daily_price`, `adj_factor`, `daily_basic` and `benchmark_price` use the exact requested-date partition.
-- `financial` and `st_history` read canonical partitions no later than the requested date, retain every source object version in the DQ report and deduplicate repeated historical logical keys.
+- All seven inputs use the exact canonical partition version authorized for the requested date by Goal 20.
+- The audited financial partition may contain several known reports. Goal 22 still applies `announce_date <= trade_date` and `report_period <= trade_date`, then the existing as-of join selects the latest known report per stock.
 - A column-complete empty `st_history` object is a valid all-clear input. No `st_history` object is a missing input and blocks the date.
 - Every input version records its object key, row count and deterministic checksum. The combined as-of frame also records its row count, checksum and column missing rates.
 
@@ -74,11 +87,11 @@ Historical decisions are made as follows:
 - `financial` must provide at least one usable as-of row for every historically active stock; a future-only or missing code is blocked rather than filled from a later disclosure.
 - Benchmark coverage must contain exactly one row for each of `000300.SH`, `000905.SH` and `000906.SH`.
 
-Missing datasets, missing active-stock coverage, duplicate logical keys, invalid schema/nullability, invalid historical intervals, incomplete benchmark coverage or any failed standard validator blocks only the affected date. Other dates continue.
+Missing datasets, receipt/object checksum drift, missing active-stock coverage, duplicate logical keys, invalid schema/nullability, invalid historical intervals, incomplete benchmark coverage or any failed standard validator blocks only the affected date. Other dates continue.
 
 ## Derived outputs
 
-With `--apply`, the five validated outputs are written to the processed layer:
+With `--apply`, the five validated outputs keep these logical dataset identities:
 
 ```text
 processed/adjusted_price/trade_date=YYYY-MM-DD/part.parquet
@@ -88,7 +101,19 @@ processed/eligible_universe/trade_date=YYYY-MM-DD/part.parquet
 processed/factor_input_table/trade_date=YYYY-MM-DD/part.parquet
 ```
 
-The local backend writes below `STOCK_LOCAL_DATA_DIR/processed`. The MinIO backend uses the configured processed bucket. Each Parquet replacement is atomic and is followed by schema, row-count and checksum read-back.
+They are physically staged as immutable generations:
+
+```text
+processed/<dataset>/trade_date=YYYY-MM-DD/generation=<sha256>/part.parquet
+```
+
+After all five generation objects pass schema, row-count and checksum read-back, one atomic date-level commit marker publishes the complete mapping:
+
+```text
+processed/_goal22_commits/trade_date=YYYY-MM-DD/commit.json
+```
+
+The Goal 22 processed reader resolves only this marker and verifies all five mappings and checksums. A direct `part.parquet` file is not the publication mechanism. Generation objects left by a failed or interrupted attempt remain invisible until a valid commit marker references the complete five-object set.
 
 The control artifacts remain in the candidate/control layer:
 
@@ -111,11 +136,13 @@ Every daily DQ report records:
 - requested/performed/unchanged write state and processed read-back evidence;
 - blocking/failure evidence and downstream firewalls.
 
-The range manifest records the immutable plan fingerprint, per-date status counts and links to every DQ report and processed output key.
+The range manifest records the immutable plan fingerprint, trusted receipt and canonical-version lineage, per-date status/attempt counts, links to every DQ report, logical output key and date commit key.
 
-Apply is idempotent. A completed date is reused only when its current input-version record, recomputed output checksums and all five processed read-backs still match. A hard interruption or mid-date write failure leaves the date uncommitted in its DQ state; the next resume recomputes that date, preserves already matching atomic objects and writes only missing or mismatched objects. Completed dates are independently verified and are not rewritten because another date failed.
+Apply is idempotent. A completed date is reused only when its commit marker binds the same run, plan, input fingerprint and output checksums and all five committed read-backs still match. A hard interruption or mid-date generation failure leaves the current DQ `RUNNING`/uncommitted and does not publish a partial set. The next resume recomputes that date, preserves already matching generation objects and writes only missing or mismatched objects before atomically committing. An older committed generation remains intact until a replacement commit succeeds.
 
-Do not run two Goal 22 commands concurrently with the same `run_id` or overlapping processed dates. Atomic object replacement prevents a partial Parquet object but is not a cross-process transaction across five object keys.
+Resume/commit-read and Parquet I/O errors are caught inside the affected date boundary, persisted as that date's failure and do not stop later dates. A schema-complete empty `eligible_universe` and matching empty `factor_input_table` are valid outputs when every stock was legitimately filtered; `risk_filter` and upstream clean outputs remain non-empty.
+
+Do not run two Goal 22 commands concurrently with the same `run_id` or overlapping processed dates. The commit marker makes one publication atomic, but it is not a cross-process compare-and-swap lock; serialize overlapping publishers.
 
 ## Status and downstream boundary
 

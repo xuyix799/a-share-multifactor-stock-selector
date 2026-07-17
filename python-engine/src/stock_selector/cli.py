@@ -1,6 +1,7 @@
 import argparse
 from datetime import date, timedelta
 import json
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -909,30 +910,48 @@ def _cmd_run_real_history_backfill(args: argparse.Namespace) -> int:
 
 
 def _cmd_run_real_clean_universe_range(args: argparse.Namespace) -> int:
+    from stock_selector.data.real_clean_input_gate import (
+        load_goal22_trusted_input_lineage,
+    )
     from stock_selector.data.real_clean_universe import run_real_clean_universe_range
 
     try:
         start_date, end_date = validate_date_range(args.start_date, args.end_date)
-        trade_dates = (
-            _parse_goal22_trade_dates(args.trade_dates)
-            if args.trade_dates
-            else _discover_goal22_trade_dates(start_date, end_date)
+        trade_dates = _parse_goal22_trade_dates(args.trade_dates)
+        trusted_input_lineage = load_goal22_trusted_input_lineage(
+            readiness_report_keys=args.readiness_report_key,
+            start_date=start_date,
+            end_date=end_date,
+            trade_dates=trade_dates,
+            read_json_fn=_load_tushare_candidate_batch_json,
         )
-        input_reader = _Goal22CanonicalInputReader()
+        input_reader = _Goal22CanonicalInputReader(trusted_input_lineage)
         result = run_real_clean_universe_range(
             run_id=args.run_id,
             start_date=start_date,
             end_date=end_date,
             trade_dates=trade_dates,
+            trusted_input_lineage=trusted_input_lineage,
             input_read_fn=input_reader.read,
             artifact_read_json_fn=_load_tushare_candidate_batch_json,
             artifact_write_json_fn=_write_tushare_candidate_batch_json,
             processed_read_fn=_read_goal22_processed if args.apply else None,
-            processed_write_fn=_write_goal22_processed if args.apply else None,
+            processed_object_read_fn=(
+                _read_goal22_processed_object if args.apply else None
+            ),
+            processed_object_write_fn=(
+                _write_goal22_processed_object if args.apply else None
+            ),
+            processed_commit_read_fn=(
+                _read_goal22_processed_commit if args.apply else None
+            ),
+            processed_commit_write_fn=(
+                _write_goal22_processed_commit if args.apply else None
+            ),
             apply_processed_write=args.apply,
             resume=args.resume,
             force=args.force,
-            trade_date_source=("EXPLICIT_CLI" if args.trade_dates else "STANDARD_MARKET_PARTITION_UNION"),
+            trade_date_source="EXPLICIT_CLI_GOAL20_RECEIPT",
         )
     except (DateValidationError, DataValidationError, DatasetValidationError, ValueError, FileNotFoundError) as exc:
         print(f"invalid input: {exc}", file=sys.stderr)
@@ -1646,25 +1665,10 @@ def _parse_goal22_trade_dates(value: str) -> list[str]:
     return trade_dates
 
 
-def _discover_goal22_trade_dates(start_date: str, end_date: str) -> list[str]:
-    start_date, end_date = validate_date_range(start_date, end_date)
-    trade_dates = {
-        _goal22_partition_date(dataset, object_key)
-        for dataset in ("daily_price", "adj_factor", "daily_basic", "benchmark_price")
-        for object_key in _list_goal22_partition_keys(dataset)
-        if start_date <= _goal22_partition_date(dataset, object_key) <= end_date
-    }
-    if not trade_dates:
-        raise FileNotFoundError(
-            "no standard market input partitions found in the requested range; "
-            "provide --trade-dates to audit an explicit trading calendar"
-        )
-    return sorted(trade_dates)
-
-
 class _Goal22CanonicalInputReader:
-    def __init__(self) -> None:
-        self._keys: dict[str, list[str]] = {}
+    def __init__(self, trusted_input_lineage: dict) -> None:
+        self._lineage = trusted_input_lineage
+        self._codes = set(trusted_input_lineage["codes"])
         self._frames: dict[str, pd.DataFrame] = {}
 
     def read(self, dataset: str, trade_date: str):
@@ -1672,44 +1676,46 @@ class _Goal22CanonicalInputReader:
 
         dataset = validate_dataset(dataset)
         trade_date = validate_trade_date(trade_date)
-        if dataset in {"financial", "st_history"}:
-            object_keys = [
-                key
-                for key in self._dataset_keys(dataset)
-                if _goal22_partition_date(dataset, key) <= trade_date
-            ]
-        else:
-            object_keys = [f"raw/{dataset}/trade_date={trade_date}/part.parquet"]
-        if not object_keys:
-            raise FileNotFoundError(f"missing raw history for {dataset} <= {trade_date}")
-
-        frames: list[pd.DataFrame] = []
-        versions: list[InputVersion] = []
-        keys = INPUT_KEY_COLUMNS[dataset]
-        for object_key in object_keys:
-            frame = self._read_object(object_key)
-            if not frame.empty and frame.duplicated(keys).any():
-                raise DataValidationError(f"duplicate logical keys in canonical input {object_key}")
-            frames.append(frame)
-            versions.append(
-                InputVersion(
-                    object_key=object_key,
-                    row_count=len(frame),
-                    checksum=dataframe_checksum(frame),
-                )
+        try:
+            trusted = self._lineage["canonical_versions"][trade_date][dataset]
+        except KeyError as exc:
+            raise FileNotFoundError(
+                f"trusted canonical version is missing for {dataset} {trade_date}"
+            ) from exc
+        object_key = trusted["object_key"]
+        object_frame = self._read_object(object_key)
+        object_checksum = dataframe_checksum(object_frame)
+        if (
+            len(object_frame) != trusted["object_row_count"]
+            or object_checksum != trusted["object_checksum"]
+        ):
+            raise DataValidationError(
+                f"canonical object version changed after Goal 20 readiness: {object_key}"
             )
-        combined = pd.concat(frames, ignore_index=True)
-        if not combined.empty:
-            distinct_rows = combined.drop_duplicates().reset_index(drop=True)
-            if distinct_rows.duplicated(keys, keep=False).any():
-                raise DataValidationError(f"conflicting historical versions for {dataset} logical keys")
-            combined = distinct_rows.drop_duplicates(keys, keep="last").reset_index(drop=True)
-        return InputArtifact(frame=combined, versions=tuple(versions))
-
-    def _dataset_keys(self, dataset: str) -> list[str]:
-        if dataset not in self._keys:
-            self._keys[dataset] = _list_goal22_partition_keys(dataset)
-        return self._keys[dataset]
+        if dataset == "benchmark_price":
+            scoped = object_frame.copy(deep=True)
+        else:
+            scoped = object_frame.loc[
+                object_frame["stock_code"].astype(str).isin(self._codes)
+            ].reset_index(drop=True)
+        if (
+            len(scoped) != trusted["scope_row_count"]
+            or dataframe_checksum(scoped) != trusted["scope_checksum"]
+        ):
+            raise DataValidationError(
+                f"canonical audited scope changed after Goal 20 readiness: {object_key}"
+            )
+        keys = INPUT_KEY_COLUMNS[dataset]
+        if not scoped.empty and scoped.duplicated(keys).any():
+            raise DataValidationError(
+                f"duplicate logical keys in canonical input {object_key}"
+            )
+        version = InputVersion(
+            object_key=object_key,
+            row_count=len(object_frame),
+            checksum=object_checksum,
+        )
+        return InputArtifact(frame=scoped, versions=(version,))
 
     def _read_object(self, object_key: str) -> pd.DataFrame:
         if object_key not in self._frames:
@@ -1859,6 +1865,7 @@ def _real_clean_universe_range_cli_output(result: dict) -> dict:
         "range_manifest_key": result.get("range_manifest_key"),
         "daily_report_keys": result.get("daily_report_keys", {}),
         "processed_output_keys": result.get("processed_output_keys", {}),
+        "processed_commit_keys": result.get("processed_commit_keys", {}),
         "downstream_firewalls": result.get("downstream_firewalls", {}),
     }
 
@@ -1892,51 +1899,32 @@ def _read_history_canonical(dataset: str, trade_date: str) -> pd.DataFrame | Non
         return None
 
 
-def _list_goal22_partition_keys(dataset: str) -> list[str]:
-    dataset = validate_dataset(dataset)
-    settings = load_settings()
-    prefix = f"raw/{dataset}/trade_date="
-    if _storage_backend(settings) == "local":
-        root = _local_root(settings) / "raw" / dataset
-        if not root.exists():
-            return []
-        keys = [
-            f"raw/{dataset}/{path.parent.name}/part.parquet"
-            for path in root.glob("trade_date=*/part.parquet")
-        ]
-    else:
-        client = create_minio_client(settings)
-        bucket = settings["storage"]["minio_bucket_raw"]
-        keys = [
-            item.object_name
-            for item in client.list_objects(bucket, prefix=prefix, recursive=True)
-            if item.object_name.endswith("/part.parquet")
-        ]
-    valid_keys = []
-    for object_key in keys:
-        try:
-            _goal22_partition_date(dataset, object_key)
-        except (DateValidationError, ValueError):
-            continue
-        valid_keys.append(object_key)
-    return sorted(set(valid_keys), key=lambda key: (_goal22_partition_date(dataset, key), key))
-
-
-def _goal22_partition_date(dataset: str, object_key: str) -> str:
-    prefix = f"raw/{dataset}/trade_date="
-    if not object_key.startswith(prefix) or not object_key.endswith("/part.parquet"):
-        raise ValueError(f"invalid raw partition key for {dataset}: {object_key}")
-    suffix = object_key[len(prefix) :]
-    partition_date, separator, tail = suffix.partition("/")
-    if separator != "/" or tail != "part.parquet":
-        raise ValueError(f"invalid raw partition key for {dataset}: {object_key}")
-    return validate_trade_date(partition_date)
-
-
 def _read_goal22_processed(dataset: str, trade_date: str) -> pd.DataFrame:
+    from stock_selector.data.real_clean_universe import (
+        OUTPUT_KEY_COLUMNS,
+    )
+
     dataset = validate_dataset(dataset)
     trade_date = validate_trade_date(trade_date)
-    object_key = f"processed/{dataset}/trade_date={trade_date}/part.parquet"
+    commit = _read_goal22_processed_commit(trade_date)
+    _validate_goal22_processed_commit_payload(commit, trade_date)
+    record = commit["outputs"][dataset]
+    expected_object_key = record["object_key"]
+    frame = _read_goal22_processed_object(expected_object_key)
+    validate_dataset_frame(dataset, frame, trade_date)
+    checksum = dataframe_checksum(
+        frame,
+        key_columns=OUTPUT_KEY_COLUMNS[dataset],
+    )
+    if len(frame) != record.get("row_count") or checksum != record.get("checksum"):
+        raise DataValidationError(
+            f"Goal 22 committed output checksum mismatch for {dataset} {trade_date}"
+        )
+    return frame
+
+
+def _read_goal22_processed_object(object_key: str) -> pd.DataFrame:
+    object_key = _validate_goal22_generation_object_key(object_key)
     settings = load_settings()
     if _storage_backend(settings) == "local":
         path = _local_root(settings) / object_key
@@ -1958,11 +1946,24 @@ def _read_goal22_processed(dataset: str, trade_date: str) -> pd.DataFrame:
         return pd.read_parquet(target)
 
 
-def _write_goal22_processed(dataset: str, trade_date: str, frame: pd.DataFrame) -> str:
+def _write_goal22_processed_object(
+    dataset: str,
+    trade_date: str,
+    generation_id: str,
+    frame: pd.DataFrame,
+) -> str:
+    from stock_selector.data.real_clean_universe import (
+        build_goal22_processed_generation_key,
+    )
+
     dataset = validate_dataset(dataset)
     trade_date = validate_trade_date(trade_date)
     validate_dataset_frame(dataset, frame, trade_date)
-    object_key = f"processed/{dataset}/trade_date={trade_date}/part.parquet"
+    object_key = build_goal22_processed_generation_key(
+        dataset,
+        trade_date,
+        generation_id,
+    )
     settings = load_settings()
     if _storage_backend(settings) == "local":
         write_parquet_local_atomic(frame, _local_root(settings) / object_key)
@@ -1975,6 +1976,155 @@ def _write_goal22_processed(dataset: str, trade_date: str, frame: pd.DataFrame) 
         local_file = Path(tmp) / "part.parquet"
         frame.to_parquet(local_file, index=False)
         AtomicObjectWriter(client, tmp_dir=Path(tmp)).write_file_atomic(bucket, object_key, local_file)
+    return object_key
+
+
+def _read_goal22_processed_commit(trade_date: str) -> dict:
+    from stock_selector.data.real_clean_universe import (
+        build_goal22_processed_commit_key,
+    )
+
+    trade_date = validate_trade_date(trade_date)
+    object_key = build_goal22_processed_commit_key(trade_date)
+    settings = load_settings()
+    if _storage_backend(settings) == "local":
+        path = _local_root(settings) / object_key
+        if not path.exists():
+            raise FileNotFoundError(object_key)
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_processed"]
+    with tempfile.TemporaryDirectory(prefix="stock-goal22-commit-read-") as tmp:
+        target = Path(tmp) / "commit.json"
+        try:
+            client.fget_object(bucket, object_key, str(target))
+        except S3Error as exc:
+            if exc.code in {"NoSuchKey", "NoSuchBucket", "NoSuchObject"}:
+                raise FileNotFoundError(object_key) from exc
+            raise
+        return json.loads(target.read_text(encoding="utf-8"))
+
+
+def _write_goal22_processed_commit(trade_date: str, payload: dict) -> str:
+    from stock_selector.data.real_clean_universe import (
+        build_goal22_processed_commit_key,
+    )
+
+    trade_date = validate_trade_date(trade_date)
+    object_key = build_goal22_processed_commit_key(trade_date)
+    _validate_goal22_processed_commit_payload(payload, trade_date)
+
+    settings = load_settings()
+    if _storage_backend(settings) == "local":
+        path = _local_root(settings) / object_key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, default=str, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+        return object_key
+
+    client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_processed"]
+    ensure_buckets(client, [bucket])
+    with tempfile.TemporaryDirectory(prefix="stock-goal22-commit-write-") as tmp:
+        local_file = Path(tmp) / "commit.json"
+        local_file.write_text(
+            json.dumps(payload, ensure_ascii=False, default=str, indent=2),
+            encoding="utf-8",
+        )
+        AtomicObjectWriter(client, tmp_dir=Path(tmp)).write_file_atomic(
+            bucket,
+            object_key,
+            local_file,
+        )
+    return object_key
+
+
+def _validate_goal22_processed_commit_payload(
+    payload: dict,
+    trade_date: str,
+) -> None:
+    from stock_selector.data.real_clean_universe import (
+        OUTPUT_DATASETS,
+        build_goal22_processed_generation_key,
+    )
+
+    expected_firewalls = {
+        "factor_daily": False,
+        "selection_result": False,
+        "backtest": False,
+    }
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != "goal22.processed_date_commit.v1"
+        or payload.get("goal") != "22"
+        or payload.get("status") != "COMMITTED"
+        or payload.get("trade_date") != trade_date
+        or payload.get("downstream_firewalls") != expected_firewalls
+        or set(payload.get("outputs", {})) != set(OUTPUT_DATASETS)
+        or re.fullmatch(r"[0-9a-f]{64}", str(payload.get("generation_id", "")))
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(payload.get("plan_fingerprint", "")),
+        )
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(payload.get("input_fingerprint", "")),
+        )
+        is None
+    ):
+        raise DataValidationError("invalid Goal 22 processed commit payload")
+    generation_id = payload["generation_id"]
+    for dataset in OUTPUT_DATASETS:
+        record = payload["outputs"][dataset]
+        expected_object_key = build_goal22_processed_generation_key(
+            dataset,
+            trade_date,
+            generation_id,
+        )
+        expected_logical_key = (
+            f"processed/{dataset}/trade_date={trade_date}/part.parquet"
+        )
+        if (
+            not isinstance(record, dict)
+            or record.get("object_key") != expected_object_key
+            or record.get("logical_key") != expected_logical_key
+            or isinstance(record.get("row_count"), bool)
+            or not isinstance(record.get("row_count"), int)
+            or record["row_count"] < 0
+            or re.fullmatch(r"[0-9a-f]{64}", str(record.get("checksum", "")))
+            is None
+        ):
+            raise DataValidationError(
+                f"invalid Goal 22 generation mapping for {dataset}"
+            )
+
+
+def _validate_goal22_generation_object_key(object_key: str) -> str:
+    object_key = safe_object_key(object_key)
+    match = re.fullmatch(
+        r"processed/([^/]+)/trade_date=(\d{4}-\d{2}-\d{2})/"
+        r"generation=([0-9a-f]{64})/part\.parquet",
+        object_key,
+    )
+    if match is None:
+        raise ValueError("invalid Goal 22 processed generation key")
+    dataset = validate_dataset(match.group(1))
+    if dataset not in {
+        "adjusted_price",
+        "clean_daily_snapshot",
+        "risk_filter",
+        "eligible_universe",
+        "factor_input_table",
+    }:
+        raise ValueError("unsupported Goal 22 processed generation dataset")
+    validate_trade_date(match.group(2))
     return object_key
 
 
@@ -2239,7 +2389,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_real_clean_universe.add_argument("--end-date", required=True)
     run_real_clean_universe.add_argument(
         "--trade-dates",
-        help="optional comma-separated authoritative trading dates; otherwise discover the union of market input partitions",
+        required=True,
+        help="comma-separated authoritative trading dates covered by Goal 20 readiness receipts",
+    )
+    run_real_clean_universe.add_argument(
+        "--readiness-report-key",
+        action="append",
+        required=True,
+        help="trusted Goal 20 readiness report key; repeat for multiple audited date batches",
     )
     run_real_clean_universe.add_argument("--apply", action="store_true")
     goal22_resume = run_real_clean_universe.add_mutually_exclusive_group()

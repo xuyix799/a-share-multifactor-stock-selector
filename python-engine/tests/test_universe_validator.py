@@ -1,4 +1,5 @@
 import pytest
+import pandas as pd
 
 from stock_selector.cleaning.snapshot_builder import build_clean_daily_snapshot
 from stock_selector.data.data_validator import DataValidationError
@@ -6,6 +7,8 @@ from stock_selector.data.mock_data import generate_mock_dataset
 from stock_selector.universe.risk_filter import build_risk_filter
 from stock_selector.universe.universe_builder import build_eligible_universe, build_factor_input_table
 from stock_selector.universe.universe_validator import (
+    ELIGIBLE_UNIVERSE_COLUMNS,
+    FACTOR_INPUT_TABLE_COLUMNS,
     validate_eligible_universe,
     validate_factor_input_table,
     validate_risk_filter,
@@ -44,3 +47,12 @@ def test_risk_filter_validator_rejects_missing_reason_column():
 
     with pytest.raises(DataValidationError):
         validate_risk_filter(risk_filter, trade_date)
+
+
+def test_universe_validators_accept_schema_complete_empty_downstream_tables():
+    trade_date = "2026-06-19"
+    eligible = pd.DataFrame(columns=ELIGIBLE_UNIVERSE_COLUMNS)
+    factor_input = pd.DataFrame(columns=FACTOR_INPUT_TABLE_COLUMNS)
+
+    validate_eligible_universe(eligible, trade_date)
+    validate_factor_input_table(factor_input, trade_date)

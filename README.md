@@ -42,7 +42,7 @@
 - Goal 18：新增 Tushare master/fundamental/financial 标准输入 landing；默认不调用 provider、默认 dry-run，`daily_basic` 和通过 as-of 校验的 `financial` 只有显式 `--apply` 才可小范围写入 `raw/daily_basic/...` 和 `raw/financial/...`。`stock_basic` 当前快照和 ST 状态只写 candidate，不写 standard `stock_basic` / `st_history` / `suspension_status`，不自动启动 clean/factor/selection/backtest，详见 `docs/goal18_tushare_standard_inputs_landing.md`。
 - Goal 20：新增真实 clean 所需七项标准输入统一 readiness 审计，覆盖 `stock_basic`、`daily_price`、`adj_factor`、`daily_basic`、`financial`、`st_history` 和 `benchmark_price`。默认不调用 provider、默认 dry-run；provider 访问必须显式传 `--provider-call`，标准写入必须显式传 `--apply`。当前快照、smoke-only benchmark、不可读历史证据或任一缺失/语义不可靠输入都会保持 blocked，不启动 clean/factor/selection/backtest，详见 `docs/goal20_real_clean_input_readiness.md`。
 - Goal 21：新增七项标准输入的确定性、可恢复历史回填框架，并完成评审修复：live 响应先写入带 checksum/语义证据哈希的不可变 raw landing；失败审计按 attempt 隔离；`suspend_d` 必须证明完整分页终止；READY checkpoint 可硬中断恢复；canonical 按逻辑 scope 精确替换；financial 使用公告日增量和严格 predecessor proof；v2 自然轴计划避免全市场十年 Cartesian 膨胀。命令默认 plan-only、不会构造或调用 provider；provider 和标准写入仍分别要求 `--provider-call`、`--apply`。当前 live adapter 无法证明历史语义的输入保持 blocked，本轮不声称已经完成真实十年抓取，也不启动 clean/factor/selection/backtest，详见 `docs/goal21_historical_backfill.md`。
-- Goal 22：新增 `run-real-clean-universe-range` 范围编排，逐日复用现有 adjusted price、clean snapshot 和 universe builders。默认只计算并写 range manifest/逐日 DQ；显式 `--apply` 才原子写入并读回五项 `processed/...` 输出。财务严格按公告日 as-of，股票成员按历史 list/delist，ST 使用历史 `[start_date, end_date)`，停牌只接受显式布尔标准字段；单日失败隔离且可恢复，不自动进入 `factor_daily`、`selection_result` 或 backtest，详见 `docs/goal22_real_clean_universe.md`。
+- Goal 22：新增 `run-real-clean-universe-range` 范围编排，逐日复用现有 adjusted price、clean snapshot 和 universe builders。命令强制接收显式交易日和 checksum 绑定的 Goal 20 readiness receipt；默认只计算并写 range manifest/逐日 DQ。显式 `--apply` 先写五项不可变 generation，全部读回后再以单个日期 commit marker 原子发布。财务严格按公告日 as-of，股票成员按历史 list/delist，ST 使用历史 `[start_date, end_date)`，停牌只接受显式布尔标准字段；单日失败隔离且可恢复，合法空 universe 可发布，不自动进入 `factor_daily`、`selection_result` 或 backtest，详见 `docs/goal22_real_clean_universe.md`。
 - Goal 10B：AKShare / Baostock 最小真实数据 smoke，已验证 AKShare `benchmark_price` 可标准化写入 `smoke/akshare/...` 并通过 DuckDB 查询；字段不足的数据集不会绕过 validator 写入标准层。
 - Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke，新增 smoke-only `daily_price_raw_smoke`，只允许写入 `smoke/<provider>/daily_price_raw_smoke/...`，不进入标准 `raw/daily_price/...`。
 - Goal 12A：真实数据标准层契约与数据质量等级冻结，详见 `docs/goal12A_real_data_contract.md`；本阶段只新增契约、守门规则和测试，不接入真实 provider 主链路，不做真实回测。
@@ -647,10 +647,12 @@ adjusted_price -> clean_daily_snapshot -> risk_filter -> eligible_universe -> fa
 docker compose run --rm stock-python python -m stock_selector.cli run-real-clean-universe-range `
   --run-id <run_id> `
   --start-date 2024-01-02 `
-  --end-date 2024-06-28
+  --end-date 2024-01-03 `
+  --trade-dates 2024-01-02,2024-01-03 `
+  --readiness-report-key candidate/real_clean_inputs/readiness_report/batch_id=<batch-id>/report.json
 ```
 
-只有显式追加 `--apply` 才写 `processed/<dataset>/trade_date=YYYY-MM-DD/part.parquet`，并逐对象读回 schema、行数与 checksum。需要权威交易日审计时可传 `--trade-dates 2024-06-03,2024-06-04`；未传时使用四项市场标准输入分区日期的并集。范围 manifest 位于 `candidate/real_clean_universe/run_id=<run_id>/manifest.json`，逐日 DQ 位于同一 run 下的 `trade_date=.../dq_report.json`，记录输入版本、排除原因、缺失率、输出 key/checksum 和恢复状态。任一必需输入缺失或历史语义/DQ/读回失败只阻断对应日期；其他日期继续。完整合同见 `docs/goal22_real_clean_universe.md`。
+`--trade-dates` 与至少一个 `--readiness-report-key` 都是必需门禁；不再从 raw 市场分区猜测日期。只有显式追加 `--apply` 才将五项 `processed` 输出写入不可变 generation，全部 schema、行数与 checksum 读回通过后，再原子写 `processed/_goal22_commits/trade_date=YYYY-MM-DD/commit.json` 发布整日结果。范围 manifest 位于 `candidate/real_clean_universe/run_id=<run_id>/manifest.json`，逐日 DQ 位于同一 run 下的 `trade_date=.../dq_report.json`，记录 readiness lineage、输入版本、排除原因、缺失率、generation/commit key、checksum 和恢复状态。任一必需输入缺失、receipt/checksum 漂移或历史语义/DQ/读回失败只阻断对应日期；其他日期继续。完整合同见 `docs/goal22_real_clean_universe.md`。
 
 ## 幂等与重跑
 

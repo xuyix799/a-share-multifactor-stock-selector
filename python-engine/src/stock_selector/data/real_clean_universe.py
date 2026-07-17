@@ -21,7 +21,11 @@ from stock_selector.data.data_validator import (
     validate_dataset_frame,
 )
 from stock_selector.data.historical_backfill import dataframe_checksum
+from stock_selector.data.real_clean_input_gate import (
+    validate_goal22_trusted_input_lineage,
+)
 from stock_selector.providers.schema_contract import get_schema_contract
+from stock_selector.storage.partition import validate_dataset
 from stock_selector.universe.universe_builder import build_universe_tables
 from stock_selector.utils.date_validator import validate_date_range, validate_trade_date
 
@@ -88,7 +92,32 @@ InputReadFn = Callable[[str, str], InputArtifact]
 ReadJsonFn = Callable[[str], dict[str, Any]]
 WriteJsonFn = Callable[[str, dict[str, Any]], str]
 ProcessedReadFn = Callable[[str, str], pd.DataFrame]
-ProcessedWriteFn = Callable[[str, str, pd.DataFrame], str]
+ProcessedObjectReadFn = Callable[[str], pd.DataFrame]
+ProcessedObjectWriteFn = Callable[[str, str, str, pd.DataFrame], str]
+ProcessedCommitReadFn = Callable[[str], dict[str, Any]]
+ProcessedCommitWriteFn = Callable[[str, dict[str, Any]], str]
+
+
+def build_goal22_processed_generation_key(
+    dataset: str,
+    trade_date: str,
+    generation_id: str,
+) -> str:
+    dataset = validate_dataset(dataset)
+    if dataset not in OUTPUT_DATASETS:
+        raise ValueError(f"unsupported Goal 22 output dataset: {dataset}")
+    trade_date = validate_trade_date(trade_date)
+    if re.fullmatch(r"[0-9a-f]{64}", str(generation_id)) is None:
+        raise ValueError("generation_id must be sha256 hex")
+    return (
+        f"processed/{dataset}/trade_date={trade_date}/"
+        f"generation={generation_id}/part.parquet"
+    )
+
+
+def build_goal22_processed_commit_key(trade_date: str) -> str:
+    trade_date = validate_trade_date(trade_date)
+    return f"processed/_goal22_commits/trade_date={trade_date}/commit.json"
 
 
 def build_real_clean_universe_output_keys(run_id: str, trade_dates: Iterable[str]) -> dict[str, Any]:
@@ -108,6 +137,10 @@ def build_real_clean_universe_output_keys(run_id: str, trade_dates: Iterable[str
             }
             for trade_date in normalized_dates
         },
+        "processed_commits": {
+            trade_date: build_goal22_processed_commit_key(trade_date)
+            for trade_date in normalized_dates
+        },
     }
 
 
@@ -117,15 +150,19 @@ def run_real_clean_universe_range(
     start_date: str,
     end_date: str,
     trade_dates: Iterable[str],
+    trusted_input_lineage: dict[str, Any],
     input_read_fn: InputReadFn,
     artifact_read_json_fn: ReadJsonFn,
     artifact_write_json_fn: WriteJsonFn,
     processed_read_fn: ProcessedReadFn | None = None,
-    processed_write_fn: ProcessedWriteFn | None = None,
+    processed_object_read_fn: ProcessedObjectReadFn | None = None,
+    processed_object_write_fn: ProcessedObjectWriteFn | None = None,
+    processed_commit_read_fn: ProcessedCommitReadFn | None = None,
+    processed_commit_write_fn: ProcessedCommitWriteFn | None = None,
     apply_processed_write: bool = False,
     resume: bool = True,
     force: bool = False,
-    trade_date_source: str = "CALLER_PROVIDED",
+    trade_date_source: str = "TRUSTED_CALLER",
     generated_at_fn: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
     run_id = _validate_run_id(run_id)
@@ -135,19 +172,31 @@ def run_real_clean_universe_range(
         raise ValueError("trade_dates must not be empty")
     if normalized_dates[0] < start_date or normalized_dates[-1] > end_date:
         raise ValueError("trade_dates must be within start_date and end_date")
-    if apply_processed_write and (processed_read_fn is None or processed_write_fn is None):
-        raise ValueError("processed read and write functions are required with --apply")
+    trusted_input_lineage = validate_goal22_trusted_input_lineage(
+        trusted_input_lineage,
+        expected_trade_dates=normalized_dates,
+    )
+    if apply_processed_write and any(
+        callback is None
+        for callback in (
+            processed_read_fn,
+            processed_object_read_fn,
+            processed_object_write_fn,
+            processed_commit_read_fn,
+            processed_commit_write_fn,
+        )
+    ):
+        raise ValueError("processed generation and commit functions are required with --apply")
     if trade_date_source not in {
-        "CALLER_PROVIDED",
-        "EXPLICIT_CLI",
-        "STANDARD_MARKET_PARTITION_UNION",
+        "TRUSTED_CALLER",
+        "EXPLICIT_CLI_GOAL20_RECEIPT",
     }:
         raise ValueError("unsupported trade_date_source")
 
     generated_at_fn = generated_at_fn or _utc_now_iso
     output_keys = build_real_clean_universe_output_keys(run_id, normalized_dates)
     plan = {
-        "schema_version": "goal22.real_clean_universe_plan.v1",
+        "schema_version": "goal22.real_clean_universe_plan.v2",
         "run_id": run_id,
         "start_date": start_date,
         "end_date": end_date,
@@ -155,76 +204,121 @@ def run_real_clean_universe_range(
         "trade_date_source": trade_date_source,
         "required_inputs": list(REQUIRED_INPUTS),
         "output_datasets": list(OUTPUT_DATASETS),
+        "trusted_input_lineage": trusted_input_lineage,
+        "trusted_input_fingerprint": _stable_hash(trusted_input_lineage),
     }
     plan_fingerprint = _stable_hash(plan)
     existing_manifest = _read_json_optional(artifact_read_json_fn, output_keys["range_manifest"])
     if existing_manifest is not None and existing_manifest.get("plan_fingerprint") != plan_fingerprint:
         raise ValueError("run_id scope does not match existing manifest")
 
+    previous_attempts = (
+        existing_manifest.get("date_attempts", {})
+        if isinstance(existing_manifest, dict)
+        else {}
+    )
+    date_attempts = {
+        trade_date: int(previous_attempts.get(trade_date, 0)) + 1
+        for trade_date in normalized_dates
+    }
     mode = "APPLY" if apply_processed_write else "DRY_RUN"
-    artifact_write_json_fn(
-        output_keys["range_manifest"],
-        {
-            "schema_version": "goal22.real_clean_universe_manifest.v1",
+    date_statuses = {trade_date: "PENDING" for trade_date in normalized_dates}
+    daily_reports: dict[str, dict[str, Any]] = {}
+
+    def write_manifest(status: str) -> dict[str, Any]:
+        status_counts = dict(sorted(Counter(date_statuses.values()).items()))
+        payload = {
+            "schema_version": "goal22.real_clean_universe_manifest.v2",
             "goal": "22",
             "run_id": run_id,
             "generated_at": generated_at_fn(),
-            "status": "RUNNING",
+            "status": status,
             "mode": mode,
             "apply_requested": bool(apply_processed_write),
             "resume": bool(resume),
             "force": bool(force),
             "plan": plan,
             "plan_fingerprint": plan_fingerprint,
-            "date_statuses": {},
+            "date_statuses": dict(date_statuses),
+            "date_attempts": dict(date_attempts),
+            "status_counts": status_counts,
             "daily_report_keys": output_keys["daily_reports"],
+            "processed_output_keys": output_keys["processed"],
+            "processed_commit_keys": output_keys["processed_commits"],
             "downstream_firewalls": deepcopy(_DOWNSTREAM_FIREWALLS),
-        },
-    )
+        }
+        artifact_write_json_fn(output_keys["range_manifest"], payload)
+        return payload
 
-    daily_reports: dict[str, dict[str, Any]] = {}
+    write_manifest("RUNNING")
+    started_reports: dict[str, dict[str, Any]] = {}
     for trade_date in normalized_dates:
-        daily_report_key = output_keys["daily_reports"][trade_date]
-        previous_report = _read_json_optional(artifact_read_json_fn, daily_report_key) if resume else None
-        report = _run_one_trade_date(
+        pending_report = _empty_daily_report(
             run_id=run_id,
             trade_date=trade_date,
             plan_fingerprint=plan_fingerprint,
             mode=mode,
-            apply_processed_write=apply_processed_write,
-            force=force,
-            previous_report=previous_report,
+            attempt=date_attempts[trade_date],
+            generated_at=generated_at_fn(),
             planned_output_keys=output_keys["processed"][trade_date],
-            input_read_fn=input_read_fn,
-            processed_read_fn=processed_read_fn,
-            processed_write_fn=processed_write_fn,
-            generated_at_fn=generated_at_fn,
+            commit_key=output_keys["processed_commits"][trade_date],
+            trusted_input_lineage=trusted_input_lineage,
         )
+        pending_report["status"] = "PENDING"
+        artifact_write_json_fn(
+            output_keys["daily_reports"][trade_date],
+            pending_report,
+        )
+        started_reports[trade_date] = pending_report
+
+    for trade_date in normalized_dates:
+        daily_report_key = output_keys["daily_reports"][trade_date]
+        started_report = deepcopy(started_reports[trade_date])
+        started_report["status"] = "RUNNING"
+        artifact_write_json_fn(daily_report_key, started_report)
+        date_statuses[trade_date] = "RUNNING"
+        write_manifest("RUNNING")
+        try:
+            report = _run_one_trade_date(
+                run_id=run_id,
+                trade_date=trade_date,
+                plan_fingerprint=plan_fingerprint,
+                mode=mode,
+                apply_processed_write=apply_processed_write,
+                resume=resume,
+                force=force,
+                started_report=started_report,
+                planned_output_keys=output_keys["processed"][trade_date],
+                commit_key=output_keys["processed_commits"][trade_date],
+                trusted_input_version_records=trusted_input_lineage[
+                    "canonical_versions"
+                ][trade_date],
+                input_read_fn=input_read_fn,
+                processed_read_fn=processed_read_fn,
+                processed_object_read_fn=processed_object_read_fn,
+                processed_object_write_fn=processed_object_write_fn,
+                processed_commit_read_fn=processed_commit_read_fn,
+                processed_commit_write_fn=processed_commit_write_fn,
+                generated_at_fn=generated_at_fn,
+            )
+        except Exception as exc:
+            report = deepcopy(started_report)
+            report["status"] = "FAILED"
+            report["blocked_reasons"] = [
+                f"DATE_EXECUTION_FAILED:{type(exc).__name__}"
+            ]
+            report["failure"] = _failure_record(exc)
+            report["commit"]["status"] = (
+                "UNCOMMITTED" if apply_processed_write else "NOT_REQUESTED"
+            )
         artifact_write_json_fn(daily_report_key, report)
         daily_reports[trade_date] = report
+        date_statuses[trade_date] = report["status"]
+        write_manifest("RUNNING")
 
-    date_statuses = {trade_date: report["status"] for trade_date, report in daily_reports.items()}
     status = _range_status(date_statuses, apply_processed_write=apply_processed_write)
-    status_counts = dict(sorted(Counter(date_statuses.values()).items()))
-    manifest = {
-        "schema_version": "goal22.real_clean_universe_manifest.v1",
-        "goal": "22",
-        "run_id": run_id,
-        "generated_at": generated_at_fn(),
-        "status": status,
-        "mode": mode,
-        "apply_requested": bool(apply_processed_write),
-        "resume": bool(resume),
-        "force": bool(force),
-        "plan": plan,
-        "plan_fingerprint": plan_fingerprint,
-        "date_statuses": date_statuses,
-        "status_counts": status_counts,
-        "daily_report_keys": output_keys["daily_reports"],
-        "processed_output_keys": output_keys["processed"],
-        "downstream_firewalls": deepcopy(_DOWNSTREAM_FIREWALLS),
-    }
-    artifact_write_json_fn(output_keys["range_manifest"], manifest)
+    manifest = write_manifest(status)
+    status_counts = manifest["status_counts"]
     return {
         "goal": "22",
         "run_id": run_id,
@@ -236,6 +330,7 @@ def run_real_clean_universe_range(
         "range_manifest_key": output_keys["range_manifest"],
         "daily_report_keys": output_keys["daily_reports"],
         "processed_output_keys": output_keys["processed"],
+        "processed_commit_keys": output_keys["processed_commits"],
         "downstream_firewalls": deepcopy(_DOWNSTREAM_FIREWALLS),
         "manifest": manifest,
     }
@@ -248,24 +343,21 @@ def _run_one_trade_date(
     plan_fingerprint: str,
     mode: str,
     apply_processed_write: bool,
+    resume: bool,
     force: bool,
-    previous_report: dict[str, Any] | None,
+    started_report: dict[str, Any],
     planned_output_keys: dict[str, str],
+    commit_key: str,
+    trusted_input_version_records: dict[str, dict[str, Any]],
     input_read_fn: InputReadFn,
     processed_read_fn: ProcessedReadFn | None,
-    processed_write_fn: ProcessedWriteFn | None,
+    processed_object_read_fn: ProcessedObjectReadFn | None,
+    processed_object_write_fn: ProcessedObjectWriteFn | None,
+    processed_commit_read_fn: ProcessedCommitReadFn | None,
+    processed_commit_write_fn: ProcessedCommitWriteFn | None,
     generated_at_fn: Callable[[], str],
 ) -> dict[str, Any]:
-    attempt = int(previous_report.get("attempt", 0)) + 1 if isinstance(previous_report, dict) else 1
-    report = _empty_daily_report(
-        run_id=run_id,
-        trade_date=trade_date,
-        plan_fingerprint=plan_fingerprint,
-        mode=mode,
-        attempt=attempt,
-        generated_at=generated_at_fn(),
-        planned_output_keys=planned_output_keys,
-    )
+    report = deepcopy(started_report)
 
     artifacts: dict[str, InputArtifact] = {}
     frames: dict[str, pd.DataFrame] = {}
@@ -274,6 +366,11 @@ def _run_one_trade_date(
         try:
             artifact = input_read_fn(dataset, trade_date)
             _validate_input_artifact(dataset, artifact)
+            _validate_trusted_input_artifact(
+                dataset,
+                artifact,
+                trusted_input_version_records[dataset],
+            )
             artifacts[dataset] = artifact
             frames[dataset] = artifact.frame.copy(deep=True)
             report["inputs"][dataset] = _input_record(artifact)
@@ -287,6 +384,8 @@ def _run_one_trade_date(
     if blocked_reasons:
         report["status"] = "BLOCKED"
         report["blocked_reasons"] = blocked_reasons
+        if apply_processed_write:
+            report["commit"]["status"] = "UNCOMMITTED"
         return report
 
     try:
@@ -328,6 +427,8 @@ def _run_one_trade_date(
     if blocked_reasons:
         report["status"] = "BLOCKED"
         report["blocked_reasons"] = _unique(blocked_reasons)
+        if apply_processed_write:
+            report["commit"]["status"] = "UNCOMMITTED"
         return report
 
     try:
@@ -372,10 +473,14 @@ def _run_one_trade_date(
     except (DataValidationError, ValueError, KeyError, TypeError) as exc:
         report["status"] = "BLOCKED"
         report["blocked_reasons"] = [f"PIPELINE_DQ_FAILED:{type(exc).__name__}:{_safe_message(exc)}"]
+        if apply_processed_write:
+            report["commit"]["status"] = "UNCOMMITTED"
         return report
     except Exception as exc:
         report["status"] = "FAILED"
         report["failure"] = _failure_record(exc)
+        if apply_processed_write:
+            report["commit"]["status"] = "UNCOMMITTED"
         return report
 
     if not apply_processed_write:
@@ -383,54 +488,122 @@ def _run_one_trade_date(
         return report
 
     assert processed_read_fn is not None
-    assert processed_write_fn is not None
-    if not force and _completed_report_matches(
-        previous_report,
-        report["inputs"],
-        outputs,
-        processed_read_fn,
-        trade_date,
-    ):
-        report["status"] = "COMPLETED"
-        report["resume_action"] = "REUSED_COMPLETED"
-        for dataset in OUTPUT_DATASETS:
-            report["outputs"][dataset]["write"] = {
-                "requested": True,
-                "performed": False,
-                "status": "UNCHANGED",
-            }
-            report["outputs"][dataset]["read_back"] = {
-                "passed": True,
-                "row_count": len(outputs[dataset]),
-                "checksum": report["outputs"][dataset]["checksum"],
-            }
-        return report
-
-    report["resume_action"] = "RECOMPUTED" if previous_report else "NEW"
-    current_dataset = None
+    assert processed_object_read_fn is not None
+    assert processed_object_write_fn is not None
+    assert processed_commit_read_fn is not None
+    assert processed_commit_write_fn is not None
+    input_fingerprint = _stable_hash(report["inputs"])
+    expected_output_records = {
+        dataset: {
+            "logical_key": planned_output_keys[dataset],
+            "row_count": report["outputs"][dataset]["row_count"],
+            "checksum": report["outputs"][dataset]["checksum"],
+        }
+        for dataset in OUTPUT_DATASETS
+    }
+    current_phase = "RESUME_COMMIT_READ"
     try:
+        existing_commit = (
+            _read_commit_optional(processed_commit_read_fn, trade_date)
+            if resume and not force
+            else None
+        )
+        if existing_commit is not None and _completed_commit_matches(
+            existing_commit,
+            run_id=run_id,
+            trade_date=trade_date,
+            plan_fingerprint=plan_fingerprint,
+            input_fingerprint=input_fingerprint,
+            expected_outputs=expected_output_records,
+            processed_read_fn=processed_read_fn,
+        ):
+            report["status"] = "COMPLETED"
+            report["resume_action"] = "REUSED_COMPLETED"
+            report["commit"] = {
+                "object_key": commit_key,
+                "status": "COMMITTED",
+                "generation_id": existing_commit["generation_id"],
+                "reused": True,
+            }
+            for dataset in OUTPUT_DATASETS:
+                committed_output = existing_commit["outputs"][dataset]
+                report["outputs"][dataset]["object_key"] = committed_output[
+                    "object_key"
+                ]
+                report["outputs"][dataset]["write"] = {
+                    "requested": True,
+                    "performed": False,
+                    "status": "UNCHANGED",
+                }
+                report["outputs"][dataset]["read_back"] = {
+                    "passed": True,
+                    "row_count": len(outputs[dataset]),
+                    "checksum": report["outputs"][dataset]["checksum"],
+                }
+            return report
+
+        report["resume_action"] = (
+            "RECOMPUTED" if existing_commit is not None else "NEW"
+        )
+        generation_id = _stable_hash(
+            {
+                "run_id": run_id,
+                "trade_date": trade_date,
+                "plan_fingerprint": plan_fingerprint,
+                "input_fingerprint": input_fingerprint,
+                "outputs": expected_output_records,
+            }
+        )
+        report["commit"] = {
+            "object_key": commit_key,
+            "status": "PENDING",
+            "generation_id": generation_id,
+            "reused": False,
+        }
+
         for dataset in OUTPUT_DATASETS:
-            current_dataset = dataset
+            current_phase = f"STAGE:{dataset}"
             expected = outputs[dataset]
             expected_checksum = report["outputs"][dataset]["checksum"]
-            existing = _read_processed_optional(processed_read_fn, dataset, trade_date)
-            if existing is not None and _valid_output_checksum(dataset, existing, trade_date, expected_checksum):
+            generation_key = build_goal22_processed_generation_key(
+                dataset,
+                trade_date,
+                generation_id,
+            )
+            report["outputs"][dataset]["object_key"] = generation_key
+            existing = _read_processed_object_optional(
+                processed_object_read_fn,
+                generation_key,
+            )
+            if existing is not None and _valid_output_checksum(
+                dataset,
+                existing,
+                trade_date,
+                expected_checksum,
+            ):
                 report["outputs"][dataset]["write"] = {
                     "requested": True,
                     "performed": False,
                     "status": "UNCHANGED",
                 }
             else:
-                object_key = processed_write_fn(dataset, trade_date, expected.copy(deep=True))
-                if object_key != planned_output_keys[dataset]:
-                    raise RuntimeError(f"processed writer returned unexpected key for {dataset}")
+                object_key = processed_object_write_fn(
+                    dataset,
+                    trade_date,
+                    generation_id,
+                    expected.copy(deep=True),
+                )
+                if object_key != generation_key:
+                    raise RuntimeError(
+                        f"processed generation writer returned unexpected key for {dataset}"
+                    )
                 report["outputs"][dataset]["write"] = {
                     "requested": True,
                     "performed": True,
                     "status": "WRITTEN",
                 }
 
-            read_back = processed_read_fn(dataset, trade_date)
+            read_back = processed_object_read_fn(generation_key)
             validate_dataset_frame(dataset, read_back, trade_date)
             read_back_checksum = dataframe_checksum(
                 read_back,
@@ -443,10 +616,61 @@ def _run_one_trade_date(
                 "row_count": len(read_back),
                 "checksum": read_back_checksum,
             }
+
+        commit_payload = {
+            "schema_version": "goal22.processed_date_commit.v1",
+            "goal": "22",
+            "status": "COMMITTED",
+            "run_id": run_id,
+            "trade_date": trade_date,
+            "generation_id": generation_id,
+            "committed_at": generated_at_fn(),
+            "plan_fingerprint": plan_fingerprint,
+            "input_fingerprint": input_fingerprint,
+            "outputs": {
+                dataset: {
+                    **expected_output_records[dataset],
+                    "object_key": report["outputs"][dataset]["object_key"],
+                }
+                for dataset in OUTPUT_DATASETS
+            },
+            "downstream_firewalls": deepcopy(_DOWNSTREAM_FIREWALLS),
+        }
+        current_phase = "DATE_COMMIT"
+        written_commit_key = processed_commit_write_fn(
+            trade_date,
+            commit_payload,
+        )
+        if written_commit_key != commit_key:
+            raise RuntimeError("processed commit writer returned unexpected key")
+        report["commit"]["status"] = "COMMITTED"
+
+        for dataset in OUTPUT_DATASETS:
+            current_phase = f"COMMITTED_READBACK:{dataset}"
+            read_back = processed_read_fn(dataset, trade_date)
+            expected_checksum = report["outputs"][dataset]["checksum"]
+            if not _valid_output_checksum(
+                dataset,
+                read_back,
+                trade_date,
+                expected_checksum,
+            ):
+                raise RuntimeError(
+                    f"committed processed read-back mismatch for {dataset}"
+                )
+            report["outputs"][dataset]["read_back"] = {
+                "passed": True,
+                "row_count": len(read_back),
+                "checksum": expected_checksum,
+            }
     except Exception as exc:
         report["status"] = "FAILED"
-        report["blocked_reasons"] = [f"OUTPUT_APPLY_FAILED:{current_dataset}:{type(exc).__name__}"]
+        report["blocked_reasons"] = [
+            f"OUTPUT_APPLY_FAILED:{current_phase}:{type(exc).__name__}"
+        ]
         report["failure"] = _failure_record(exc)
+        if report["commit"]["status"] != "COMMITTED":
+            report["commit"]["status"] = "UNCOMMITTED"
         return report
 
     report["status"] = "COMPLETED"
@@ -462,9 +686,11 @@ def _empty_daily_report(
     attempt: int,
     generated_at: str,
     planned_output_keys: dict[str, str],
+    commit_key: str,
+    trusted_input_lineage: dict[str, Any],
 ) -> dict[str, Any]:
     return {
-        "schema_version": "goal22.real_clean_universe_daily_dq.v1",
+        "schema_version": "goal22.real_clean_universe_daily_dq.v2",
         "goal": "22",
         "run_id": run_id,
         "trade_date": trade_date,
@@ -474,6 +700,18 @@ def _empty_daily_report(
         "mode": mode,
         "status": "RUNNING",
         "resume_action": "NOT_APPLICABLE",
+        "trusted_input_lineage": {
+            "fingerprint": _stable_hash(trusted_input_lineage),
+            "codes": list(trusted_input_lineage["codes"]),
+            "readiness_report_keys": [
+                receipt["readiness_report_key"]
+                for receipt in trusted_input_lineage["readiness_receipts"]
+            ],
+            "readiness_report_checksums": [
+                receipt["readiness_report_checksum"]
+                for receipt in trusted_input_lineage["readiness_receipts"]
+            ],
+        },
         "inputs": {},
         "financial_as_of": {
             "source_rows": 0,
@@ -486,13 +724,20 @@ def _empty_daily_report(
         "missing_rates": {"inputs": {}, "outputs": {}},
         "outputs": {
             dataset: {
-                "object_key": planned_output_keys[dataset],
+                "logical_key": planned_output_keys[dataset],
+                "object_key": None,
                 "row_count": 0,
                 "checksum": None,
                 "write": {"requested": mode == "APPLY", "performed": False, "status": "NOT_RUN"},
                 "read_back": {"passed": False, "status": "NOT_RUN"},
             }
             for dataset in OUTPUT_DATASETS
+        },
+        "commit": {
+            "object_key": commit_key,
+            "status": "PENDING" if mode == "APPLY" else "NOT_REQUESTED",
+            "generation_id": None,
+            "reused": False,
         },
         "blocked_reasons": [],
         "failure": None,
@@ -556,7 +801,8 @@ def _output_records(
     for dataset in OUTPUT_DATASETS:
         frame = outputs[dataset]
         records[dataset] = {
-            "object_key": planned_output_keys[dataset],
+            "logical_key": planned_output_keys[dataset],
+            "object_key": None,
             "row_count": len(frame),
             "checksum": dataframe_checksum(frame, key_columns=OUTPUT_KEY_COLUMNS[dataset]),
             "write": {
@@ -577,24 +823,59 @@ def _normalize_output_frame(dataset: str, frame: pd.DataFrame) -> pd.DataFrame:
     return result[contract.columns]
 
 
-def _completed_report_matches(
-    previous_report: dict[str, Any] | None,
-    input_records: dict[str, dict[str, Any]],
-    outputs: dict[str, pd.DataFrame],
-    processed_read_fn: ProcessedReadFn,
+def _completed_commit_matches(
+    commit: dict[str, Any],
+    *,
+    run_id: str,
     trade_date: str,
+    plan_fingerprint: str,
+    input_fingerprint: str,
+    expected_outputs: dict[str, dict[str, Any]],
+    processed_read_fn: ProcessedReadFn,
 ) -> bool:
-    if not isinstance(previous_report, dict) or previous_report.get("status") != "COMPLETED":
+    if not isinstance(commit, dict):
         return False
-    if previous_report.get("inputs") != input_records:
+    if (
+        commit.get("schema_version") != "goal22.processed_date_commit.v1"
+        or commit.get("goal") != "22"
+        or commit.get("status") != "COMMITTED"
+        or commit.get("run_id") != run_id
+        or commit.get("trade_date") != trade_date
+        or commit.get("plan_fingerprint") != plan_fingerprint
+        or commit.get("input_fingerprint") != input_fingerprint
+        or commit.get("downstream_firewalls") != _DOWNSTREAM_FIREWALLS
+    ):
+        return False
+    generation_id = str(commit.get("generation_id", ""))
+    if re.fullmatch(r"[0-9a-f]{64}", generation_id) is None:
+        return False
+    committed_outputs = commit.get("outputs")
+    if not isinstance(committed_outputs, dict) or set(committed_outputs) != set(
+        OUTPUT_DATASETS
+    ):
         return False
     for dataset in OUTPUT_DATASETS:
-        expected_checksum = dataframe_checksum(outputs[dataset], key_columns=OUTPUT_KEY_COLUMNS[dataset])
-        previous_output = previous_report.get("outputs", {}).get(dataset, {})
-        if previous_output.get("checksum") != expected_checksum:
+        expected = expected_outputs[dataset]
+        committed = committed_outputs[dataset]
+        if not isinstance(committed, dict):
             return False
-        current = _read_processed_optional(processed_read_fn, dataset, trade_date)
-        if current is None or not _valid_output_checksum(dataset, current, trade_date, expected_checksum):
+        expected_generation_key = build_goal22_processed_generation_key(
+            dataset,
+            trade_date,
+            generation_id,
+        )
+        if committed != {**expected, "object_key": expected_generation_key}:
+            return False
+        try:
+            current = processed_read_fn(dataset, trade_date)
+        except (DataValidationError, FileNotFoundError):
+            return False
+        if not _valid_output_checksum(
+            dataset,
+            current,
+            trade_date,
+            expected["checksum"],
+        ):
             return False
     return True
 
@@ -625,6 +906,34 @@ def _validate_input_artifact(dataset: str, artifact: InputArtifact) -> None:
         seen_keys.add(version.object_key)
     if dataset not in REQUIRED_INPUTS:
         raise ValueError(f"unsupported Goal 22 input: {dataset}")
+
+
+def _validate_trusted_input_artifact(
+    dataset: str,
+    artifact: InputArtifact,
+    expected: dict[str, Any],
+) -> None:
+    if len(artifact.versions) != 1:
+        raise DataValidationError(
+            f"trusted canonical input must have exactly one version for {dataset}"
+        )
+    version = artifact.versions[0]
+    if (
+        version.object_key != expected["object_key"]
+        or version.row_count != expected["object_row_count"]
+        or version.checksum != expected["object_checksum"]
+    ):
+        raise DataValidationError(
+            f"trusted canonical object version mismatch for {dataset}"
+        )
+    scope_checksum = dataframe_checksum(artifact.frame)
+    if (
+        len(artifact.frame) != expected["scope_row_count"]
+        or scope_checksum != expected["scope_checksum"]
+    ):
+        raise DataValidationError(
+            f"trusted canonical scoped content mismatch for {dataset}"
+        )
 
 
 def _input_record(artifact: InputArtifact) -> dict[str, Any]:
@@ -690,9 +999,22 @@ def _range_status(date_statuses: dict[str, str], *, apply_processed_write: bool)
     return "BLOCKED" if any(value == "BLOCKED" for value in values) else "FAILED"
 
 
-def _read_processed_optional(read_fn: ProcessedReadFn, dataset: str, trade_date: str) -> pd.DataFrame | None:
+def _read_processed_object_optional(
+    read_fn: ProcessedObjectReadFn,
+    object_key: str,
+) -> pd.DataFrame | None:
     try:
-        return read_fn(dataset, trade_date)
+        return read_fn(object_key)
+    except FileNotFoundError:
+        return None
+
+
+def _read_commit_optional(
+    read_fn: ProcessedCommitReadFn,
+    trade_date: str,
+) -> dict[str, Any] | None:
+    try:
+        return read_fn(trade_date)
     except FileNotFoundError:
         return None
 

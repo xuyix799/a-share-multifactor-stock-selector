@@ -72,7 +72,6 @@ def validate_risk_filter(df: pd.DataFrame, trade_date: str) -> None:
 
 def validate_eligible_universe(df: pd.DataFrame, trade_date: str) -> None:
     trade_date = validate_trade_date(trade_date)
-    _require_non_empty(df, "eligible_universe")
     _require_columns(df, ELIGIBLE_UNIVERSE_COLUMNS)
     _validate_trade_date_column(df, trade_date)
     _validate_stock_codes(df)
@@ -87,7 +86,6 @@ def validate_eligible_universe(df: pd.DataFrame, trade_date: str) -> None:
 
 def validate_factor_input_table(df: pd.DataFrame, trade_date: str) -> None:
     trade_date = validate_trade_date(trade_date)
-    _require_non_empty(df, "factor_input_table")
     _require_columns(df, FACTOR_INPUT_TABLE_COLUMNS)
     _validate_trade_date_column(df, trade_date)
     _validate_stock_codes(df)

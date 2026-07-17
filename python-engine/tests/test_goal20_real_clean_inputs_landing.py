@@ -5,6 +5,10 @@ import pytest
 
 from stock_selector.cli import main
 from stock_selector.data.mock_data import generate_mock_dataset
+from stock_selector.data.real_clean_input_gate import (
+    load_goal22_trusted_input_lineage,
+    readiness_payload_checksum,
+)
 
 
 REQUIRED_INPUTS = {
@@ -291,6 +295,20 @@ def test_goal20_verified_empty_st_history_means_all_clear_without_fake_rows(monk
     for trade_date in TRADE_DATES:
         stored = pd.read_parquet(tmp_path / _raw_key("st_history", trade_date))
         assert stored.empty
+    lineage = load_goal22_trusted_input_lineage(
+        readiness_report_keys=[output["readiness_report_key"]],
+        start_date=TRADE_DATES[0],
+        end_date=TRADE_DATES[-1],
+        trade_dates=TRADE_DATES,
+        read_json_fn=lambda key: _read_report(tmp_path, key),
+    )
+    assert all(
+        lineage["canonical_versions"][trade_date]["st_history"][
+            "scope_row_count"
+        ]
+        == 0
+        for trade_date in TRADE_DATES
+    )
 
 
 def test_goal20_valid_apply_writes_and_reads_back(monkeypatch, tmp_path, capsys):
@@ -307,15 +325,65 @@ def test_goal20_valid_apply_writes_and_reads_back(monkeypatch, tmp_path, capsys)
     assert report["ready_for_apply"] is True
     assert report["ready_for_clean"] is True
     assert report["read_back_verification"]["passed"] is True
+    manifest = _read_report(tmp_path, output["manifest_key"])
+    assert manifest["readiness_report_checksum"] == readiness_payload_checksum(report)
     for dataset in REQUIRED_INPUTS:
         assert report["inputs"][dataset]["validation"]["passed"] is True
         assert report["inputs"][dataset]["read_back"]["passed"] is True
+        assert all(
+            detail["object_checksum"] and detail["scope_checksum"]
+            for detail in report["inputs"][dataset]["read_back"]["details"]
+        )
     for trade_date in TRADE_DATES:
         for dataset in ["stock_basic", "adj_factor", "st_history", "benchmark_price"]:
             assert (tmp_path / "raw" / dataset / f"trade_date={trade_date}" / "part.parquet").exists()
         stock = pd.read_parquet(tmp_path / _raw_key("stock_basic", trade_date))
         assert set(stock["list_date"].astype(str)) == {"2010-01-01"}
         assert stock.loc[stock["stock_code"] == "600519.SH", "delist_date"].iloc[0] == "2025-01-01"
+
+    lineage = load_goal22_trusted_input_lineage(
+        readiness_report_keys=[output["readiness_report_key"]],
+        start_date=TRADE_DATES[0],
+        end_date=TRADE_DATES[-1],
+        trade_dates=TRADE_DATES,
+        read_json_fn=lambda key: _read_report(tmp_path, key),
+    )
+    assert lineage["trade_dates"] == TRADE_DATES
+    assert lineage["codes"] == sorted(CODES)
+
+
+def test_goal20_verified_receipt_closes_goal22_cli_trust_gate(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    monkeypatch.setenv("STOCK_PARQUET_BACKEND", "local")
+    monkeypatch.setenv("STOCK_LOCAL_DATA_DIR", str(tmp_path))
+    _write_valid_goal20_sources(tmp_path)
+    assert main(_goal20_args("--apply")) == 0
+    goal20_output = json.loads(capsys.readouterr().out)
+
+    assert main(
+        [
+            "run-real-clean-universe-range",
+            "--run-id",
+            "goal20-to-goal22-integration",
+            "--start-date",
+            TRADE_DATES[0],
+            "--end-date",
+            TRADE_DATES[-1],
+            "--trade-dates",
+            ",".join(TRADE_DATES),
+            "--readiness-report-key",
+            goal20_output["readiness_report_key"],
+        ]
+    ) == 0
+
+    goal22_output = json.loads(capsys.readouterr().out)
+    assert goal22_output["status"] == "READY_FOR_APPLY"
+    assert goal22_output["date_statuses"] == {
+        trade_date: "READY_FOR_APPLY" for trade_date in TRADE_DATES
+    }
 
 
 def test_goal20_goal13_adj_reuse_requires_and_records_manifest(monkeypatch, tmp_path, capsys):
