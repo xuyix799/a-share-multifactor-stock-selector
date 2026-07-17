@@ -21,6 +21,17 @@ READINESS_MANIFEST_KEY = (
     "candidate/real_clean_inputs/manifest/"
     "batch_id=goal22-cli-receipt/manifest.json"
 )
+ST_HISTORY_STAGING_KEY = (
+    "candidate/real_clean_inputs/st_history_interval_staging/"
+    "batch_id=goal22-cli-receipt/part.parquet"
+)
+ST_HISTORY_COVERAGE_KEY = (
+    "candidate/real_clean_inputs/st_history_interval_staging/"
+    "batch_id=goal22-cli-receipt/coverage.json"
+)
+ST_HISTORY_EVIDENCE_KEY = (
+    "evidence/vendor/st_history/goal22-cli-all-clear.parquet"
+)
 
 
 def test_goal22_parser_defaults_to_dry_run_and_resume():
@@ -125,6 +136,70 @@ def test_goal22_cli_rejects_manifest_source_lineage_mismatch(
     assert main(_args(run_id="goal22-lineage-mismatch")) == 2
 
     assert "source lineage differs for daily_price" in capsys.readouterr().err
+    assert not (tmp_path / "candidate" / "real_clean_universe").exists()
+
+
+def test_goal22_cli_rejects_empty_st_receipt_without_proof_lineage_even_when_rechecksummed(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    monkeypatch.setenv("STOCK_PARQUET_BACKEND", "local")
+    monkeypatch.setenv("STOCK_LOCAL_DATA_DIR", str(tmp_path))
+    _write_inputs(tmp_path)
+    forged_keys = [_raw_key("st_history", TRADE_DATE)]
+    report = _read_json(tmp_path, READINESS_KEY)
+    report["inputs"]["st_history"]["source_keys"] = forged_keys
+    _write_json(tmp_path, READINESS_KEY, report)
+    manifest = _read_json(tmp_path, READINESS_MANIFEST_KEY)
+    manifest["source_keys"]["st_history"] = forged_keys
+    manifest["readiness_report_checksum"] = readiness_payload_checksum(report)
+    _write_json(tmp_path, READINESS_MANIFEST_KEY, manifest)
+
+    assert main(_args(run_id="goal22-empty-st-forged-lineage")) == 2
+
+    assert "exact Goal 20 staging" in capsys.readouterr().err
+    assert not (tmp_path / "candidate" / "real_clean_universe").exists()
+
+
+def test_goal22_cli_rejects_empty_st_coverage_outside_audited_range(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    monkeypatch.setenv("STOCK_PARQUET_BACKEND", "local")
+    monkeypatch.setenv("STOCK_LOCAL_DATA_DIR", str(tmp_path))
+    _write_inputs(tmp_path)
+    proof = _read_json(tmp_path, ST_HISTORY_COVERAGE_KEY)
+    proof["coverage_start_date"] = "2026-06-20"
+    proof["coverage_end_date"] = "2026-06-20"
+    _write_json(tmp_path, ST_HISTORY_COVERAGE_KEY, proof)
+
+    assert main(_args(run_id="goal22-empty-st-short-coverage")) == 2
+
+    assert "misses audited dates" in capsys.readouterr().err
+    assert not (tmp_path / "candidate" / "real_clean_universe").exists()
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    [ST_HISTORY_STAGING_KEY, ST_HISTORY_EVIDENCE_KEY],
+)
+def test_goal22_cli_rejects_empty_st_missing_proof_parquet(
+    monkeypatch,
+    tmp_path,
+    capsys,
+    missing_key,
+):
+    monkeypatch.setenv("STOCK_PARQUET_BACKEND", "local")
+    monkeypatch.setenv("STOCK_LOCAL_DATA_DIR", str(tmp_path))
+    _write_inputs(tmp_path)
+    (tmp_path / missing_key).unlink()
+
+    suffix = "staging" if missing_key == ST_HISTORY_STAGING_KEY else "evidence"
+    assert main(_args(run_id=f"goal22-empty-st-missing-{suffix}")) == 2
+
+    assert missing_key in capsys.readouterr().err
     assert not (tmp_path / "candidate" / "real_clean_universe").exists()
 
 
@@ -309,12 +384,33 @@ def _write_inputs(
 def _write_goal20_receipt(root, trade_dates: list[str]) -> None:
     stock = pd.read_parquet(root / _raw_key("stock_basic", trade_dates[0]))
     codes = sorted(set(stock["stock_code"].astype(str)))
+    empty_st_history = pd.DataFrame(
+        columns=["stock_code", "st_type", "start_date", "end_date", "source"]
+    )
+    for object_key in (ST_HISTORY_STAGING_KEY, ST_HISTORY_EVIDENCE_KEY):
+        path = root / object_key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        empty_st_history.to_parquet(path, index=False)
+    _write_json(
+        root,
+        ST_HISTORY_COVERAGE_KEY,
+        {
+            "schema_version": "goal20.st_history_coverage.v1",
+            "source_semantics": "HISTORICAL_INTERVAL_SOURCE",
+            "source_object_keys": [ST_HISTORY_EVIDENCE_KEY],
+            "coverage_codes": codes,
+            "coverage_start_date": trade_dates[0],
+            "coverage_end_date": trade_dates[-1],
+            "coverage_complete": True,
+            "interval_row_count": 0,
+        },
+    )
     inputs = {}
     readback_details = []
     source_keys = {}
     for dataset in REQUIRED_INPUTS:
         details = []
-        keys = []
+        canonical_keys = []
         total_rows = 0
         for trade_date in trade_dates:
             object_key = _raw_key(dataset, trade_date)
@@ -334,8 +430,15 @@ def _write_goal20_receipt(root, trade_dates: list[str]) -> None:
                 "scope_checksum": dataframe_checksum(scoped),
             }
             details.append(detail)
-            keys.append(object_key)
+            canonical_keys.append(object_key)
             total_rows += len(scoped)
+        keys = canonical_keys
+        if dataset == "st_history":
+            keys = [
+                ST_HISTORY_STAGING_KEY,
+                ST_HISTORY_COVERAGE_KEY,
+                ST_HISTORY_EVIDENCE_KEY,
+            ]
         source_keys[dataset] = keys
         coverage = {
             "passed": True,
@@ -349,14 +452,25 @@ def _write_goal20_receipt(root, trade_dates: list[str]) -> None:
                 "000905.SH",
                 "000906.SH",
             ]
+        if dataset == "st_history":
+            coverage["coverage_start_date"] = trade_dates[0]
+            coverage["coverage_end_date"] = trade_dates[-1]
         inputs[dataset] = {
             "dataset": dataset,
             "source_keys": keys,
             "row_count": total_rows,
-            "dq_level": "DQ3_STANDARD_CANONICAL",
+            "dq_level": (
+                "DQ1_VERIFIED_HISTORICAL_INTERVALS"
+                if dataset == "st_history"
+                else "DQ3_STANDARD_CANONICAL"
+            ),
             "coverage": coverage,
             "validation": {"passed": True, "errors": []},
-            "write": {"requested": True, "status": "WRITTEN", "object_keys": keys},
+            "write": {
+                "requested": True,
+                "status": "WRITTEN",
+                "object_keys": canonical_keys,
+            },
             "read_back": {"passed": True, "status": "PASS", "details": details},
             "ready_for_apply": True,
             "ready_for_clean": True,

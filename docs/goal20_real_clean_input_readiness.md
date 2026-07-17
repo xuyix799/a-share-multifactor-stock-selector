@@ -150,6 +150,8 @@ scope_checksum
 
 The companion manifest records `readiness_report_checksum`. Goal 22 requires this checksum binding and rejects older or hand-edited report/manifest pairs that do not match. Regenerate a Goal 20 readiness receipt after upgrading before using it as a Goal 22 gate.
 
+For an empty `st_history`, Goal 22 also reopens the exact batch-scoped interval staging object and `coverage.json`, checks the audited code/date range, and reads every upstream evidence object named by the sidecar. The report and manifest lineage must be exactly the staging key, coverage key and those evidence keys in producer order. Recomputing the report checksum cannot replace this proof.
+
 The top level records the requested scope, provider/apply mode, staging writes, per-input status, aggregate upsert summaries, read-back details, blocked reasons, output keys, and downstream firewalls.
 
 - `ready_for_apply=true` means all seven inputs are already trusted canonical data or have validated sources safe to promote.

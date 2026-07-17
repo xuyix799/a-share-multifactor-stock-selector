@@ -291,6 +291,11 @@ def test_goal20_verified_empty_st_history_means_all_clear_without_fake_rows(monk
     assert status["row_count"] == 0
     assert status["validation"]["passed"] is True
     assert status["read_back"]["passed"] is True
+    assert status["source_keys"] == [
+        _goal20_staging_key("st_history"),
+        _goal20_st_coverage_key(),
+        evidence_key,
+    ]
     assert report["ready_for_clean"] is True
     for trade_date in TRADE_DATES:
         stored = pd.read_parquet(tmp_path / _raw_key("st_history", trade_date))
@@ -301,6 +306,7 @@ def test_goal20_verified_empty_st_history_means_all_clear_without_fake_rows(monk
         end_date=TRADE_DATES[-1],
         trade_dates=TRADE_DATES,
         read_json_fn=lambda key: _read_report(tmp_path, key),
+        read_parquet_fn=lambda key: pd.read_parquet(tmp_path / key),
     )
     assert all(
         lineage["canonical_versions"][trade_date]["st_history"][
@@ -347,6 +353,7 @@ def test_goal20_valid_apply_writes_and_reads_back(monkeypatch, tmp_path, capsys)
         end_date=TRADE_DATES[-1],
         trade_dates=TRADE_DATES,
         read_json_fn=lambda key: _read_report(tmp_path, key),
+        read_parquet_fn=lambda key: pd.read_parquet(tmp_path / key),
     )
     assert lineage["trade_dates"] == TRADE_DATES
     assert lineage["codes"] == sorted(CODES)

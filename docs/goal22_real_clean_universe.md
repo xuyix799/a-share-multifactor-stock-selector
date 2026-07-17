@@ -60,6 +60,7 @@ Goal 22 accepts a receipt only when:
 - the report is `READY`, `ready_for_apply=true`, `ready_for_clean=true`, has no blockers, and all seven validation, coverage and canonical read-back checks passed;
 - the companion manifest is `COMPLETED`, points to that report, has the same audit scope and source lineage, and binds the report checksum;
 - every requested date has all seven canonical object keys, whole-object row counts/checksums and audited-scope row counts/checksums;
+- an empty `st_history` additionally has the exact Goal 20 batch staging key, `coverage.json`, full historical code/date coverage and readable upstream empty-interval evidence; synchronized hand-written report/manifest checksums do not substitute for these artifacts;
 - the current canonical objects still match those versions exactly.
 
 There is deliberately no raw-partition date discovery fallback. Omitting either gate is a CLI error. A requested date remains in the plan and DQ even when all four market partitions are later missing.

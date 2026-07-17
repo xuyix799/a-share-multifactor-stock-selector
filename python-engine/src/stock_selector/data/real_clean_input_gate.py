@@ -7,7 +7,11 @@ import json
 import re
 from typing import Any
 
+import pandas as pd
+
 from stock_selector.data.data_validator import validate_stock_code
+from stock_selector.data.data_validator import validate_dataset_frame
+from stock_selector.providers.schema_contract import get_schema_contract
 from stock_selector.utils.date_validator import validate_date_range, validate_trade_date
 from stock_selector.utils.path_validator import safe_object_key
 
@@ -30,6 +34,7 @@ _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
 ReadJsonFn = Callable[[str], dict[str, Any]]
+ReadParquetFn = Callable[[str], pd.DataFrame]
 
 
 def readiness_payload_checksum(payload: Any) -> str:
@@ -50,6 +55,7 @@ def load_goal22_trusted_input_lineage(
     end_date: str,
     trade_dates: Iterable[str],
     read_json_fn: ReadJsonFn,
+    read_parquet_fn: ReadParquetFn,
 ) -> dict[str, Any]:
     start_date, end_date = validate_date_range(start_date, end_date)
     selected_dates = _normalize_trade_dates(trade_dates)
@@ -60,7 +66,11 @@ def load_goal22_trusted_input_lineage(
 
     report_keys = _normalize_report_keys(readiness_report_keys)
     receipts = [
-        _load_and_validate_receipt(report_key, read_json_fn)
+        _load_and_validate_receipt(
+            report_key,
+            read_json_fn,
+            read_parquet_fn,
+        )
         for report_key in report_keys
     ]
     for receipt in receipts:
@@ -208,6 +218,7 @@ def validate_goal22_trusted_input_lineage(
 def _load_and_validate_receipt(
     readiness_report_key: str,
     read_json_fn: ReadJsonFn,
+    read_parquet_fn: ReadParquetFn,
 ) -> dict[str, Any]:
     report_key, batch_id = _validate_readiness_report_key(readiness_report_key)
     manifest_key = _manifest_key(batch_id)
@@ -369,6 +380,19 @@ def _load_and_validate_receipt(
                 "Goal 20 read-back details do not cover the audited dates for "
                 f"{dataset}"
             )
+        if dataset == "st_history" and all(
+            record["scope_row_count"] == 0 for record in by_date.values()
+        ):
+            _validate_empty_st_history_lineage(
+                batch_id=batch_id,
+                status=status,
+                source_keys=source_keys,
+                codes=codes,
+                scope_start=scope_start,
+                scope_end=scope_end,
+                read_json_fn=read_json_fn,
+                read_parquet_fn=read_parquet_fn,
+            )
         for trade_date in trade_dates:
             canonical_versions[trade_date][dataset] = by_date[trade_date]
 
@@ -382,6 +406,142 @@ def _load_and_validate_receipt(
         "trade_dates": trade_dates,
         "canonical_versions": canonical_versions,
     }
+
+
+def _validate_empty_st_history_lineage(
+    *,
+    batch_id: str,
+    status: dict[str, Any],
+    source_keys: list[str],
+    codes: list[str],
+    scope_start: str,
+    scope_end: str,
+    read_json_fn: ReadJsonFn,
+    read_parquet_fn: ReadParquetFn,
+) -> None:
+    staging_key = (
+        "candidate/real_clean_inputs/st_history_interval_staging/"
+        f"batch_id={batch_id}/part.parquet"
+    )
+    coverage_key = (
+        "candidate/real_clean_inputs/st_history_interval_staging/"
+        f"batch_id={batch_id}/coverage.json"
+    )
+    coverage = status.get("coverage")
+    if (
+        status.get("dq_level") != "DQ1_VERIFIED_HISTORICAL_INTERVALS"
+        or isinstance(status.get("row_count"), bool)
+        or status.get("row_count") != 0
+        or not isinstance(coverage, dict)
+        or coverage.get("coverage_start_date") != scope_start
+        or coverage.get("coverage_end_date") != scope_end
+    ):
+        raise ValueError(
+            "empty st_history receipt lacks the Goal 20 historical audit contract"
+        )
+
+    proof = read_json_fn(coverage_key)
+    if not isinstance(proof, dict):
+        raise ValueError("empty st_history coverage sidecar must be a JSON object")
+    if (
+        proof.get("schema_version") != "goal20.st_history_coverage.v1"
+        or proof.get("source_semantics") != "HISTORICAL_INTERVAL_SOURCE"
+        or proof.get("coverage_complete") is not True
+        or isinstance(proof.get("interval_row_count"), bool)
+        or proof.get("interval_row_count") != 0
+    ):
+        raise ValueError("empty st_history coverage sidecar is invalid")
+
+    proof_codes = proof.get("coverage_codes")
+    if isinstance(proof_codes, str):
+        proof_codes = [
+            value.strip()
+            for value in proof_codes.split(",")
+            if value.strip()
+        ]
+    normalized_proof_codes = _normalize_codes(proof_codes)
+    if not set(codes).issubset(normalized_proof_codes):
+        raise ValueError("empty st_history coverage sidecar misses audited codes")
+    proof_start, proof_end = validate_date_range(
+        str(proof.get("coverage_start_date", "")),
+        str(proof.get("coverage_end_date", "")),
+    )
+    if proof_start > scope_start or proof_end < scope_end:
+        raise ValueError("empty st_history coverage sidecar misses audited dates")
+
+    evidence_keys = proof.get("source_object_keys")
+    if not isinstance(evidence_keys, list) or not evidence_keys:
+        raise ValueError("empty st_history coverage sidecar lacks upstream evidence")
+    if any(not isinstance(key, str) or not key for key in evidence_keys):
+        raise ValueError("empty st_history upstream evidence keys must be strings")
+    if len(set(evidence_keys)) != len(evidence_keys):
+        raise ValueError("empty st_history upstream evidence keys must be unique")
+    _validate_lineage_keys(evidence_keys, "st_history")
+    for evidence_key in evidence_keys:
+        lowered = evidence_key.lower()
+        if lowered.startswith("candidate/real_clean_inputs/") or lowered.startswith(
+            "raw/st_history/"
+        ):
+            raise ValueError(
+                "empty st_history evidence must be upstream of Goal 20 canonical data"
+            )
+
+    expected_source_keys = [staging_key, coverage_key, *evidence_keys]
+    if source_keys != expected_source_keys:
+        raise ValueError(
+            "empty st_history source lineage must contain the exact Goal 20 "
+            "staging, coverage and upstream evidence keys"
+        )
+
+    columns = get_schema_contract("st_history").columns
+    staging = _read_empty_st_history_frame(
+        read_parquet_fn,
+        staging_key,
+        columns=columns,
+        codes=None,
+        trade_date=scope_end,
+    )
+    if not staging.empty:
+        raise ValueError("empty st_history Goal 20 staging object is not empty")
+    for evidence_key in evidence_keys:
+        evidence = _read_empty_st_history_frame(
+            read_parquet_fn,
+            evidence_key,
+            columns=columns,
+            codes=codes,
+            trade_date=scope_end,
+        )
+        if not evidence.empty:
+            raise ValueError(
+                "empty st_history upstream evidence is not empty for audited codes"
+            )
+
+
+def _read_empty_st_history_frame(
+    read_parquet_fn: ReadParquetFn,
+    object_key: str,
+    *,
+    columns: list[str],
+    codes: list[str] | None,
+    trade_date: str,
+) -> pd.DataFrame:
+    frame = read_parquet_fn(object_key)
+    if not isinstance(frame, pd.DataFrame):
+        raise ValueError("empty st_history proof object must be Parquet data")
+    missing = sorted(set(columns) - set(frame.columns))
+    if missing:
+        raise ValueError(
+            "empty st_history proof object is missing columns: "
+            + ", ".join(missing)
+        )
+    scoped = frame
+    if codes is not None:
+        scoped = frame.loc[
+            frame["stock_code"].astype(str).isin(codes)
+        ].reset_index(drop=True)
+    scoped = scoped.loc[:, columns].copy()
+    validate_dataset_frame("st_history", scoped, trade_date)
+    return scoped
 
 
 def _validate_version_record(

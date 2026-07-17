@@ -924,6 +924,7 @@ def _cmd_run_real_clean_universe_range(args: argparse.Namespace) -> int:
             end_date=end_date,
             trade_dates=trade_dates,
             read_json_fn=_load_tushare_candidate_batch_json,
+            read_parquet_fn=_load_tushare_candidate_batch_parquet,
         )
         input_reader = _Goal22CanonicalInputReader(trusted_input_lineage)
         result = run_real_clean_universe_range(
