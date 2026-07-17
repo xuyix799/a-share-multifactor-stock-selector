@@ -162,6 +162,70 @@ def test_goal22_cli_rejects_empty_st_receipt_without_proof_lineage_even_when_rec
     assert not (tmp_path / "candidate" / "real_clean_universe").exists()
 
 
+def test_goal22_cli_rejects_mixed_st_scope_counts_without_proof_even_when_rechecksummed(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    trade_dates = ["2026-06-18", TRADE_DATE]
+    monkeypatch.setenv("STOCK_PARQUET_BACKEND", "local")
+    monkeypatch.setenv("STOCK_LOCAL_DATA_DIR", str(tmp_path))
+    _write_inputs(tmp_path, trade_dates=trade_dates)
+
+    mixed_st = generate_mock_dataset("st_history", trade_dates[-1])
+    mixed_st_path = tmp_path / _raw_key("st_history", trade_dates[-1])
+    mixed_st.to_parquet(mixed_st_path, index=False)
+
+    forged_keys = [_raw_key("st_history", date) for date in trade_dates]
+    report = _read_json(tmp_path, READINESS_KEY)
+    st_status = report["inputs"]["st_history"]
+    st_status["source_keys"] = forged_keys
+    st_status["row_count"] = len(mixed_st)
+    for detail in st_status["read_back"]["details"]:
+        if detail["trade_date"] == trade_dates[-1]:
+            detail.update(
+                {
+                    "object_row_count": len(mixed_st),
+                    "object_checksum": dataframe_checksum(mixed_st),
+                    "scope_row_count": len(mixed_st),
+                    "scope_checksum": dataframe_checksum(mixed_st),
+                }
+            )
+    st_aggregate = next(
+        item
+        for item in report["read_back_verification"]["details"]
+        if item["dataset"] == "st_history"
+    )
+    st_aggregate["details"] = st_status["read_back"]["details"]
+    _write_json(tmp_path, READINESS_KEY, report)
+
+    manifest = _read_json(tmp_path, READINESS_MANIFEST_KEY)
+    manifest["source_keys"]["st_history"] = forged_keys
+    manifest["readiness_report_checksum"] = readiness_payload_checksum(report)
+    _write_json(tmp_path, READINESS_MANIFEST_KEY, manifest)
+    for proof_key in (
+        ST_HISTORY_STAGING_KEY,
+        ST_HISTORY_COVERAGE_KEY,
+        ST_HISTORY_EVIDENCE_KEY,
+    ):
+        (tmp_path / proof_key).unlink()
+
+    assert (
+        main(
+            _args(
+                run_id="goal22-mixed-st-forged-lineage",
+                trade_dates=trade_dates,
+                start_date=trade_dates[0],
+                end_date=trade_dates[-1],
+            )
+        )
+        == 2
+    )
+
+    assert "st_history row counts" in capsys.readouterr().err
+    assert not (tmp_path / "candidate" / "real_clean_universe").exists()
+
+
 def test_goal22_cli_rejects_empty_st_coverage_outside_audited_range(
     monkeypatch,
     tmp_path,

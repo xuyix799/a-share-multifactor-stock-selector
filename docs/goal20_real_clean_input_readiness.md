@@ -148,6 +148,8 @@ scope_row_count
 scope_checksum
 ```
 
+Because Goal 20 copies one validated historical ST interval frame to every audited date, every `st_history.scope_row_count` must equal the input-level `row_count`. A receipt with mixed per-date ST row counts is not a valid Goal 20 producer result and Goal 22 rejects it.
+
 The companion manifest records `readiness_report_checksum`. Goal 22 requires this checksum binding and rejects older or hand-edited report/manifest pairs that do not match. Regenerate a Goal 20 readiness receipt after upgrading before using it as a Goal 22 gate.
 
 For an empty `st_history`, Goal 22 also reopens the exact batch-scoped interval staging object and `coverage.json`, checks the audited code/date range, and reads every upstream evidence object named by the sidecar. The report and manifest lineage must be exactly the staging key, coverage key and those evidence keys in producer order. Recomputing the report checksum cannot replace this proof.

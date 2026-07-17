@@ -380,19 +380,30 @@ def _load_and_validate_receipt(
                 "Goal 20 read-back details do not cover the audited dates for "
                 f"{dataset}"
             )
-        if dataset == "st_history" and all(
-            record["scope_row_count"] == 0 for record in by_date.values()
-        ):
-            _validate_empty_st_history_lineage(
-                batch_id=batch_id,
-                status=status,
-                source_keys=source_keys,
-                codes=codes,
-                scope_start=scope_start,
-                scope_end=scope_end,
-                read_json_fn=read_json_fn,
-                read_parquet_fn=read_parquet_fn,
+        if dataset == "st_history":
+            status_row_count = _non_negative_int(
+                status.get("row_count"),
+                "st_history row_count",
             )
+            if any(
+                record["scope_row_count"] != status_row_count
+                for record in by_date.values()
+            ):
+                raise ValueError(
+                    "Goal 20 st_history row counts are inconsistent across "
+                    "audited dates"
+                )
+            if status_row_count == 0:
+                _validate_empty_st_history_lineage(
+                    batch_id=batch_id,
+                    status=status,
+                    source_keys=source_keys,
+                    codes=codes,
+                    scope_start=scope_start,
+                    scope_end=scope_end,
+                    read_json_fn=read_json_fn,
+                    read_parquet_fn=read_parquet_fn,
+                )
         for trade_date in trade_dates:
             canonical_versions[trade_date][dataset] = by_date[trade_date]
 
