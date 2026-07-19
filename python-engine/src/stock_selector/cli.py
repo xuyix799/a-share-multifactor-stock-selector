@@ -963,6 +963,62 @@ def _cmd_run_real_clean_universe_range(args: argparse.Namespace) -> int:
     return 0 if output["status"] in {"READY_FOR_APPLY", "COMPLETED"} else 1
 
 
+def _cmd_run_real_factor_range(args: argparse.Namespace) -> int:
+    from stock_selector.factors.real_factor_daily import (
+        load_goal22_manifest_catalog,
+        run_real_factor_daily_range,
+    )
+
+    try:
+        start_date, end_date = validate_date_range(args.start_date, args.end_date)
+        trade_dates = _parse_goal22_trade_dates(args.trade_dates)
+        manifest_catalog = load_goal22_manifest_catalog(
+            manifest_keys=args.goal22_manifest_key,
+            read_json_fn=_load_tushare_candidate_batch_json,
+        )
+        result = run_real_factor_daily_range(
+            run_id=args.run_id,
+            start_date=start_date,
+            end_date=end_date,
+            trade_dates=trade_dates,
+            goal22_manifest_catalog=manifest_catalog,
+            factor_config=load_factor_weights_config(),
+            control_read_json_fn=_load_tushare_candidate_batch_json,
+            control_write_json_fn=_write_tushare_candidate_batch_json,
+            goal22_processed_object_read_fn=_read_goal22_processed_object,
+            canonical_object_read_fn=_load_tushare_candidate_batch_parquet,
+            goal22_commit_read_fn=_read_goal22_processed_commit,
+            factor_object_read_fn=(
+                _read_goal23_factor_object if args.apply else None
+            ),
+            factor_object_write_fn=(
+                _write_goal23_factor_object if args.apply else None
+            ),
+            factor_commit_read_fn=(
+                _read_goal23_factor_commit if args.apply else None
+            ),
+            factor_commit_write_fn=(
+                _write_goal23_factor_commit if args.apply else None
+            ),
+            apply_processed_write=args.apply,
+            resume=args.resume,
+            force=args.force,
+        )
+    except (
+        DateValidationError,
+        DataValidationError,
+        DatasetValidationError,
+        ValueError,
+        FileNotFoundError,
+    ) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    output = _real_factor_range_cli_output(result)
+    print(json.dumps(output, ensure_ascii=False, default=str))
+    return 0 if output["status"] in {"READY_FOR_APPLY", "COMPLETED"} else 1
+
+
 def _cmd_validate_provider_data(args: argparse.Namespace) -> int:
     try:
         trade_date = validate_trade_date(args.trade_date)
@@ -1871,6 +1927,23 @@ def _real_clean_universe_range_cli_output(result: dict) -> dict:
     }
 
 
+def _real_factor_range_cli_output(result: dict) -> dict:
+    return {
+        "goal": "23",
+        "run_id": result.get("run_id"),
+        "status": result.get("status"),
+        "mode": result.get("mode", "DRY_RUN"),
+        "apply_requested": result.get("apply_requested", False),
+        "date_statuses": result.get("date_statuses", {}),
+        "status_counts": result.get("status_counts", {}),
+        "range_manifest_key": result.get("range_manifest_key"),
+        "daily_report_keys": result.get("daily_report_keys", {}),
+        "processed_output_keys": result.get("processed_output_keys", {}),
+        "processed_commit_keys": result.get("processed_commit_keys", {}),
+        "downstream_firewalls": result.get("downstream_firewalls", {}),
+    }
+
+
 def _tushare_provider_config_status(exc: ProviderConfigurationError) -> str:
     message = str(exc).lower()
     if "disabled" in message:
@@ -2126,6 +2199,168 @@ def _validate_goal22_generation_object_key(object_key: str) -> str:
     }:
         raise ValueError("unsupported Goal 22 processed generation dataset")
     validate_trade_date(match.group(2))
+    return object_key
+
+
+def _read_goal23_factor_daily(trade_date: str) -> pd.DataFrame:
+    from stock_selector.factors.real_factor_daily import (
+        read_goal23_published_factor_daily,
+    )
+
+    return read_goal23_published_factor_daily(
+        trade_date=trade_date,
+        factor_commit_read_fn=_read_goal23_factor_commit,
+        factor_object_read_fn=_read_goal23_factor_object,
+    )
+
+
+def _read_goal23_factor_object(object_key: str) -> pd.DataFrame:
+    object_key = _validate_goal23_factor_generation_object_key(object_key)
+    settings = load_settings()
+    if _storage_backend(settings) == "local":
+        path = _local_root(settings) / object_key
+        if not path.exists():
+            raise FileNotFoundError(object_key)
+        return _read_goal23_factor_parquet(path)
+
+    client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_processed"]
+    with tempfile.TemporaryDirectory(prefix="stock-goal23-factor-read-") as tmp:
+        target = Path(tmp) / "part.parquet"
+        try:
+            client.fget_object(bucket, object_key, str(target))
+        except S3Error as exc:
+            if exc.code in {"NoSuchKey", "NoSuchBucket", "NoSuchObject"}:
+                raise FileNotFoundError(object_key) from exc
+            raise
+        return _read_goal23_factor_parquet(target)
+
+
+def _read_goal23_factor_parquet(path: Path) -> pd.DataFrame:
+    import pyarrow.parquet as pq
+
+    from stock_selector.factors.real_factor_daily import (
+        validate_factor_daily_arrow_schema,
+    )
+
+    validate_factor_daily_arrow_schema(pq.read_schema(path))
+    return pd.read_parquet(path)
+
+
+def _write_goal23_factor_object(
+    trade_date: str,
+    generation_id: str,
+    frame: pd.DataFrame,
+) -> str:
+    from stock_selector.factors.real_factor_daily import (
+        build_goal23_factor_generation_key,
+        normalize_factor_daily_frame,
+    )
+
+    trade_date = validate_trade_date(trade_date)
+    frame = normalize_factor_daily_frame(frame)
+    validate_factor_daily(frame, trade_date)
+    object_key = build_goal23_factor_generation_key(
+        trade_date,
+        generation_id,
+    )
+    settings = load_settings()
+    if _storage_backend(settings) == "local":
+        write_parquet_local_atomic(frame, _local_root(settings) / object_key)
+        return object_key
+
+    client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_processed"]
+    ensure_buckets(client, [bucket])
+    with tempfile.TemporaryDirectory(prefix="stock-goal23-factor-write-") as tmp:
+        local_file = Path(tmp) / "part.parquet"
+        frame.to_parquet(local_file, index=False)
+        AtomicObjectWriter(client, tmp_dir=Path(tmp)).write_file_atomic(
+            bucket,
+            object_key,
+            local_file,
+        )
+    return object_key
+
+
+def _read_goal23_factor_commit(trade_date: str) -> dict:
+    from stock_selector.factors.real_factor_daily import (
+        build_goal23_factor_commit_key,
+        validate_goal23_factor_commit_payload,
+    )
+
+    trade_date = validate_trade_date(trade_date)
+    object_key = build_goal23_factor_commit_key(trade_date)
+    settings = load_settings()
+    if _storage_backend(settings) == "local":
+        path = _local_root(settings) / object_key
+        if not path.exists():
+            raise FileNotFoundError(object_key)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        client = create_minio_client(settings)
+        bucket = settings["storage"]["minio_bucket_processed"]
+        with tempfile.TemporaryDirectory(prefix="stock-goal23-commit-read-") as tmp:
+            target = Path(tmp) / "commit.json"
+            try:
+                client.fget_object(bucket, object_key, str(target))
+            except S3Error as exc:
+                if exc.code in {"NoSuchKey", "NoSuchBucket", "NoSuchObject"}:
+                    raise FileNotFoundError(object_key) from exc
+                raise
+            payload = json.loads(target.read_text(encoding="utf-8"))
+    validate_goal23_factor_commit_payload(payload, trade_date)
+    return payload
+
+
+def _write_goal23_factor_commit(trade_date: str, payload: dict) -> str:
+    from stock_selector.factors.real_factor_daily import (
+        build_goal23_factor_commit_key,
+        validate_goal23_factor_commit_payload,
+    )
+
+    trade_date = validate_trade_date(trade_date)
+    validate_goal23_factor_commit_payload(payload, trade_date)
+    object_key = build_goal23_factor_commit_key(trade_date)
+    settings = load_settings()
+    if _storage_backend(settings) == "local":
+        path = _local_root(settings) / object_key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, default=str, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+        return object_key
+
+    client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_processed"]
+    ensure_buckets(client, [bucket])
+    with tempfile.TemporaryDirectory(prefix="stock-goal23-commit-write-") as tmp:
+        local_file = Path(tmp) / "commit.json"
+        local_file.write_text(
+            json.dumps(payload, ensure_ascii=False, default=str, indent=2),
+            encoding="utf-8",
+        )
+        AtomicObjectWriter(client, tmp_dir=Path(tmp)).write_file_atomic(
+            bucket,
+            object_key,
+            local_file,
+        )
+    return object_key
+
+
+def _validate_goal23_factor_generation_object_key(object_key: str) -> str:
+    object_key = safe_object_key(object_key)
+    match = re.fullmatch(
+        r"processed/factor_daily/trade_date=(\d{4}-\d{2}-\d{2})/"
+        r"generation=([0-9a-f]{64})/part\.parquet",
+        object_key,
+    )
+    if match is None:
+        raise ValueError("invalid Goal 23 factor generation key")
+    validate_trade_date(match.group(1))
     return object_key
 
 
@@ -2405,6 +2640,34 @@ def build_parser() -> argparse.ArgumentParser:
     goal22_resume.add_argument("--no-resume", dest="resume", action="store_false")
     run_real_clean_universe.add_argument("--force", action="store_true")
     run_real_clean_universe.set_defaults(resume=True, func=_cmd_run_real_clean_universe_range)
+
+    run_real_factor_range = subparsers.add_parser(
+        "run-real-factor-range",
+        allow_abbrev=False,
+    )
+    run_real_factor_range.add_argument("--run-id", required=True)
+    run_real_factor_range.add_argument("--start-date", required=True)
+    run_real_factor_range.add_argument("--end-date", required=True)
+    run_real_factor_range.add_argument(
+        "--trade-dates",
+        required=True,
+        help="comma-separated authoritative target dates covered by Goal 22 manifests",
+    )
+    run_real_factor_range.add_argument(
+        "--goal22-manifest-key",
+        action="append",
+        required=True,
+        help="trusted Goal 22 range manifest key; repeat to provide factor history",
+    )
+    run_real_factor_range.add_argument("--apply", action="store_true")
+    goal23_resume = run_real_factor_range.add_mutually_exclusive_group()
+    goal23_resume.add_argument("--resume", dest="resume", action="store_true")
+    goal23_resume.add_argument("--no-resume", dest="resume", action="store_false")
+    run_real_factor_range.add_argument("--force", action="store_true")
+    run_real_factor_range.set_defaults(
+        resume=True,
+        func=_cmd_run_real_factor_range,
+    )
 
     validate_provider_data = subparsers.add_parser("validate-provider-data")
     validate_provider_data.add_argument("--trade-date", required=True)

@@ -28,6 +28,7 @@ def validate_dataset_frame(dataset: str, df: pd.DataFrame, trade_date: str) -> N
         "st_history",
         "eligible_universe",
         "factor_input_table",
+        "factor_daily",
     }:
         raise DataValidationError(f"{dataset} is empty")
 

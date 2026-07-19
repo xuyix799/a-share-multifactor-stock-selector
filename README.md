@@ -2,7 +2,7 @@
 
 本仓库是一个本地 Docker 部署的 A股中长线多因子选股系统。当前系统已完成 Docker 本地 mock/offline 端到端闭环验证。Python CLI、PostgreSQL、MinIO、Spring Boot API 已在容器环境中联通，mock 数据可以完成 provider、raw、复权、clean snapshot、universe、factor_daily、selection_result、validate-selection 和 run-backtest，并可通过 Spring API 查询选股摘要和回测摘要。
 
-真实数据方面，AKShare、Baostock、Tushare 仍未进入真实选股或真实回测主链路。Tushare 的 `daily`、`stk_limit`、`adj_factor`、`daily_basic`、`trade_cal`、`suspend_d` 等关键接口已完成 smoke、candidate/staging、coverage expansion、`suspend_d` full coverage audit、promotion preflight、Goal 14 小范围 `daily_price` promotion validator、Goal 15 显式 `--apply` 小范围标准写入路径、Goal 17 小批次 `daily_price` landing 编排和 Goal 18 标准输入 landing；Goal 20 统一审计真实 clean 所需七项输入，Goal 21 补充确定性、可恢复历史回填框架，Goal 22 则让已可信的标准输入以默认 dry-run、显式 `--apply` 的方式进入 processed `adjusted_price`、clean snapshot、universe 与 `factor_input_table`。只有历史语义、覆盖、DQ、写入和读回全部可信时才能声明对应范围 ready；Goal 22 仍不自动启动 `factor_daily`、选股或回测。
+真实数据方面，AKShare、Baostock、Tushare 仍未进入真实选股或真实回测主链路。Tushare 的 `daily`、`stk_limit`、`adj_factor`、`daily_basic`、`trade_cal`、`suspend_d` 等关键接口已完成 smoke、candidate/staging、coverage expansion、`suspend_d` full coverage audit、promotion preflight、Goal 14 小范围 `daily_price` promotion validator、Goal 15 显式 `--apply` 小范围标准写入路径、Goal 17 小批次 `daily_price` landing 编排和 Goal 18 标准输入 landing；Goal 20 统一审计真实 clean 所需七项输入，Goal 21 补充确定性、可恢复历史回填框架，Goal 22 让已可信的标准输入进入原子发布的 processed clean/universe/`factor_input_table`，Goal 23 再只消费这些 Goal 22 已提交结果和其绑定的 benchmark 版本，生成默认 dry-run、显式 `--apply` 的真实 `factor_daily` 范围结果。只有历史语义、覆盖、DQ、generation、commit 和读回全部可信时才能声明对应范围 ready；Goal 23 仍不自动启动选股或回测。
 
 系统定位：
 
@@ -43,6 +43,7 @@
 - Goal 20：新增真实 clean 所需七项标准输入统一 readiness 审计，覆盖 `stock_basic`、`daily_price`、`adj_factor`、`daily_basic`、`financial`、`st_history` 和 `benchmark_price`。默认不调用 provider、默认 dry-run；provider 访问必须显式传 `--provider-call`，标准写入必须显式传 `--apply`。当前快照、smoke-only benchmark、不可读历史证据或任一缺失/语义不可靠输入都会保持 blocked，不启动 clean/factor/selection/backtest，详见 `docs/goal20_real_clean_input_readiness.md`。
 - Goal 21：新增七项标准输入的确定性、可恢复历史回填框架，并完成评审修复：live 响应先写入带 checksum/语义证据哈希的不可变 raw landing；失败审计按 attempt 隔离；`suspend_d` 必须证明完整分页终止；READY checkpoint 可硬中断恢复；canonical 按逻辑 scope 精确替换；financial 使用公告日增量和严格 predecessor proof；v2 自然轴计划避免全市场十年 Cartesian 膨胀。命令默认 plan-only、不会构造或调用 provider；provider 和标准写入仍分别要求 `--provider-call`、`--apply`。当前 live adapter 无法证明历史语义的输入保持 blocked，本轮不声称已经完成真实十年抓取，也不启动 clean/factor/selection/backtest，详见 `docs/goal21_historical_backfill.md`。
 - Goal 22：新增 `run-real-clean-universe-range` 范围编排，逐日复用现有 adjusted price、clean snapshot 和 universe builders。命令强制接收显式交易日和 checksum 绑定的 Goal 20 readiness receipt；默认只计算并写 range manifest/逐日 DQ。显式 `--apply` 先写五项不可变 generation，全部读回后再以单个日期 commit marker 原子发布。财务严格按公告日 as-of，股票成员按历史 list/delist，ST 使用历史 `[start_date, end_date)`，停牌只接受显式布尔标准字段；单日失败隔离且可恢复，合法空 universe 可发布，不自动进入 `factor_daily`、`selection_result` 或 backtest，详见 `docs/goal22_real_clean_universe.md`。
+- Goal 23：新增 `run-real-factor-range` 范围编排，只消费显式 Goal 22 manifest 覆盖且已由 date commit 发布的 `adjusted_price`、`clean_daily_snapshot`、`factor_input_table`，benchmark 历史必须匹配 Goal 22 所绑定的 Goal 20 canonical 版本。命令默认 dry-run；显式 `--apply` 先写不可变 `factor_daily` generation，schema/行数/checksum 读回通过后才写 Goal 23 commit。历史不足保留空因子，三年估值分位使用严格历史门槛，合法空 factor input 产生 schema 完整空结果；动态 DQ 不把全空字段计入有效因子，且不生成 `total_score`、不进入选股或回测，详见 `docs/goal23_real_factor_daily.md`。
 - Goal 10B：AKShare / Baostock 最小真实数据 smoke，已验证 AKShare `benchmark_price` 可标准化写入 `smoke/akshare/...` 并通过 DuckDB 查询；字段不足的数据集不会绕过 validator 写入标准层。
 - Goal 11：AKShare / Baostock 真实数据能力矩阵与日线 smoke，新增 smoke-only `daily_price_raw_smoke`，只允许写入 `smoke/<provider>/daily_price_raw_smoke/...`，不进入标准 `raw/daily_price/...`。
 - Goal 12A：真实数据标准层契约与数据质量等级冻结，详见 `docs/goal12A_real_data_contract.md`；本阶段只新增契约、守门规则和测试，不接入真实 provider 主链路，不做真实回测。
@@ -51,7 +52,7 @@
 
 - 大范围真实标准 `daily_price` promotion。
 - 大范围真实财务数据接入和真实财务主链路使用。
-- 真实 clean/factor/selection/backtest 主链路。
+- 大范围真实 clean/factor 数据执行，以及真实 selection/backtest 主链路。
 - LLM 解释。
 - 复杂 Spring Boot 业务 API / 前端页面。
 - 自动交易或券商账户接入。
@@ -85,6 +86,15 @@ mock provider
   -> selection_result
 ```
 
+真实范围链路保持独立门禁：
+
+```text
+Goal 20/21 trusted canonical inputs
+  -> Goal 22 committed adjusted_price / clean_daily_snapshot / factor_input_table
+  -> Goal 23 committed factor_daily
+  -X-> selection_result / backtest
+```
+
 核心数据集：
 
 - raw：`stock_basic`、`daily_price`、`adj_factor`、`daily_basic`、`financial`、`st_history`、`benchmark_price`
@@ -105,6 +115,15 @@ mock provider
 - 子评分：`quality_score`、`growth_score`、`valuation_score`、`trend_score`、`industry_score`
 
 `factor_daily` 不包含 `total_score`。`total_score` 在 Goal 7 的 `selection_result` 中计算。
+
+Goal 23 因子合同审计结论：
+
+- 当前 schema 在可信历史充分时可计算 23 个有效基础因子；逐日 DQ 会按非空结果动态计数，达到 15 才把该日期标记为满足第一版有效因子门槛。
+- `quality_cashflow_profit_ratio` 因缺少可靠绝对净利润分母保持全空，不填 0、不计入有效因子。
+- `operating_cashflow` 已存在于可信 `factor_input_table`，不是 Goal 25 上游缺口，但当前冻结的 `factor_daily` schema 尚未将其作为独立因子，因此不计入上述 23 个有效因子；后续纳入需要显式调整 factor schema/权重合同，不需要扩大 Goal 20/21/22 canonical schema。
+- 所有非空基础因子必须是有限数；`+Inf/-Inf` 会阻断该日期。generation 读回会在任何 pandas 规范化之前校验精确物理 schema：`stock_code`、`trade_date`、`industry`、`market_type` 必须是 Arrow string，因子和评分列必须是 Arrow double；date32、timestamp、dictionary、string/object/bool 数值列及其他漂移均直接失败。
+- 20/60/120 日价格与行业窗口不足时保持空；真实范围路径的三年 PE/PB 分位还要求至少 720 个 prior 非空观测且历史接近完整三年边界。
+- 缺少投入资本、绝对营收/净利润、自由现金流、可比多期财务序列、盈利预测修订和行业历史财务聚合的因子延后到 Goal 25，不扩大 Goal 20/21/22 canonical schema。
 
 `selection_result` 当前包含：
 
@@ -654,6 +673,47 @@ docker compose run --rm stock-python python -m stock_selector.cli run-real-clean
 
 `--trade-dates` 与至少一个 `--readiness-report-key` 都是必需门禁；不再从 raw 市场分区猜测日期。只有显式追加 `--apply` 才将五项 `processed` 输出写入不可变 generation，全部 schema、行数与 checksum 读回通过后，再原子写 `processed/_goal22_commits/trade_date=YYYY-MM-DD/commit.json` 发布整日结果。范围 manifest 位于 `candidate/real_clean_universe/run_id=<run_id>/manifest.json`，逐日 DQ 位于同一 run 下的 `trade_date=.../dq_report.json`，记录 readiness lineage、输入版本、排除原因、缺失率、generation/commit key、checksum 和恢复状态。任一必需输入缺失、receipt/checksum 漂移或历史语义/DQ/读回失败只阻断对应日期；其他日期继续。完整合同见 `docs/goal22_real_clean_universe.md`。
 
+### Goal 23 Real Factor Daily Range
+
+Goal 23 只读取显式提供的 Goal 22 range manifest，不扫描 raw 或 legacy
+`part.parquet` 猜测历史：
+
+```powershell
+docker compose run --rm stock-python python -m stock_selector.cli run-real-factor-range `
+  --run-id <run_id> `
+  --start-date 2024-01-02 `
+  --end-date 2024-06-28 `
+  --trade-dates 2024-06-28 `
+  --goal22-manifest-key candidate/real_clean_universe/run_id=<goal22_run_id>/manifest.json
+```
+
+可重复传入 `--goal22-manifest-key` 提供更早的可信历史。每个目标日期必须由已
+`COMPLETED` 的 Goal 22 日期覆盖；Goal 23 会复核 Goal 22 manifest、逐日 DQ、
+date commit、三项消费 generation checksum，以及 Goal 22 lineage 绑定的
+benchmark canonical checksum。目标日之后的对象不会读取。
+
+默认只计算并写：
+
+```text
+candidate/real_factor_daily/run_id=<run_id>/manifest.json
+candidate/real_factor_daily/run_id=<run_id>/trade_date=YYYY-MM-DD/dq_report.json
+```
+
+显式 `--apply` 才写：
+
+```text
+processed/factor_daily/trade_date=YYYY-MM-DD/generation=<sha256>/part.parquet
+processed/_goal23_factor_commits/trade_date=YYYY-MM-DD/commit.json
+```
+
+generation schema、行数、checksum 和读回全部通过后才发布 commit；Goal 23
+reader 也只通过 commit 解析结果。`--force`、`--resume`、`--no-resume` 都不
+隐式开启 `--apply`。同一 `run_id` 的日期、manifest、权重和 null-score 配置
+不可漂移；不支持同一 `run_id` 或重叠日期的并发 apply。所有结果保持
+`selection_result=false`、`backtest=false`、`llm=false`、
+`provider_call=false`，不会自动进入 Goal 24。完整合同见
+`docs/goal23_real_factor_daily.md`。
+
 ## 幂等与重跑
 
 所有关键派生任务通过 PostgreSQL `update_log` 记录状态：
@@ -689,7 +749,9 @@ $env:PYTHONPATH='src;tests'
 python -m pytest
 ```
 
-当前测试基线：Python `249 passed, 5 skipped`；Spring Maven `mvn test -q` exit 0。
+当前测试基线（Goal 23 本轮重建镜像后实测）：Python
+`937 passed, 5 skipped`；Spring Maven `15 tests, 0 failures, 0 errors,
+0 skipped`，两者 exit 0。
 
 ## 开发约束
 

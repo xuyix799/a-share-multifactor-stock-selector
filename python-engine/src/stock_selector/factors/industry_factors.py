@@ -39,7 +39,10 @@ def build_industry_factors(
                 "ret_120d": _period_return(stock_history, "adj_close", 120),
             }
         )
-    returns = pd.DataFrame(stock_returns)
+    returns = pd.DataFrame(
+        stock_returns,
+        columns=["stock_code", "industry", "ret_60d", "ret_120d"],
+    )
     industry_ret_60 = returns.groupby("industry")["ret_60d"].mean()
     industry_ret_120 = returns.groupby("industry")["ret_120d"].mean()
 

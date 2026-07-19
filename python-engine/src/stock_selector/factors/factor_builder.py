@@ -19,6 +19,9 @@ def build_factor_daily(
     benchmark_price_history: pd.DataFrame,
     trade_date: str,
     factor_weights: dict[str, float] | None = None,
+    null_score_policy: str = "neutral",
+    neutral_score: float = 50.0,
+    strict_history_windows: bool = False,
 ) -> pd.DataFrame:
     trade_date = validate_trade_date(trade_date)
     validate_dataset_frame("factor_input_table", factor_input_table, trade_date)
@@ -27,7 +30,16 @@ def build_factor_daily(
     base["trade_date"] = trade_date
     result = base.merge(build_quality_factors(factor_input_table, trade_date), on=["stock_code", "trade_date"], how="left")
     result = result.merge(build_growth_factors(factor_input_table, trade_date), on=["stock_code", "trade_date"], how="left")
-    result = result.merge(build_valuation_factors(factor_input_table, clean_snapshot_history, trade_date), on=["stock_code", "trade_date"], how="left")
+    result = result.merge(
+        build_valuation_factors(
+            factor_input_table,
+            clean_snapshot_history,
+            trade_date,
+            require_full_3y_history=strict_history_windows,
+        ),
+        on=["stock_code", "trade_date"],
+        how="left",
+    )
     result = result.merge(build_trend_factors(factor_input_table, adjusted_price_history, trade_date), on=["stock_code", "trade_date"], how="left")
     result = result.merge(
         build_industry_factors(factor_input_table, adjusted_price_history, benchmark_price_history, trade_date).drop(columns=["industry"]),
@@ -36,7 +48,12 @@ def build_factor_daily(
     )
     result["liquidity_amount"] = factor_input_table["amount"].values
     result["liquidity_turnover_rate"] = factor_input_table["turnover_rate"].values
-    result = add_factor_scores(result, factor_weights)
+    result = add_factor_scores(
+        result,
+        factor_weights,
+        null_score_policy=null_score_policy,
+        neutral_score=neutral_score,
+    )
     result = result[FACTOR_DAILY_COLUMNS]
     validate_factor_daily(result, trade_date)
     return result

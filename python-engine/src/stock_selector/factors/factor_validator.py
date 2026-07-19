@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+import math
 
 import pandas as pd
 
@@ -43,19 +44,26 @@ FACTOR_DAILY_COLUMNS = [
 ]
 
 FACTOR_SCORE_COLUMNS = ["quality_score", "growth_score", "valuation_score", "trend_score", "industry_score"]
+FACTOR_BASE_COLUMNS = ["stock_code", "trade_date", "industry", "market_type"]
+FACTOR_NUMERIC_COLUMNS = [
+    column for column in FACTOR_DAILY_COLUMNS if column not in FACTOR_BASE_COLUMNS
+]
 
 
 def validate_factor_daily(df: pd.DataFrame, trade_date: str) -> None:
     trade_date = validate_trade_date(trade_date)
-    if df.empty:
-        raise DataValidationError("factor_daily is empty")
     _require_columns(df, FACTOR_DAILY_COLUMNS)
     _validate_trade_date_column(df, trade_date)
     _validate_stock_codes(df)
     if df.duplicated(["stock_code", "trade_date"]).any():
         raise DataValidationError("duplicate rows by key: stock_code, trade_date")
+    numeric_columns = {
+        column: _validate_numeric_factor_column(df, column)
+        for column in FACTOR_NUMERIC_COLUMNS
+    }
     for column in FACTOR_SCORE_COLUMNS:
-        if df[column].isna().any() or (df[column] < 0).any() or (df[column] > 100).any():
+        values = numeric_columns[column]
+        if values.isna().any() or (values < 0).any() or (values > 100).any():
             raise DataValidationError(f"{column} must be between 0 and 100")
     if "total_score" in df.columns:
         raise DataValidationError("factor_daily must not include total_score in Goal 6")
@@ -76,3 +84,20 @@ def _validate_trade_date_column(df: pd.DataFrame, trade_date: str) -> None:
 def _validate_stock_codes(df: pd.DataFrame) -> None:
     for value in df["stock_code"].astype(str):
         validate_stock_code(value)
+
+
+def _validate_numeric_factor_column(
+    df: pd.DataFrame,
+    column: str,
+) -> pd.Series:
+    try:
+        values = pd.to_numeric(df[column], errors="raise")
+    except (TypeError, ValueError) as exc:
+        raise DataValidationError(
+            f"{column} must contain only numeric values or null"
+        ) from exc
+    if not values.dropna().map(lambda value: math.isfinite(float(value))).all():
+        raise DataValidationError(
+            f"{column} must contain only finite values or null"
+        )
+    return values

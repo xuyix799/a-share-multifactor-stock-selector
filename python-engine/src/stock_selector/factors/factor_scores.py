@@ -4,8 +4,18 @@ import pandas as pd
 SCORE_COLUMNS = ["quality_score", "growth_score", "valuation_score", "trend_score", "industry_score"]
 
 
-def add_factor_scores(factors: pd.DataFrame, factor_weights: dict[str, float] | None = None) -> pd.DataFrame:
+def add_factor_scores(
+    factors: pd.DataFrame,
+    factor_weights: dict[str, float] | None = None,
+    *,
+    null_score_policy: str = "neutral",
+    neutral_score: float = 50.0,
+) -> pd.DataFrame:
     _ = factor_weights or {}
+    if null_score_policy != "neutral":
+        raise ValueError(f"unsupported null_score_policy: {null_score_policy}")
+    if neutral_score < 0 or neutral_score > 100:
+        raise ValueError("neutral_score must be between 0 and 100")
     result = factors.copy()
     result["quality_score"] = _mean_score(
         [
@@ -46,7 +56,7 @@ def add_factor_scores(factors: pd.DataFrame, factor_weights: dict[str, float] | 
         ]
     )
     for column in SCORE_COLUMNS:
-        result[column] = result[column].clip(0, 100).fillna(50.0)
+        result[column] = result[column].clip(0, 100).fillna(neutral_score)
     return result
 
 
