@@ -29,11 +29,16 @@ SELECTION_RESULT_COLUMNS = [
 SELECTION_SCORE_COLUMNS = ["quality_score", "growth_score", "valuation_score", "trend_score", "industry_score", "total_score"]
 
 
-def validate_selection_result(df: pd.DataFrame, trade_date: str) -> None:
+def validate_selection_result(
+    df: pd.DataFrame,
+    trade_date: str,
+    *,
+    allow_empty: bool = False,
+) -> None:
     trade_date = validate_trade_date(trade_date)
-    if df.empty:
-        raise DataValidationError("selection_result is empty")
     _require_columns(df, SELECTION_RESULT_COLUMNS)
+    if df.empty and not allow_empty:
+        raise DataValidationError("selection_result is empty")
     _validate_trade_date_column(df, trade_date)
     _validate_stock_codes(df)
     if df.duplicated(["stock_code", "trade_date"]).any():

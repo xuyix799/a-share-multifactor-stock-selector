@@ -85,3 +85,43 @@ def test_selection_snapshot_repo_replaces_existing_summary_for_trade_date():
     assert rows[0][2] == "new"
     assert rows[0][3] == 2
     assert json.loads(rows[0][7])[0]["stock_code"] == _selection().iloc[0]["stock_code"]
+
+
+def test_selection_snapshot_repo_preserves_monthly_and_quarterly_same_date():
+    conn = _connection()
+    repo = SelectionSnapshotRepository(lambda: conn, placeholder="?")
+    monthly = summarize_selection_result(
+        _selection(),
+        trade_date="2026-06-19",
+        top_n=50,
+        object_key="monthly",
+        rebalance_mode="monthly",
+    )
+    quarterly = summarize_selection_result(
+        _selection(),
+        trade_date="2026-06-19",
+        top_n=50,
+        object_key="quarterly",
+        rebalance_mode="quarterly",
+    )
+
+    repo.upsert_snapshot(monthly)
+    repo.upsert_snapshot(quarterly)
+
+    rows = conn.execute(
+        """
+        SELECT rebalance_mode, object_key
+        FROM selection_snapshot
+        ORDER BY rebalance_mode
+        """
+    ).fetchall()
+    assert rows == [
+        ("monthly", "monthly"),
+        ("quarterly", "quarterly"),
+    ]
+    assert repo.find_snapshot("2026-06-19", "monthly")[
+        "object_key"
+    ] == "monthly"
+    assert repo.find_snapshot("2026-06-19", "quarterly")[
+        "object_key"
+    ] == "quarterly"

@@ -154,6 +154,14 @@ def validate_selection_result(*args, **kwargs):
     return implementation(*args, **kwargs)
 
 
+def create_selection_snapshot_repository(*args, **kwargs):
+    from stock_selector.scoring.selection_snapshot_repo import (
+        create_selection_snapshot_repository as implementation,
+    )
+
+    return implementation(*args, **kwargs)
+
+
 def BacktestConfig(*args, **kwargs):
     from stock_selector.backtesting.backtest_pipeline import BacktestConfig as implementation
 
@@ -1017,6 +1025,90 @@ def _cmd_run_real_factor_range(args: argparse.Namespace) -> int:
     output = _real_factor_range_cli_output(result)
     print(json.dumps(output, ensure_ascii=False, default=str))
     return 0 if output["status"] in {"READY_FOR_APPLY", "COMPLETED"} else 1
+
+
+def _cmd_run_real_selection_range(args: argparse.Namespace) -> int:
+    from stock_selector.scoring.real_selection_result import (
+        load_goal23_manifest_catalog,
+        run_real_selection_result_range,
+    )
+
+    try:
+        start_date, end_date = validate_date_range(
+            args.start_date,
+            args.end_date,
+        )
+        selection_dates = _parse_goal22_trade_dates(
+            args.selection_dates
+        )
+        manifest_catalog = load_goal23_manifest_catalog(
+            manifest_keys=args.goal23_manifest_key,
+            read_json_fn=_load_tushare_candidate_batch_json,
+        )
+        snapshot_repo = None
+        if args.apply:
+            _ensure_db_schema()
+            snapshot_repo = create_selection_snapshot_repository()
+        result = run_real_selection_result_range(
+            run_id=args.run_id,
+            start_date=start_date,
+            end_date=end_date,
+            selection_dates=selection_dates,
+            rebalance_mode=args.rebalance_mode,
+            goal23_manifest_catalog=manifest_catalog,
+            selection_config=load_factor_weights_config(),
+            control_read_json_fn=_load_tushare_candidate_batch_json,
+            control_write_json_fn=(
+                _write_tushare_candidate_batch_json
+                if args.apply
+                else None
+            ),
+            goal23_factor_object_read_fn=_read_goal23_factor_object,
+            goal23_commit_read_fn=_read_goal23_factor_commit,
+            goal22_processed_object_read_fn=_read_goal22_processed_object,
+            goal22_commit_read_fn=_read_goal22_processed_commit,
+            selection_object_read_fn=(
+                _read_goal24_selection_object if args.apply else None
+            ),
+            selection_object_write_fn=(
+                _write_goal24_selection_object if args.apply else None
+            ),
+            selection_commit_read_fn=(
+                _read_goal24_selection_commit if args.apply else None
+            ),
+            selection_commit_write_fn=(
+                _write_goal24_selection_commit if args.apply else None
+            ),
+            snapshot_read_fn=(
+                snapshot_repo.find_snapshot
+                if snapshot_repo is not None
+                else None
+            ),
+            snapshot_upsert_fn=(
+                snapshot_repo.upsert_snapshot
+                if snapshot_repo is not None
+                else None
+            ),
+            apply_processed_write=args.apply,
+            resume=args.resume,
+            force=args.force,
+        )
+    except (
+        DateValidationError,
+        DataValidationError,
+        DatasetValidationError,
+        ValueError,
+        FileNotFoundError,
+    ) as exc:
+        print(f"invalid input: {exc}", file=sys.stderr)
+        return 2
+
+    print(json.dumps(result, ensure_ascii=False, default=str))
+    return (
+        0
+        if result["status"] in {"READY_FOR_APPLY", "COMPLETED"}
+        else 1
+    )
 
 
 def _cmd_validate_provider_data(args: argparse.Namespace) -> int:
@@ -1999,12 +2091,13 @@ def _read_goal22_processed(dataset: str, trade_date: str) -> pd.DataFrame:
 
 def _read_goal22_processed_object(object_key: str) -> pd.DataFrame:
     object_key = _validate_goal22_generation_object_key(object_key)
+    dataset = object_key.split("/", 2)[1]
     settings = load_settings()
     if _storage_backend(settings) == "local":
         path = _local_root(settings) / object_key
         if not path.exists():
             raise FileNotFoundError(object_key)
-        return pd.read_parquet(path)
+        return _read_goal22_processed_parquet(path, dataset)
 
     client = create_minio_client(settings)
     bucket = settings["storage"]["minio_bucket_processed"]
@@ -2017,7 +2110,34 @@ def _read_goal22_processed_object(object_key: str) -> pd.DataFrame:
             if exc.code in {"NoSuchKey", "NoSuchBucket", "NoSuchObject"}:
                 raise FileNotFoundError(object_key) from exc
             raise
-        return pd.read_parquet(target)
+        return _read_goal22_processed_parquet(target, dataset)
+
+
+def _read_goal22_processed_parquet(
+    path: Path,
+    dataset: str,
+) -> pd.DataFrame:
+    from stock_selector.scoring.real_selection_result import (
+        GOAL22_ARROW_SCHEMA_EVIDENCE_ATTR,
+        GOAL22_SELECTION_INPUT_DATASETS,
+        validate_goal22_selection_input_arrow_schema,
+    )
+
+    physical_schema = None
+    if dataset in GOAL22_SELECTION_INPUT_DATASETS:
+        import pyarrow.parquet as pq
+
+        physical_schema = validate_goal22_selection_input_arrow_schema(
+            dataset,
+            pq.read_schema(path),
+        )
+    frame = pd.read_parquet(path)
+    if physical_schema is not None:
+        frame.attrs[GOAL22_ARROW_SCHEMA_EVIDENCE_ATTR] = {
+            "dataset": dataset,
+            "physical_schema": physical_schema,
+        }
+    return frame
 
 
 def _write_goal22_processed_object(
@@ -2364,6 +2484,216 @@ def _validate_goal23_factor_generation_object_key(object_key: str) -> str:
     return object_key
 
 
+def _read_goal24_selection_object(object_key: str) -> pd.DataFrame:
+    object_key = _validate_goal24_selection_generation_object_key(object_key)
+    settings = load_settings()
+    if _storage_backend(settings) == "local":
+        path = _local_root(settings) / object_key
+        if not path.exists():
+            raise FileNotFoundError(object_key)
+        return _read_goal24_selection_parquet(path)
+
+    client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_processed"]
+    with tempfile.TemporaryDirectory(
+        prefix="stock-goal24-selection-read-"
+    ) as tmp:
+        target = Path(tmp) / "part.parquet"
+        try:
+            client.fget_object(bucket, object_key, str(target))
+        except S3Error as exc:
+            if exc.code in {"NoSuchKey", "NoSuchBucket", "NoSuchObject"}:
+                raise FileNotFoundError(object_key) from exc
+            raise
+        return _read_goal24_selection_parquet(target)
+
+
+def _read_goal24_selection_parquet(path: Path) -> pd.DataFrame:
+    import pyarrow.parquet as pq
+
+    from stock_selector.scoring.real_selection_result import (
+        validate_selection_result_arrow_schema,
+    )
+
+    validate_selection_result_arrow_schema(pq.read_schema(path))
+    return pd.read_parquet(path)
+
+
+def _write_goal24_selection_object(
+    trade_date: str,
+    rebalance_mode: str,
+    generation_id: str,
+    frame: pd.DataFrame,
+) -> str:
+    from stock_selector.scoring.real_selection_result import (
+        build_goal24_selection_generation_key,
+        normalize_selection_result_frame,
+    )
+
+    trade_date = validate_trade_date(trade_date)
+    frame = normalize_selection_result_frame(frame)
+    object_key = build_goal24_selection_generation_key(
+        trade_date,
+        rebalance_mode,
+        generation_id,
+    )
+    settings = load_settings()
+    if _storage_backend(settings) == "local":
+        write_parquet_local_atomic(frame, _local_root(settings) / object_key)
+        return object_key
+
+    client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_processed"]
+    ensure_buckets(client, [bucket])
+    with tempfile.TemporaryDirectory(
+        prefix="stock-goal24-selection-write-"
+    ) as tmp:
+        local_file = Path(tmp) / "part.parquet"
+        frame.to_parquet(local_file, index=False)
+        AtomicObjectWriter(client, tmp_dir=Path(tmp)).write_file_atomic(
+            bucket,
+            object_key,
+            local_file,
+        )
+    return object_key
+
+
+def _read_goal24_selection_commit(
+    trade_date: str,
+    rebalance_mode: str,
+) -> dict:
+    from stock_selector.scoring.real_selection_result import (
+        build_goal24_selection_commit_key,
+        validate_goal24_selection_commit_payload,
+    )
+
+    trade_date = validate_trade_date(trade_date)
+    object_key = build_goal24_selection_commit_key(
+        trade_date,
+        rebalance_mode,
+    )
+    settings = load_settings()
+    if _storage_backend(settings) == "local":
+        path = _local_root(settings) / object_key
+        if not path.exists():
+            raise FileNotFoundError(object_key)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    else:
+        client = create_minio_client(settings)
+        bucket = settings["storage"]["minio_bucket_processed"]
+        with tempfile.TemporaryDirectory(
+            prefix="stock-goal24-commit-read-"
+        ) as tmp:
+            target = Path(tmp) / "commit.json"
+            try:
+                client.fget_object(bucket, object_key, str(target))
+            except S3Error as exc:
+                if exc.code in {
+                    "NoSuchKey",
+                    "NoSuchBucket",
+                    "NoSuchObject",
+                }:
+                    raise FileNotFoundError(object_key) from exc
+                raise
+            payload = json.loads(target.read_text(encoding="utf-8"))
+    validate_goal24_selection_commit_payload(
+        payload,
+        trade_date,
+        rebalance_mode,
+    )
+    return payload
+
+
+def _write_goal24_selection_commit(
+    trade_date: str,
+    rebalance_mode: str,
+    payload: dict,
+) -> str:
+    from stock_selector.scoring.real_selection_result import (
+        build_goal24_selection_commit_key,
+        validate_goal24_selection_commit_payload,
+    )
+
+    trade_date = validate_trade_date(trade_date)
+    validate_goal24_selection_commit_payload(
+        payload,
+        trade_date,
+        rebalance_mode,
+    )
+    object_key = build_goal24_selection_commit_key(
+        trade_date,
+        rebalance_mode,
+    )
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        default=str,
+        indent=2,
+    ).encode("utf-8")
+    settings = load_settings()
+    if _storage_backend(settings) == "local":
+        import os
+        from uuid import uuid4
+
+        path = _local_root(settings) / object_key
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(
+            f".{path.name}.{uuid4().hex}.tmp"
+        )
+        try:
+            with tmp_path.open("xb") as stream:
+                stream.write(serialized)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(tmp_path, path)
+            except FileExistsError as exc:
+                raise FileExistsError(object_key) from exc
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        return object_key
+
+    client = create_minio_client(settings)
+    bucket = settings["storage"]["minio_bucket_processed"]
+    ensure_buckets(client, [bucket])
+    try:
+        client._put_object(
+            bucket,
+            object_key,
+            serialized,
+            headers={
+                "Content-Type": "application/json",
+                "If-None-Match": "*",
+            },
+        )
+    except S3Error as exc:
+        if exc.code in {
+            "PreconditionFailed",
+            "ConditionalRequestConflict",
+            "OperationAborted",
+        }:
+            raise FileExistsError(object_key) from exc
+        raise
+    client.stat_object(bucket, object_key)
+    return object_key
+
+
+def _validate_goal24_selection_generation_object_key(
+    object_key: str,
+) -> str:
+    object_key = safe_object_key(object_key)
+    match = re.fullmatch(
+        r"processed/selection_result/trade_date=(\d{4}-\d{2}-\d{2})/"
+        r"rebalance_mode=(monthly|quarterly)/"
+        r"generation=([0-9a-f]{64})/part\.parquet",
+        object_key,
+    )
+    if match is None:
+        raise ValueError("invalid Goal 24 selection generation key")
+    validate_trade_date(match.group(1))
+    return object_key
+
+
 def _materialize_dataset(dataset: str, trade_date: str, tmp_root: Path) -> Path:
     path = _try_materialize_dataset(dataset, trade_date, tmp_root)
     if not path:
@@ -2667,6 +2997,47 @@ def build_parser() -> argparse.ArgumentParser:
     run_real_factor_range.set_defaults(
         resume=True,
         func=_cmd_run_real_factor_range,
+    )
+
+    run_real_selection_range = subparsers.add_parser(
+        "run-real-selection-range",
+        allow_abbrev=False,
+    )
+    run_real_selection_range.add_argument("--run-id", required=True)
+    run_real_selection_range.add_argument("--start-date", required=True)
+    run_real_selection_range.add_argument("--end-date", required=True)
+    run_real_selection_range.add_argument(
+        "--selection-dates",
+        required=True,
+        help="comma-separated deterministic selection dates",
+    )
+    run_real_selection_range.add_argument(
+        "--rebalance-mode",
+        required=True,
+        choices=["monthly", "quarterly"],
+    )
+    run_real_selection_range.add_argument(
+        "--goal23-manifest-key",
+        action="append",
+        required=True,
+        help="trusted Goal 23 range manifest key; repeat when needed",
+    )
+    run_real_selection_range.add_argument("--apply", action="store_true")
+    goal24_resume = run_real_selection_range.add_mutually_exclusive_group()
+    goal24_resume.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+    )
+    goal24_resume.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+    )
+    run_real_selection_range.add_argument("--force", action="store_true")
+    run_real_selection_range.set_defaults(
+        resume=True,
+        func=_cmd_run_real_selection_range,
     )
 
     validate_provider_data = subparsers.add_parser("validate-provider-data")

@@ -28,7 +28,23 @@ ALTER TABLE selection_snapshot ADD COLUMN IF NOT EXISTS stock_count INTEGER;
 ALTER TABLE selection_snapshot ADD COLUMN IF NOT EXISTS avg_total_score DOUBLE PRECISION;
 ALTER TABLE selection_snapshot ADD COLUMN IF NOT EXISTS max_total_score DOUBLE PRECISION;
 ALTER TABLE selection_snapshot ADD COLUMN IF NOT EXISTS min_total_score DOUBLE PRECISION;
+ALTER TABLE selection_snapshot ADD COLUMN IF NOT EXISTS rebalance_mode TEXT;
+UPDATE selection_snapshot
+SET rebalance_mode = 'daily'
+WHERE rebalance_mode IS NULL OR btrim(rebalance_mode) = '';
+ALTER TABLE selection_snapshot ALTER COLUMN rebalance_mode SET DEFAULT 'daily';
+ALTER TABLE selection_snapshot ALTER COLUMN rebalance_mode SET NOT NULL;
+DELETE FROM selection_snapshot older
+USING selection_snapshot newer
+WHERE older.trade_date = newer.trade_date
+  AND older.rebalance_mode = newer.rebalance_mode
+  AND (
+      older.created_at < newer.created_at
+      OR (older.created_at = newer.created_at AND older.id < newer.id)
+  );
 CREATE INDEX IF NOT EXISTS idx_selection_snapshot_trade_date ON selection_snapshot(trade_date);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_selection_snapshot_trade_date_mode
+    ON selection_snapshot(trade_date, rebalance_mode);
 
 CREATE TABLE IF NOT EXISTS backtest_summary (
     id BIGSERIAL PRIMARY KEY,

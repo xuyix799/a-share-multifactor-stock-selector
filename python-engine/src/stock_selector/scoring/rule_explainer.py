@@ -1,7 +1,19 @@
 from typing import Any
 
 
-FORBIDDEN_WORDS = ["必涨", "稳赚", "满仓", "目标价", "无脑买入"]
+FORBIDDEN_WORDS = [
+    "必涨",
+    "稳赚",
+    "必赚",
+    "保证收益",
+    "确定收益",
+    "承诺收益",
+    "满仓",
+    "目标价",
+    "无脑买入",
+    "自动交易",
+    "自动下单",
+]
 
 
 def build_reason(row: dict[str, Any]) -> str:

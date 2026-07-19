@@ -19,6 +19,20 @@ def test_factor_weights_must_sum_to_one():
         )
 
 
+def test_fractional_top_n_is_rejected_instead_of_truncated():
+    with pytest.raises(ScoringConfigError, match="positive integer"):
+        parse_scoring_config(
+            {
+                "quality_score": 0.30,
+                "growth_score": 0.25,
+                "valuation_score": 0.20,
+                "industry_score": 0.15,
+                "trend_score": 0.10,
+                "scoring": {"top_n": 50.9},
+            }
+        )
+
+
 def test_total_score_uses_configured_weights():
     config = parse_scoring_config(
         {

@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import pandas as pd
@@ -24,10 +25,17 @@ def parse_scoring_config(raw_config: dict[str, Any]) -> ScoringConfig:
     for column in SCORE_WEIGHT_COLUMNS:
         if column not in raw_config:
             raise ScoringConfigError(f"missing weight: {column}")
-        weights[column] = float(raw_config[column])
+        weight = float(raw_config[column])
+        if not math.isfinite(weight):
+            raise ScoringConfigError(f"factor weight must be finite: {column}")
+        if weight < 0:
+            raise ScoringConfigError(
+                f"factor weight must be non-negative: {column}"
+            )
+        weights[column] = weight
 
     weight_sum = sum(weights.values())
-    if abs(weight_sum - 1.0) > 1e-9:
+    if not math.isfinite(weight_sum) or abs(weight_sum - 1.0) > 1e-9:
         raise ScoringConfigError(f"factor weight sum must equal 1, got {weight_sum}")
 
     scoring = raw_config.get("scoring") or {}
@@ -37,11 +45,28 @@ def parse_scoring_config(raw_config: dict[str, Any]) -> ScoringConfig:
     if null_policy != "neutral":
         raise ScoringConfigError(f"unsupported null_score_policy: {null_policy}")
     neutral_score = float(scoring.get("neutral_score", 50.0))
-    if neutral_score < 0 or neutral_score > 100:
+    if (
+        not math.isfinite(neutral_score)
+        or neutral_score < 0
+        or neutral_score > 100
+    ):
         raise ScoringConfigError("neutral_score must be between 0 and 100")
-    top_n = int(scoring.get("top_n", 50))
-    if top_n <= 0:
-        raise ScoringConfigError("top_n must be positive")
+    raw_top_n = scoring.get("top_n", 50)
+    if isinstance(raw_top_n, bool):
+        raise ScoringConfigError("top_n must be a positive integer")
+    try:
+        numeric_top_n = float(raw_top_n)
+    except (TypeError, ValueError) as exc:
+        raise ScoringConfigError(
+            "top_n must be a positive integer"
+        ) from exc
+    if (
+        not math.isfinite(numeric_top_n)
+        or not numeric_top_n.is_integer()
+        or numeric_top_n <= 0
+    ):
+        raise ScoringConfigError("top_n must be a positive integer")
+    top_n = int(numeric_top_n)
     return ScoringConfig(weights=weights, null_score_policy=null_policy, neutral_score=neutral_score, top_n=top_n)
 
 

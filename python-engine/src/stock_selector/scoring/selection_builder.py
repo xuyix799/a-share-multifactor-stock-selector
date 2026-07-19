@@ -17,6 +17,7 @@ def build_selection_result(
     factor_input_table: pd.DataFrame | None,
     trade_date: str,
     scoring_config: ScoringConfig,
+    allow_empty: bool = False,
 ) -> pd.DataFrame:
     trade_date = validate_trade_date(trade_date)
     validate_factor_daily(factor_daily, trade_date)
@@ -35,19 +36,34 @@ def build_selection_result(
     result = result.merge(risk_columns, on=["stock_code", "trade_date"], how="left")
     result[["exclude_reasons", "risk_flags"]] = result[["exclude_reasons", "risk_flags"]].fillna("")
     result = compute_total_scores(result, scoring_config)
-    result["risk_level"] = result.apply(
-        lambda row: determine_risk_level(
-            total_score=row["total_score"],
-            quality_score=row["quality_score"],
-            growth_score=row["growth_score"],
-            risk_flags=row["risk_flags"],
-        ),
-        axis=1,
-    )
-    result["reason"] = result.apply(lambda row: build_reason(row.to_dict()), axis=1)
-    result["suggestion"] = result.apply(lambda row: build_suggestion(row.to_dict()), axis=1)
+    if result.empty:
+        result["risk_level"] = pd.Series(dtype="string")
+        result["reason"] = pd.Series(dtype="string")
+        result["suggestion"] = pd.Series(dtype="string")
+    else:
+        result["risk_level"] = result.apply(
+            lambda row: determine_risk_level(
+                total_score=row["total_score"],
+                quality_score=row["quality_score"],
+                growth_score=row["growth_score"],
+                risk_flags=row["risk_flags"],
+            ),
+            axis=1,
+        )
+        result["reason"] = result.apply(
+            lambda row: build_reason(row.to_dict()),
+            axis=1,
+        )
+        result["suggestion"] = result.apply(
+            lambda row: build_suggestion(row.to_dict()),
+            axis=1,
+        )
     result = result.sort_values(["total_score", "stock_code"], ascending=[False, True]).head(scoring_config.top_n).reset_index(drop=True)
-    result["rank"] = range(1, len(result) + 1)
+    result["rank"] = pd.Series(
+        range(1, len(result) + 1),
+        index=result.index,
+        dtype="int64",
+    )
     result = result[SELECTION_RESULT_COLUMNS]
-    validate_selection_result(result, trade_date)
+    validate_selection_result(result, trade_date, allow_empty=allow_empty)
     return result
